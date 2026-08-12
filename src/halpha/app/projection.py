@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
@@ -10,6 +10,15 @@ from typing import Any, Protocol
 import psycopg
 from pydantic import SecretStr
 
+from halpha.binance_contracts import (
+    BINANCE_USDM_ACCOUNT_SNAPSHOT_SCHEMA,
+    parse_complete_binance_usdm_account_snapshot,
+)
+from halpha.capital.discipline import (
+    evaluate_new_risk_discipline,
+    read_new_risk_discipline,
+)
+from halpha.capital.models import NewRiskDisciplinePolicy
 from halpha.product_build import (
     EXECUTOR_READY_APPLICATION_NAME_PREFIX,
     EXECUTOR_STARTING_APPLICATION_NAME,
@@ -84,6 +93,7 @@ def _empty_account_snapshot(status: str) -> dict[str, object]:
         "account_snapshot_age_seconds": None,
         "account_ordinary_open_order_count": None,
         "account_algo_open_order_count": None,
+        "account_summary": None,
         "account_positions": [],
         "account_orders": [],
     }
@@ -96,6 +106,46 @@ def _snapshot_optional_order_decimal(value: object) -> str | None:
     if Decimal(normalized) < 0:
         raise ValueError("ACCOUNT_SNAPSHOT_ORDER_INVALID")
     return normalized
+
+
+def _project_account_summary(
+    raw: object,
+    *,
+    observed_at: datetime,
+    snapshot_ref: str,
+) -> dict[str, object]:
+    if not isinstance(raw, dict) or type(raw.get("can_trade")) is not bool:
+        raise ValueError("ACCOUNT_SNAPSHOT_SUMMARY_INVALID")
+    non_negative_fields = (
+        "wallet_balance",
+        "margin_balance",
+        "initial_margin",
+        "maintenance_margin",
+        "position_initial_margin",
+        "open_order_initial_margin",
+    )
+    decimal_fields = (
+        *non_negative_fields,
+        "unrealized_pnl",
+        "available_balance",
+        "cross_wallet_balance",
+        "cross_unrealized_pnl",
+    )
+    values = {name: _snapshot_decimal(raw[name]) for name in decimal_fields}
+    if any(Decimal(values[name]) < 0 for name in non_negative_fields):
+        raise ValueError("ACCOUNT_SNAPSHOT_SUMMARY_INVALID")
+    source_update_time_ms = raw.get("source_update_time_ms")
+    if source_update_time_ms is not None and (
+        type(source_update_time_ms) is not int or source_update_time_ms < 0
+    ):
+        raise ValueError("ACCOUNT_SNAPSHOT_SUMMARY_INVALID")
+    return {
+        "can_trade": raw["can_trade"],
+        **values,
+        "source_update_time_ms": source_update_time_ms,
+        "fact_cutoff": observed_at.isoformat().replace("+00:00", "Z"),
+        "snapshot_ref": snapshot_ref,
+    }
 
 
 def _snapshot_order_text(
@@ -225,32 +275,25 @@ def _project_account_snapshot(
         if age_seconds <= ACCOUNT_SNAPSHOT_CURRENT_SECONDS
         else "STALE"
     )
-    if (
-        payload.get("schema") != "HALPHA_BINANCE_USDM_ACCOUNT_SNAPSHOT_V2"
-        or payload.get("snapshot_complete") is not True
-        or payload.get("read_only") is not True
-        or payload.get("management_authority") != "NONE"
-        or not isinstance(payload.get("positions"), list)
-        or not isinstance(payload.get("ordinary_open_orders"), list)
-        or not isinstance(payload.get("algo_open_orders"), list)
-        or type(payload.get("ordinary_open_order_count")) is not int
-        or type(payload.get("algo_open_order_count")) is not int
-        or int(payload["ordinary_open_order_count"]) < 0
-        or int(payload["algo_open_order_count"]) < 0
-        or int(payload["ordinary_open_order_count"])
-        != len(payload["ordinary_open_orders"])
-        or int(payload["algo_open_order_count"])
-        != len(payload["algo_open_orders"])
-    ):
+    snapshot = parse_complete_binance_usdm_account_snapshot(payload)
+    if snapshot is None:
         return _empty_account_snapshot("UNKNOWN")
+    schema = snapshot["schema"]
     attributed = frozenset(attributed_instruments)
     snapshot_ref = str(fact_ref or "").strip()
     if not snapshot_ref or len(snapshot_ref) > 160:
         return _empty_account_snapshot("UNKNOWN")
     positions: list[dict[str, object]] = []
     orders: list[dict[str, object]] = []
+    account_summary: dict[str, object] | None = None
     try:
-        for raw in payload["positions"]:
+        if schema == BINANCE_USDM_ACCOUNT_SNAPSHOT_SCHEMA:
+            account_summary = _project_account_summary(
+                snapshot["account_summary"],
+                observed_at=observed_at,
+                snapshot_ref=snapshot_ref,
+            )
+        for raw in snapshot["positions"]:
             if not isinstance(raw, dict):
                 raise ValueError("ACCOUNT_SNAPSHOT_POSITION_INVALID")
             instrument_ref = str(raw["instrument_ref"])
@@ -319,7 +362,7 @@ def _project_account_snapshot(
                 observed_at=observed_at,
                 snapshot_ref=snapshot_ref,
             )
-            for raw in payload["ordinary_open_orders"]
+                for raw in snapshot["ordinary_open_orders"]
         )
         orders.extend(
             _project_account_order(
@@ -328,7 +371,7 @@ def _project_account_snapshot(
                 observed_at=observed_at,
                 snapshot_ref=snapshot_ref,
             )
-            for raw in payload["algo_open_orders"]
+                for raw in snapshot["algo_open_orders"]
         )
     except (KeyError, TypeError, ValueError):
         return _empty_account_snapshot("UNKNOWN")
@@ -351,9 +394,10 @@ def _project_account_snapshot(
         "account_snapshot_cutoff": observed_at.isoformat().replace("+00:00", "Z"),
         "account_snapshot_age_seconds": age_seconds,
         "account_ordinary_open_order_count": int(
-            payload["ordinary_open_order_count"]
+            snapshot["ordinary_open_order_count"]
         ),
-        "account_algo_open_order_count": int(payload["algo_open_order_count"]),
+        "account_algo_open_order_count": int(snapshot["algo_open_order_count"]),
+        "account_summary": account_summary,
         "account_positions": positions,
         "account_orders": orders,
     }
@@ -366,6 +410,9 @@ class PostgreSQLWorkbenchProjection:
     password: SecretStr
     environment_id: str
     account_id: str
+    new_risk_discipline_policy: NewRiskDisciplinePolicy = field(
+        default_factory=NewRiskDisciplinePolicy
+    )
     host: str = "127.0.0.1"
     port: int = 5432
     read_only: bool = False
@@ -430,6 +477,30 @@ class PostgreSQLWorkbenchProjection:
                     ),
                 )
                 row = cursor.fetchone()
+                observed_at = _aware_utc(row[0]) if row is not None else None
+                if observed_at is None:
+                    discipline = evaluate_new_risk_discipline(
+                        policy=self.new_risk_discipline_policy,
+                        observed_at=datetime.now(UTC),
+                        account_equity=None,
+                        attempts=(),
+                    )
+                else:
+                    try:
+                        discipline = read_new_risk_discipline(
+                            connection,
+                            environment_id=self.environment_id,
+                            account_ref=self.account_id,
+                            policy=self.new_risk_discipline_policy,
+                            observed_at=observed_at,
+                        )
+                    except Exception:
+                        discipline = evaluate_new_risk_discipline(
+                            policy=self.new_risk_discipline_policy,
+                            observed_at=observed_at,
+                            account_equity=None,
+                            attempts=(),
+                        )
         except ProjectionUnavailable:
             raise
         except Exception as exc:
@@ -454,6 +525,7 @@ class PostgreSQLWorkbenchProjection:
             "open_activation_count": int(row[1]),
             "database_name": str(row[2]),
             "database_role": str(row[3]),
+            "new_risk_discipline": discipline.model_dump(mode="json"),
             **account_snapshot,
         }
 

@@ -1,464 +1,99 @@
 document_id: HALPHA-PLAN-001
 level: L4
 language: zh-CN
-as_of: 2026-08-04
+as_of: 2026-08-12
 
 current_summary: >-
-  Halpha 当前代码和非秘密配置已把原先单一 Live 目标拆为三个固定交易上下文：Demo、带单员公域合约实盘和个人合约实盘。
-  三者复用同一计划、资金、执行和复盘逻辑，但分别绑定账户类型、环境与账户标识、数据库、App/Executor 身份、
-  Windows 任务、凭据命名空间、写执行互斥、写门文件、监听端口和角色输出；工作台通过一个原子交易上下文选择器切换。
-  三个上下文的数据库、身份、任务和 App 已在当前主机部署；Demo Executor 持续运行，带单 Read Only Executor 使用精确绑定的
-  带单账户只读 API Key 每 30 秒追加一份完整账户事实，个人 Read Only Executor 因尚无私有账户凭据保持禁用。
-  带单账户页面分别显示当前仓位和当前委托，不展示过期事实为当前数据。全部真实账户写门保持关闭，Halpha 不允许交易所变更请求。
+  Halpha 当前产品契约提供 Demo、带单员公域合约实盘和个人合约实盘三个固定且隔离的交易上下文，
+  复用计划、资金、执行和复盘语义，并通过显式配置选择上下文与运行模式。Git 只记录产品契约、
+  非秘密配置形状和验证结论；仓库外事实及其派生制品不记录于此。
+  当前计划不授权真实账户交易所变更请求。
 
 current_product_boundary:
   outcome: >-
-    支持计划配置与固定、一次激活、持续监控、交易所动作执行、保护、退出、核对、复盘和用户接管。
+    支持计划配置与固定、一次激活、持续监控、动作执行、保护、退出、核对、复盘和用户接管的产品闭环。
   includes:
-    - DEMO 完整闭环
-    - LIVE_READ_ONLY 公开行情观察
-    - LIVE_WRITE（真实账户交易）的无凭据实现、安全反例和一次受限真实激活能力
-    - Demo、带单员公域合约账户和个人合约账户三个固定且互相隔离的交易上下文
-    - 本地交易工作台、Windows 运行、邮件通知、备份恢复和官方入口接管
+    - DEMO 产品闭环
+    - LIVE_READ_ONLY 公开观察与隔离的私有账户观察形状
+    - LIVE_WRITE 的失败关闭实现、安全反例和显式授权边界
+    - Demo、带单员公域合约账户和个人合约账户三个固定交易上下文
+    - 本地交易工作台与程序化计划接口共用的计划 schema 和领域路径
+    - Windows 本地运行、通知、备份恢复和官方入口接管的产品契约
   excludes:
-    - 第二个正式策略
-    - 任意动态账户接入、跨账户组合视图、资金分配、组合优化和凭据自动发现或回退
-    - 多场所接入
+    - 仓库外事实、材料及其派生制品
+    - 动态账户接入、跨账户组合、自动扩大资金范围、多场所和机构治理能力
     - 独立 Research 与 Monitor 仓库的实现、依赖、数据和生命周期
-    - 自动扩大资金范围
-    - 高可用、微服务、机构审批或治理平台
 
 current_decisions:
-  target_host: Windows 10 Pro 22H2 x64
-  host_rule: 不迁移、不缩减目标；如实记录依赖支持限制，并以本机直接验证判断当前可用性
   development_flow: CONTINUOUS_SMALL_ITERATIONS
-  iteration_rule: 每次围绕一个可验证的小结果完成必要设计、实现、验证和修复，验证通过后直接集成
-  capital_authority: 半自动计划中用户配置并固定的交易金额就是本次资金边界；激活只让计划开始运行
-  build_identity: 每组产品输入只使用一个 product_build_id
-  observation: 只有当前发布、部署或真实资金决定提出直接测试无法回答的问题时才增加观察
-  research: >-
-    AI 可在独立研究边界内，基于项目当前问题、既有证据和外部调研自主选择一个有价值的可证伪问题；
-    问题与取舍理由由对应研究材料记录，结果仍须由项目所有者决定是否进入产品。
+  iteration_rule: 每次围绕一个可验证的小结果完成必要设计、实现、验证和修复
+  capital_authority: 用户固定的单计划资金边界不因激活、历史结果或外部绩效目标自动扩大
+  account_risk_discipline: >-
+    Demo、LIVE_READ_ONLY 与 LIVE_WRITE 使用同一账户级新增风险判定器；不按每日订单数或并发数限制，
+    而按单计划与组合最坏损失、总/单品种/相关簇敞口、可靠日/周亏损停止和滚动回撤限制。
+    当前共享上限为单计划最大允许损失 0.75%、未闭合计划最坏损失 2.5%、总/单品种/相关簇敞口为纪律权益的
+    2/1/1.5 倍、日/周可靠已闭合亏损停止 1.5%/4%、30 日滚动回撤停止 10%。
+    所有上下文使用同一代码拥有的上限，配置只能进一步收窄；Demo 测试直接覆盖实盘所用的同一判定器和执行前复核。
+    同品种同向非零浮亏持仓禁止普通新增风险加仓；只有本激活已有成交、冻结多档订单快照可精确还原的原始档位可以继续，
+    重试、改价、单档或任何无法还原的动作不例外。
+  context_isolation: 环境、账户类型、账户标识、数据库、运行身份、凭据命名空间和写门按交易上下文隔离
+  build_identity: 每组产品运行输入只使用一个 product_build_id
+  publication_boundary: EXTERNAL_FACTS_NOT_RECORDED
+  publication_guard: GITIGNORE_AND_PUBLICATION_HOOK
 
 current_facts:
   source:
     repository: 当前 Git 工作区
-    identity_rule: 构建或验证时直接读取提交、分支和工作树；本计划不抄写易失真的 SHA
-    checked_at: 2026-08-04
+    checked_at: 2026-08-12
   evidence_limit: >-
-    历史测试和观察只说明当时输入；当前实现仍在连续修改，因此不把历史结果表述为当前产品闭环或真实账户交易能力。
-  persistence:
-    migration_head: 20260803_0012
-    demo_database_at_head: true
-    live_copy_database_at_head: true
-    live_personal_database_at_head: true
-    target_database_provisioning:
-      demo: EXISTING_OBSERVED_AT_HEAD
-      live_copy: PROVISIONED_AT_HEAD
-      live_personal: PROVISIONED_AT_HEAD
-    product_record_family_count: 11
-    row_count_cutoff: 2026-07-26T16:50:55Z
-    demo_product_rows: 5146
-    legacy_live_product_rows: 0
-  clean_slate_reset:
-    authorized_at: 2026-07-24
-    named_targets:
-      demo:
-        environment_id: binance-demo-primary
-        database: halpha_demo
-      live:
-        environment_id: binance-live-primary
-        database: halpha_live
-    history_policy: OWNER_AUTHORIZED_IRREVERSIBLE_DISCARD_WITHOUT_BACKUP
-    irreversible_effect: >-
-      两个命名目标的旧数据库与旧备份均未保留；其中历史永久丢失，不能再恢复、回放或用于推断当前产品事实。
-      重建后资格检查产生的新备份只包含唯一新根 schema 与备份时的当前数据，不包含或恢复任何旧历史。
-    non_target_databases_touched: false
-    pre_reset_observation:
-      observed_at: 2026-07-24 重建前
-      retention: >-
-        这是重建前的一次性观察；旧数据库、备份、当次完整命令和输出均未保留，历史结果不可复现。
-      demo_local_database:
-        method: 重建前一次性只读计数
-        observed_nonterminal_activations: 10
-        observed_nonterminal_execution_actions: 15
-      live_local_database:
-        method: 重建前一次性只读计数
-        observed_product_rows: 0
-      demo_venue:
-        probe: tools/qualification/probe_binance_demo_clients.py 的只读 preflight
-        environment: DEMO
-        account_ref: binance-usdm-demo-owner-primary
-        instruments:
-          BTCUSDT:
-            nonzero_positions: 0
-            open_ordinary_orders: 0
-            open_conditional_or_algo_orders: 0
-          ETHUSDT:
-            nonzero_positions: 0
-            open_ordinary_orders: 0
-            open_conditional_or_algo_orders: 0
-        unknown_responsibilities: 0
-      interpretation: >-
-        10 个激活和 15 个动作没有被改写为完成、关闭或移交；所有者只退役并放弃这些已知非终态本地历史。
-        上述计数和场所结果只描述重建前观察，不是当前产品事实。
-    live_credentials_available_during_reset: false
-    result: >-
-      两个空数据库均只由 20260724_0001 唯一根迁移建立，并通过权限、索引和交叉连接拒绝检查；
-      没有从旧历史恢复、回放、转换或推断记录。
-    reuse_rule: 本次决定只适用于上述两个目标和当次事实，不授权以后自动丢弃数据
-  qualification_provenance:
-    checked_at: 2026-07-25
-    scope: PREVIOUS_DEMO_AND_SINGLE_LIVE_HOST_TOPOLOGY
-    current_target_status: HISTORICAL_EVIDENCE_SUPERSEDED_BY_DEPLOYED_THREE_CONTEXT_TOPOLOGY
-    interpretation: >-
-      以下结果只证明上一阶段 Demo 与单一 Live 主机拓扑在当时的边界；当前三上下文已经部署，
-      但这些历史结果不能替代当前三上下文的完整主机资格证据，也不能重现已清空的重建前本地计数。
-      需要完整资格结论时仍须按当前目标重新运行对应工具。
-    recorded_commands:
-      demo_venue_read_only: '.venv\Scripts\python.exe -m tools.qualification.probe_binance_demo_clients'
-      database_boundary: '.venv\Scripts\python.exe -m tools.qualification.verify_database_boundary --output build/qualification/post-migration/database-boundary-exact.json'
-      backup_boundary: '.venv\Scripts\python.exe -m tools.qualification.verify_backup_boundary --config config/halpha.toml --output build/qualification/post-migration/backup-boundary-exact.json'
-      restore_boundary: '.venv\Scripts\python.exe -m tools.qualification.verify_restore_boundary --config config/halpha.toml --output build/qualification/post-migration/database-restore-exact.json'
-      runtime_acls: '.venv\Scripts\python.exe -m tools.qualification.verify_runtime_acls --repository-root . --demo-config config/halpha.toml --live-config config/halpha.live-read-only.toml'
-      demo_task_runtime: '.venv\Scripts\python.exe -m tools.qualification.verify_windows_runtime --repository-root . --config config/halpha.toml'
-      live_read_only_task_runtime: '.venv\Scripts\python.exe -m tools.qualification.verify_windows_runtime --repository-root . --config config/halpha.live-read-only.toml'
-      demo_runtime_inventory: '.venv\Scripts\halpha-control.exe status --config config/halpha.toml --json'
-      live_read_only_runtime_inventory: '.venv\Scripts\halpha-control.exe status --config config/halpha.live-read-only.toml --json'
-    recorded_results:
-      database_boundary: >-
-        build/qualification/post-migration/database-boundary-exact.json 为 QUALIFIED；
-        两库所有者、精确 ACL、关键约束、函数与触发器全集、Live 单一未闭合激活索引、
-        复盘版本链和跨数据库连接拒绝均符合当时的双上下文契约。
-      backup_boundary: >-
-        build/qualification/post-migration/backup-boundary-exact.json 为 QUALIFIED；
-        Demo/Live 独立归档、精确 manifest 与摘要、目录边界和秘密扫描均通过。
-      restore_boundary: >-
-        build/qualification/post-migration/database-restore-exact.json 为 QUALIFIED；
-        两个环境分别恢复到空临时库，revision、表、记录数、按主键排序的 binary COPY 内容摘要、
-        完整数据库权限契约和跨环境拒绝一致，临时库均已删除。
-      runtime_acls: 23 个目录边界的所有者、受保护 DACL 与授权集合符合当时的双上下文契约；固定产品输入为只读执行，角色输出目录隔离
-      demo_task_runtime: App 与 Executor 的任务身份、秘密可见性、停止事件和 HTTP 检查通过
-      live_read_only_task_runtime: App 的任务身份、秘密可见性、停止事件和 HTTP 检查通过；Executor 保持禁用且未运行
-      shared_auxiliary_backup: Backup 身份只见两个环境各自的只读备份凭据，不见 App、Executor 或迁移凭据
-  host_cleanup_limit: >-
-    旧 HalphaApp/HalphaExecutor 本地账户和任务已不存在，也无对应进程或 ACL；
-    Windows 仍锁定两个已删除账户的孤立用户配置单元，当前会话无法卸载，需主机重启后删除其配置目录。
-    该残留不参与产品运行、凭据投影或权限授予。
-
-target_runtime:
-  host:
-    operating_system: Windows 10 Pro 22H2
-    build: 10.0.19045
-    architecture: x64
-    dependency_caveat: >-
-      当前 NautilusTrader 版本的常规 Windows 支持边界不包含该主机；项目记录此限制，
-      通过本机安装、启停、重启和联合链路验证判断当前可用性，不表述为供应商保证。
-  trading:
-    venue: Binance USDⓈ-M
-    demo_instruments: [BTCUSDT-PERP, ETHUSDT-PERP]
-    first_live_instrument: BTCUSDT-PERP
-    strategy: ONE_SHOT_DONCHIAN_ATR_BREAKOUT
-    account_configuration_mutation: DISABLED
-  topology:
-    database: PostgreSQL
-    configuration_schema_version: 2
-    processes: [halpha-app, halpha-executor]
-    configured_contexts:
-      demo:
-        environment_kind: DEMO
-        venue_account_type: USDM_DEMO
-        environment_id: binance-demo-primary
-        account_id: binance-usdm-demo-owner-primary
-        supported_profiles: [BINANCE_DEMO]
-        database: halpha_demo
-        app_port: 8765
-        credential_namespace: BINANCE_DEMO
-        windows_tasks: ['\Halpha\App.BINANCE_DEMO', '\Halpha\Executor.BINANCE_DEMO']
-        windows_identities:
-          app: HalphaAppDemo
-          executor: HalphaExecutorDemo
-        database_roles:
-          app: halpha_demo_app
-          executor: halpha_demo_executor
-          migration: halpha_demo_migration
-          backup: halpha_demo_backup
-        write_gate: NOT_APPLICABLE
-      live_copy:
-        environment_kind: LIVE
-        venue_account_type: USDM_COPY_LEAD
-        environment_id: binance-live-copy-primary
-        account_id: binance-usdm-copy-lead-primary
-        supported_profiles: [BINANCE_LIVE_READ_ONLY, BINANCE_LIVE_WRITE]
-        database: halpha_live_copy
-        app_port: 8766
-        credential_namespace: BINANCE_LIVE_COPY
-        windows_tasks: ['\Halpha\App.BINANCE_LIVE_COPY', '\Halpha\Executor.BINANCE_LIVE_COPY']
-        windows_identities:
-          app: HalphaAppCopy
-          executor: HalphaExecCopy
-        database_roles:
-          app: halpha_live_copy_app
-          app_reader: halpha_live_copy_app_reader
-          executor: halpha_live_copy_executor
-          migration: halpha_live_copy_migration
-          backup: halpha_live_copy_backup
-        write_gate: state/live-copy-write-gate.json
-      live_personal:
-        environment_kind: LIVE
-        venue_account_type: USDM_PERSONAL
-        environment_id: binance-live-personal-primary
-        account_id: binance-usdm-personal-primary
-        supported_profiles: [BINANCE_LIVE_READ_ONLY, BINANCE_LIVE_WRITE]
-        database: halpha_live_personal
-        app_port: 8767
-        credential_namespace: BINANCE_LIVE_PERSONAL
-        windows_tasks: ['\Halpha\App.BINANCE_LIVE_PERSONAL', '\Halpha\Executor.BINANCE_LIVE_PERSONAL']
-        windows_identities:
-          app: HalphaAppPersonal
-          executor: HalphaExecPersonal
-        database_roles:
-          app: halpha_live_personal_app
-          app_reader: halpha_live_personal_app_reader
-          executor: halpha_live_personal_executor
-          migration: halpha_live_personal_migration
-          backup: halpha_live_personal_backup
-        write_gate: state/live-personal-write-gate.json
-    product_credential_boundary:
-      demo_app: 只投影 Demo App 的数据库、Web 与通知凭据
-      demo_executor: 只投影 Demo Executor 的数据库、Demo API Key 与运行网络凭据
-      live_copy_read_only_app: 只投影带单上下文 App 的数据库、Web 与通知凭据；数据库连接强制只读
-      live_copy_read_only_executor: 只投影带单上下文 Executor 的数据库、只读 API Key 与运行网络凭据；只允许 DAT 账户事实追加
-      live_copy_write_executor: 只允许读取 BINANCE_LIVE_COPY 下精确绑定的带单账户凭据
-      live_personal_read_only_app: 只投影个人上下文 App 的数据库、Web 与通知凭据；数据库连接强制只读
-      live_personal_write_executor: 只允许读取 BINANCE_LIVE_PERSONAL 下精确绑定的个人账户凭据
-      live_personal_read_only_executor: 任务禁用，不投影个人账户 API Key
-      cross_context_or_role_fallback: false
-    venue_account_qualification:
-      applies_to: BINANCE_LIVE_WRITE_NORMAL_RISK_INCREASE_ONLY
-      credential_binding: 使用写门 SHA-256 指纹已绑定的同一 API Key
-      lead_status_endpoint: GET https://api.binance.com/sapi/v1/copyTrading/futures/userStatus
-      lead_symbol_endpoint: GET https://api.binance.com/sapi/v1/copyTrading/futures/leadSymbol
-      live_copy_requirement: isLeadTrader=true，且产品目标 symbol 全部位于当前带单白名单
-      live_personal_requirement: isLeadTrader=false，不请求带单 symbol 白名单
-      request_contract: 签名 GET、禁止重定向、3 秒超时、响应上限 64 KiB、错误内容不透传
-      freshness: 成功事实最多缓存 60 秒；启动和后续增险写门复核时按需刷新
-      failure_effect: Executor 拒绝正常写启动或后续增险；既有激活只恢复路径不因此失去撤单、保护、减仓和退出能力
-    role_output_directories:
-      demo_app: logs/binance-demo-primary/app
-      demo_executor: logs/binance-demo-primary/executor
-      live_copy_app: logs/binance-live-copy-primary/app
-      live_copy_executor: logs/binance-live-copy-primary/executor
-      live_personal_app: logs/binance-live-personal-primary/app
-      live_personal_executor: logs/binance-live-personal-primary/executor
-      shared_backup_log: logs/maintenance/backup
-    shared_auxiliary:
-      backup:
-        task: '\Halpha\Backup'
-        identity: HalphaBackup
-        database_role_source: target_runtime.topology.configured_contexts 的三个独立 backup 角色
-        output_directories:
-          demo: backups/postgresql/demo
-          live_copy: backups/postgresql/live_copy
-          live_personal: backups/postgresql/live_personal
-        product_database_write: false
-        exchange_change_requests: false
-        api_key_access: false
-    lifecycle_control_cli: halpha-control
-    lifecycle_default_config: config/halpha.toml
-    lifecycle_generated_output_language: ASCII_ENGLISH
-    lifecycle_pass_through_text: SOURCE_PRESERVED
-    lifecycle_inventory_scope: 当前仓库及所有已登记 Git 工作树中的产品进程树、TCP 监听和 Windows Halpha 任务
-    product_start_group:
-      demo: [app, executor]
-      live_copy_read_only: [app, executor]
-      live_personal_read_only: [app]
-    live_read_only_executor_tasks:
-      live_copy: CONTINUOUS_PRIVATE_ACCOUNT_OBSERVATION
-      live_personal: DISABLED_EXPLICIT_OBSERVATION_SESSION_ONLY
-    auxiliary_start_rule: backup 只能显式单独启动，不随 product 启动
-    direct_product_long_running_start: PROHIBITED
-    exchange_change_paths_per_context: 1
-    web:
-      demo: 127.0.0.1:8765
-      live_copy: 127.0.0.1:8766
-      live_personal: 127.0.0.1:8767
-    notification: EMAIL_ONLY
-    filesystem_boundary: 固定产品输入只读；三个上下文、App/Executor 与共享 Backup 的目标可写目录互相隔离；当前任务已据此运行，但三上下文完整 ACL 资格报告尚未重新记录
-    deployment_status:
-      observed_at: 2026-08-03
-      demo: App 与 Executor 由独立 Windows 任务运行
-      live_copy_target: App 与只读账户观察 Executor 由独立 Windows 任务运行；Executor 不装载执行客户端或动作能力
-      live_personal_target: App 由独立 Windows 任务运行；Executor 因没有个人账户私有凭据保持禁用
-      shared_auxiliary: Backup 就绪
+    仓库验证只能证明当前代码和非秘密配置形状；本文件不把仓库外状态表述为 Git 当前事实，
+    也不从历史提交推断这些状态。
+  product_contract:
+    trading_contexts:
+      - USDM_DEMO
+      - USDM_COPY_LEAD
+      - USDM_PERSONAL
+    runtime_modes:
+      - DEMO
+      - LIVE_READ_ONLY
+      - LIVE_WRITE
+    plan_lifecycle:
+      - DRAFT
+      - FIXED
+      - ACTIVATED
+    programmatic_plan_api: 与工作台共用完整 schema、领域路由和创建至激活链路
+  external_facts:
+    repository_status: NOT_RECORDED
+    source_of_truth: 各权威外部边界
 
 component_sources:
-  python_locks:
-    - requirements/runtime.txt
-    - requirements/dev.txt
-  frontend_lock: frontend/package-lock.json
-  project_metadata: pyproject.toml
-  runtime_configuration: config/*.toml
-  key_current_versions:
-    python: 3.13.14
-    nautilus_trader: 1.230.0
-    postgresql: 17.10
-    node: 24.18.0
-  rule: 精确依赖以锁文件为准；运行时不下载依赖
+  design:
+    - docs/L1
+    - docs/L2
+    - docs/L3
+  implementation:
+    - src/halpha
+    - frontend/src
+    - config
+  validation:
+    - tests
+    - frontend
+    - governance
 
 current_strategy:
-  owner: HALPHA-ALP-002
-  strategy_id: ONE_SHOT_DONCHIAN_ATR_BREAKOUT
-  strategy_version: 1.0.1
-  parameter_schema_version: 1.3.0
-  registry: src/halpha/planning/strategy_registry.json
-  instrument: BTCUSDT-PERP
-  supported_directions: [LONG, SHORT]
-  historical_limit: 历史模型未包含 funding，只支持机制检查，不证明实时净收益或 Alpha
-
-product_build:
-  target: ONE_PRODUCT_BUILD_ID_PER_EFFECTIVE_TRADING_CONTEXT_CONFIGURATION
-  observed_host_contexts:
-    demo:
-      current_product_build_id: 457bac6e966a8597e9094105defa1f31c8bb37c85a938258d7140f763c87ee44
-      status: APP_AND_EXECUTOR_RUNNING
-    live_copy:
-      current_product_build_id: 29e4926052d4ef026c0c42cdf73b466cb667d574f556f301f4ac8586f986572c
-      status: APP_AND_READ_ONLY_ACCOUNT_OBSERVER_RUNNING
-    live_personal:
-      current_product_build_id: f239498782700662a0c2ff7dd2ae19e6c31f7ca3ddb2ecb2bb7e3bf3d0388e8e
-      status: APP_RUNNING_EXECUTOR_DISABLED_NO_PRIVATE_CREDENTIAL
-  id_note: 上述值由当前运行 App 报告；文档、测试和资格报告不参与构建身份
-  implementation: src/halpha/product_build.py
-  rule: 只散列产品运行文件和有效非秘密配置；时间、Git 状态、文档、测试与验证报告不参与
+  strategy_id: one_shot
+  selection_rule: 只使用当前策略注册表中可验证、可固定并可由当前消费者解释的版本
+  boundary: 策略定义产品能力，不记录仓库外实例事实
 
 current_iteration:
-  focus: >-
-    让带单账户总览持续读取当前交易所账户事实：复用 Nautilus 私有只读账户 API，每 30 秒原子查询仓位、普通委托和条件委托，
-    保存完整委托明细；工作台以紧凑的“当前仓位 / 当前委托”页签显示当前事实，并继续保持全部真实交易能力关闭。
-  validation:
-    - Nautilus 私有只读查询的仓位、普通开放委托和条件开放委托全部规范化并由同一截止点持久化；任一类别失败时不保存半快照
-    - 持续账户观察是 LIVE_READ_ONLY 的显式配置，只能在完整凭据对存在时启用；结构上没有执行客户端、动作 repository 或场所写能力
-    - 当前账户直接只读核对、Python 全量回归、前端契约与单元测试、浏览器桌面验证和三上下文运行状态已在本轮重新记录
-  validation_evidence:
-    checked_at: 2026-08-03T21:01:23+08:00
-    live_copy_account:
-      source: Nautilus Binance USDⓈ-M 私有只读账户 API
-      cutoff_sequence:
-        - 2026-08-03T20:48:14.974072+08:00
-        - 2026-08-03T20:49:15+08:00
-        - 2026-08-03T21:01:17.595436+08:00
-      final_cutoff: 2026-08-03T21:01:17.595436+08:00
-      snapshot_status: CURRENT
-      open_positions: 0
-      ordinary_open_orders: 8
-      algo_open_orders: 0
-      uai_long_position_present: false
-    runtime:
-      three_context_inventory: CONTROLLED
-      ports_http_ok: [8765, 8766, 8767]
-      live_copy_observer_graceful_stop_and_restart: PASSED
-      live_runtime_real_write_gates: CLOSED
-      windows_task_runtime_qualification: THREE_CONTEXTS_QUALIFIED
-      database_boundary: QUALIFIED_AT_20260803_0012
-      fresh_three_database_backup: QUALIFIED
-      demo_restart_recovery: QUALIFIED
-      reconnect_contract: 9_OF_9_AND_BLACK_BOX_QUALIFIED
-    automated_checks:
-      python_pytest: 1478_PASSED
-      frontend_vitest: 195_PASSED
-      frontend_typescript_check: PASSED
-      frontend_production_build: PASSED_WITH_EXISTING_CHUNK_SIZE_WARNING
-      frontend_planning_e2e: 56_PASSED_10_INTENTIONAL_PROJECT_SKIPS
-      live_copy_overview_browser: CURRENT_ZERO_POSITIONS_EIGHT_ORDERS_AND_30_SECOND_REFRESH_VERIFIED
-      live_copy_browser_console_errors: 0
-  current_result: >-
-    带单 Read Only Executor 已成为该上下文产品组合内的持续只读观察角色；账户事实从只保存委托数量扩展为保存全部当前委托明细。
-    总览不再把页面查询时间冒充交易所更新时间，也不再用大卡片和开发期说明堆叠仓位；只有当前账户事实进入仓位和委托表，
-    外部仓位仍保留“未接管”身份和策略调整预览入口。2026-08-03 21:01 UTC+8 的只读核对未发现 UAI 多仓或其他未平仓仓位，
-    并读取到 8 笔普通未结委托、0 笔条件委托；这些数量仍由持续观察器更新。当前没有创建真实激活、执行动作或触发任何 Live 写入。
-  current_limits:
-    - Demo 交易链路当前依赖本机既有运行代理；代理不可用时 Executor 必须失败关闭，不能退回不完整直连
-    - 带单 API Key 当前只读；只能形成账户事实和操作预览，不能固定接管责任、激活计划或发起交易所变更请求
-    - 个人账户 API Key 尚未进入当前范围，因此个人账户页面没有私有仓位和委托事实
-    - Binance 带单员状态接口虽为 GET，但官方安全类型为 TRADE；当前只读凭据不能把账户声明冒充为已完成的 LIVE_WRITE 带单资格
-  next_candidates:
-    - 继续核对带单账户持续仓位、普通委托与条件委托事实在重启和网络失败后的当前性与失败关闭
-    - 只有只读事实、唯一 Executor、写门精确绑定和官方带单账户语义全部通过后，另行授权最小挂单撤单，再逐级验证最小成交、保护和退出
-    - 个人实盘沿用同一阶段顺序，但使用个人上下文的独立数据库、身份、凭据和写门，不能复用带单证据或 Key
+  focus: 完成账户级组合风险纪律，并补足浮亏同向加仓拒绝与冻结分批计划例外的执行前复核
+  result: >-
+    组合风险纪律的设计、配置、预览、激活、总览和类型化前端已切换为同一语义；浮亏同向加仓在激活与最终提交前均受共享判定器限制，
+    例外只能由冻结多档快照精确证明；
+    未形成真实账户交易所变更请求。
 
 real_account_trading:
-  design_owner: HALPHA-TRADEPLAN-002、HALPHA-CAP-002、HALPHA-EXE-002、HALPHA-SYS-002
+  design_owner: docs/L3/HALPHA-ENG-002-real-trade-core-technology-stack-and-build-boundaries.zh-CN.md
   exchange_change_requests_allowed: false
-  credentials_loaded: COPY_READ_ONLY_ACCOUNT_OBSERVER_ONLY
-  credential_value_recorded_in_repository_or_plan: false
-  contexts:
-    live_copy:
-      owner_key_available_outside_halpha: true
-      database_current: true
-      runtime_deployed: true
-      credential_projected: READ_ONLY_ONLY
-      venue_account_type_qualified: OWNER_DECLARED_NOT_LIVE_WRITE_QUALIFIED
-      required_lead_symbols: [BTCUSDT]
-      unique_executor_confirmed: true
-      facts_current: true
-      current_activation_id: null
-      execution_actions_created: false
-      exchange_changes_observed: false
-    live_personal:
-      owner_key_available_outside_halpha: UNKNOWN_NOT_REQUIRED_FOR_CURRENT_ITERATION
-      database_current: true
-      runtime_deployed: APP_ONLY
-      credential_projected: false
-      venue_account_type_qualified: false
-      unique_executor_confirmed: false
-      facts_current: false
-      current_activation_id: null
-      execution_actions_created: false
-      exchange_changes_observed: false
-
-independent_research:
-  product_work_dependency: NONE
-  repository: https://github.com/hhxcv/Halpha-Research
-  revision: f0e232b7be6f7ff4994519951bcab5a75a75a364
-  owned_path: external repository root
-  selection_mode: AI_AUTONOMOUS_WITHIN_RESEARCH_BOUNDARY
-  question_record: 对应外部仓库 studies/** 研究材料
-  product_effects: NONE_UNTIL_OWNER_SELECTS_RESULT
-  environment:
-    python: 3.13.14
-    lock: requirements.txt
-    isolation: 与产品虚拟环境、依赖锁、运行时和构建身份分离
-  primary_framework:
-    name: vectorbt
-    version: 1.1.0
-    role: 适合数组或 bar 表达的问题的统计与滚动分析、批量候选筛选、敏感性比较和初步组合模拟
-    product_runtime_dependency: false
-    execution_semantics_authority: false
-  product_quant_core:
-    name: NautilusTrader
-    role: 唯一产品量化交易核心，以及获选策略候选进入产品后的事件、订单、成交与在线离线一致性验证
-  qualification:
-    checked_at: 2026-08-04
-    host: Windows 10 Pro 22H2 x64
-    result: vectorbt 1.1.0 在 Python 3.13.14 完成参数广播、rolling split、DSR、时间移位和费用滑点验证
-    isolation_reason: vectorbt 1.1.0 要求 pandas 3.x，产品当前因 NautilusTrader 兼容边界锁定 pandas 2.3.3
-    evidence: 外部仓库 README.md、verify_vectorbt.py 与 GitHub CI
-  handoff:
-    applicable_to: OWNER_SELECTED_STRATEGY_CANDIDATE_ONLY
-    owner_selection_required: true
-    research_output: 仅对获选策略候选提供框架无关的固定策略说明、小型输入与确定性决策轨迹
-    product_implementation: 在产品路径重新实现或审查纯策略逻辑，不导入 VectorBT 或研究目录
-    product_acceptance: 相同规范输入的决策一致性检查，以及 NautilusTrader 事件与执行语义验证
-    shared_runtime_or_cache: false
-
-independent_monitor:
-  product_work_dependency: NONE
-  repository: https://github.com/hhxcv/Halpha-Monitor
-  python_module: halpha_monitor
-  local_endpoint: 127.0.0.1:8790
-  local_database_configuration: HALPHA_MONITOR_DB_PATH（用户级环境变量，取值不进入仓库）
-  product_runtime_dependency: false
-  halpha_control_visibility_or_control: false
-  account_or_trading_capability: false
-  validation: Python 3.13.14 独立安装、50 项测试、仓库外数据库哈希、SQLite 完整性与环境变量路径核对通过；本次迁移未启动独立服务
+  repository_fact_policy: EXTERNAL_FACTS_NOT_RECORDED
+  authority_note: Git 内容和 AI 建议均不能自行授权真实账户交易动作

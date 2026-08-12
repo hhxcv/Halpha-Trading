@@ -7,19 +7,23 @@ plans, activations, and UX command state.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from psycopg import Connection
 
-from halpha.binance_contracts import BINANCE_USDM_ACCOUNT_SNAPSHOT_SCHEMA
+from halpha.binance_contracts import parse_complete_binance_usdm_account_snapshot
 from halpha.capital.checks import check_action
+from halpha.capital.discipline import read_new_risk_discipline
 from halpha.capital.models import (
     ActivationCapitalBoundary,
     ActionCheckInput,
     AuthorityClass,
     EnvironmentKind,
+    NewRiskDisciplinePolicy,
+    NewRiskDisciplineStatus,
     RiskClass,
     StopCategory,
 )
@@ -32,6 +36,8 @@ from halpha.planning.models import (
     PlanActivation,
     PlanEvent,
     PlanLifecycle,
+    PlanDecisionContext,
+    PlanDecisionIntent,
     PositionAlignmentSpec,
     ProtectionState,
     ProposedAction,
@@ -39,6 +45,7 @@ from halpha.planning.models import (
     TradePlanContent,
     TradePlanDraft,
     TradePlanVersion,
+    new_risk_decision_context_incompatibility,
     validate_current_plan_admission,
 )
 from halpha.planning.order_schedule import (
@@ -50,8 +57,10 @@ from halpha.planning.order_policies import RuntimeConditionState
 from halpha.planning.registry import (
     DecisionBasisKind,
     FixedDecisionBasis,
+    FixedStrategyPlanBasis,
     build_fixed_decision_basis,
     fixed_decision_basis_runtime_incompatibility,
+    strategy_decision_intent_incompatibility,
 )
 from halpha.planning.repository import PostgreSQLPlanningRepository
 from halpha.planning.strategies.one_shot import StrategyProposal
@@ -91,6 +100,7 @@ def _entry_valid_until(
 def plan_runtime_incompatibility(
     *,
     decision_basis: FixedDecisionBasis,
+    decision_context: PlanDecisionContext | None,
     order_schedule_spec: OrderScheduleSpec | None,
     allowed_actions: frozenset[str],
     position_alignment: PositionAlignmentSpec | None = None,
@@ -106,6 +116,24 @@ def plan_runtime_incompatibility(
         )
     except ValueError:
         return "PLAN_ORDER_SCHEDULE_RUNTIME_INCOMPATIBLE"
+    if position_alignment is None:
+        context_incompatibility = new_risk_decision_context_incompatibility(
+            decision_basis_kind=decision_basis.kind,
+            decision_context=decision_context,
+        )
+        if context_incompatibility is not None:
+            return context_incompatibility
+        if isinstance(decision_basis, FixedStrategyPlanBasis):
+            intent_incompatibility = strategy_decision_intent_incompatibility(
+                decision_basis.economic_scope,
+                (
+                    decision_context.intent.value
+                    if decision_context.intent is not None
+                    else None
+                ),
+            )
+            if intent_incompatibility is not None:
+                return intent_incompatibility
     return fixed_decision_basis_runtime_incompatibility(decision_basis)
 
 
@@ -121,20 +149,16 @@ def _alignment_position_matches(
     payload: object,
     alignment: PositionAlignmentSpec,
 ) -> bool:
+    snapshot = parse_complete_binance_usdm_account_snapshot(payload)
     if (
-        not isinstance(payload, dict)
-        or payload.get("schema") != BINANCE_USDM_ACCOUNT_SNAPSHOT_SCHEMA
-        or payload.get("snapshot_complete") is not True
-        or payload.get("read_only") is not True
-        or payload.get("management_authority") != "NONE"
-        or payload.get("ordinary_open_order_count") != 0
-        or payload.get("algo_open_order_count") != 0
-        or not isinstance(payload.get("positions"), list)
+        snapshot is None
+        or snapshot.get("ordinary_open_order_count") != 0
+        or snapshot.get("algo_open_order_count") != 0
     ):
         return False
     matches = [
         item
-        for item in payload["positions"]
+        for item in snapshot["positions"]
         if isinstance(item, dict)
         and item.get("instrument_ref") == alignment.instrument_ref
         and item.get("position_side") == alignment.position_side
@@ -164,6 +188,31 @@ class PlanningApplicationService:
         self._planning = PostgreSQLPlanningRepository(connection, environment_id)
         self._capital = PostgreSQLCapitalRepository(connection, environment_id)
         self._environment_id = environment_id
+
+    def new_risk_discipline_status(
+        self,
+        *,
+        account_ref: str,
+        policy: NewRiskDisciplinePolicy,
+        observed_at: datetime,
+        proposed_max_allowed_loss: str | None = None,
+        proposed_max_notional: str | None = None,
+        proposed_instrument_ref: str | None = None,
+        proposed_direction: str | None = None,
+        lock: bool = False,
+    ) -> NewRiskDisciplineStatus:
+        return read_new_risk_discipline(
+            self._connection,
+            environment_id=self._environment_id,
+            account_ref=account_ref,
+            policy=policy,
+            observed_at=observed_at,
+            proposed_max_allowed_loss=proposed_max_allowed_loss,
+            proposed_max_notional=proposed_max_notional,
+            proposed_instrument_ref=proposed_instrument_ref,
+            proposed_direction=proposed_direction,
+            lock=lock,
+        )
 
     def _finalize_completed_receipts(
         self,
@@ -364,6 +413,24 @@ class PlanningApplicationService:
             content.decision_basis,
             product_build_id=product_build_id,
         )
+        if content.position_alignment is None:
+            context_incompatibility = new_risk_decision_context_incompatibility(
+                decision_basis_kind=basis.kind,
+                decision_context=content.decision_context,
+            )
+            if context_incompatibility is not None:
+                raise ValueError(context_incompatibility)
+            if isinstance(basis, FixedStrategyPlanBasis):
+                intent_incompatibility = strategy_decision_intent_incompatibility(
+                    basis.economic_scope,
+                    (
+                        content.decision_context.intent.value
+                        if content.decision_context.intent is not None
+                        else None
+                    ),
+                )
+                if intent_incompatibility is not None:
+                    raise ValueError(intent_incompatibility)
         fields = {
             "plan_version_id": plan_version_id,
             "plan_id": plan_id,
@@ -400,14 +467,77 @@ class PlanningApplicationService:
         authority_class: AuthorityClass,
         observed_at: datetime,
         order_schedule_snapshot: OrderSchedulePreview | None = None,
+        new_risk_discipline_policy: NewRiskDisciplinePolicy | None = None,
+        live_profit_qualification_checker: (
+            Callable[[TradePlanVersion], Mapping[str, Any]] | None
+        ) = None,
     ) -> PlanActivation:
         version = self._planning.get_version(plan_version_id)
+        live_profit_qualification_snapshot: dict[str, Any] | None = None
+        if (
+            environment_kind is EnvironmentKind.LIVE
+            and version.position_alignment is None
+            and version.decision_context is not None
+            and version.decision_context.intent is PlanDecisionIntent.PROFIT_SEEKING
+        ):
+            if live_profit_qualification_checker is None:
+                raise ValueError("LIVE_PROFIT_QUALIFICATION_NOT_CONFIGURED")
+            qualification_result = live_profit_qualification_checker(version)
+            if not isinstance(qualification_result, Mapping):
+                raise ValueError("LIVE_PROFIT_QUALIFICATION_SNAPSHOT_INVALID")
+            live_profit_qualification_snapshot = dict(qualification_result)
+            artifact_digest = live_profit_qualification_snapshot.get(
+                "artifact_content_digest"
+            )
+            if (
+                live_profit_qualification_snapshot.get("status")
+                != "ELIGIBLE_INPUT"
+                or live_profit_qualification_snapshot.get("eligible_input") is not True
+                or live_profit_qualification_snapshot.get(
+                    "live_activation_authority"
+                )
+                is not False
+                or live_profit_qualification_snapshot.get(
+                    "capital_scaling_authority"
+                )
+                is not False
+                or not isinstance(artifact_digest, str)
+                or len(artifact_digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in artifact_digest
+                )
+            ):
+                raise ValueError("LIVE_PROFIT_QUALIFICATION_SNAPSHOT_INVALID")
+        if (
+            version.position_alignment is None
+            and new_risk_discipline_policy is not None
+        ):
+            discipline = self.new_risk_discipline_status(
+                account_ref=version.account_ref,
+                policy=new_risk_discipline_policy,
+                observed_at=observed_at,
+                proposed_max_allowed_loss=(
+                    version.requested_limits.max_allowed_loss
+                ),
+                proposed_max_notional=version.requested_limits.max_notional,
+                proposed_instrument_ref=version.instrument_ref,
+                proposed_direction=version.direction.value,
+                lock=True,
+            )
+            if not discipline.new_risk_allowed:
+                raise ValueError(
+                    discipline.blocker_codes[0]
+                    if discipline.blocker_codes
+                    else "NEW_RISK_DISCIPLINE_UNKNOWN"
+                )
         self.require_current_position_alignment(
             version,
             observed_at=observed_at,
         )
         incompatibility = plan_runtime_incompatibility(
             decision_basis=version.decision_basis,
+            decision_context=version.decision_context,
             order_schedule_spec=version.order_schedule_spec,
             allowed_actions=version.allowed_actions,
             position_alignment=version.position_alignment,
@@ -484,6 +614,15 @@ class PlanningApplicationService:
                 "deadlines": {"entry_valid_until": entry_valid_until.isoformat()},
                 "condition_judgements": {},
                 "last_bar_cursors": {},
+                **(
+                    {
+                        "live_profit_qualification": (
+                            live_profit_qualification_snapshot
+                        )
+                    }
+                    if live_profit_qualification_snapshot is not None
+                    else {}
+                ),
             },
             protection_state=ProtectionState.NONE,
             created_at=observed_at,

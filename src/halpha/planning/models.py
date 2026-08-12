@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+import re
 from typing import Any, Literal
 
 from pydantic import (
@@ -58,6 +59,25 @@ class ProtectionState(StrEnum):
 class PlanCreatorKind(StrEnum):
     HUMAN = "HUMAN"
     AI = "AI"
+    MONITOR = "MONITOR"
+
+
+class PlanDecisionIntent(StrEnum):
+    """Why this plan is allowed to consume one risk attempt."""
+
+    PROFIT_SEEKING = "PROFIT_SEEKING"
+    VALIDATION = "VALIDATION"
+
+
+class PlanSetupFamily(StrEnum):
+    """Small, stable comparison buckets; never executable conditions."""
+
+    BREAKOUT_CONTINUATION = "BREAKOUT_CONTINUATION"
+    PULLBACK_CONTINUATION = "PULLBACK_CONTINUATION"
+    RANGE_MEAN_REVERSION = "RANGE_MEAN_REVERSION"
+    REVERSAL = "REVERSAL"
+    EVENT_DRIVEN = "EVENT_DRIVEN"
+    OTHER = "OTHER"
 
 
 class PositionAlignmentOperation(StrEnum):
@@ -69,6 +89,8 @@ POSITION_ALIGNMENT_ALLOWED_ACTIONS = frozenset({"REDUCE_OR_CLOSE_MARKET"})
 
 
 PERSISTED_HISTORY_CONTEXT_KEY = "persisted_history"
+PLAYBOOK_REF_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,95}$"
+_PLAYBOOK_REF_RE = re.compile(PLAYBOOK_REF_PATTERN)
 
 
 def validate_current_plan_admission(
@@ -152,14 +174,76 @@ class PlanDecisionContext(PlanningModel):
     rationale: str = Field(min_length=1, max_length=2000)
     evidence: str = Field(min_length=1, max_length=2000)
     limitations: str = Field(min_length=1, max_length=2000)
+    # Optional defaults keep immutable historical plans readable.  Current
+    # new-risk API admission requires the complete experiment fields below.
+    intent: PlanDecisionIntent | None = None
+    setup_family: PlanSetupFamily | None = None
+    playbook_ref: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=96,
+        pattern=PLAYBOOK_REF_PATTERN,
+    )
+    invalidation: str | None = Field(default=None, max_length=2000)
+    evidence_cutoff: datetime | None = None
 
-    @field_validator("rationale", "evidence", "limitations")
+    @field_validator("rationale", "evidence", "limitations", "invalidation")
     @classmethod
-    def text_is_readable(cls, value: str) -> str:
+    def text_is_readable(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         normalized = value.replace("\r\n", "\n").replace("\r", "\n").strip()
         if not normalized or len(normalized) > 2000 or "\x00" in normalized:
             raise ValueError("PLAN_DECISION_CONTEXT_INVALID")
         return normalized
+
+    @field_validator("playbook_ref", mode="before")
+    @classmethod
+    def playbook_ref_is_stable(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("PLAN_DECISION_PLAYBOOK_REF_INVALID")
+        normalized = value.strip()
+        if _PLAYBOOK_REF_RE.fullmatch(normalized) is None:
+            raise ValueError("PLAN_DECISION_PLAYBOOK_REF_INVALID")
+        return normalized
+
+    @field_validator("evidence_cutoff")
+    @classmethod
+    def evidence_cutoff_is_aware(
+        cls,
+        value: datetime | None,
+    ) -> datetime | None:
+        if value is not None and value.utcoffset() is None:
+            raise ValueError("PLAN_DECISION_EVIDENCE_CUTOFF_INVALID")
+        return value
+
+    @property
+    def experiment_complete(self) -> bool:
+        return (
+            self.intent is not None
+            and self.setup_family is not None
+            and self.invalidation is not None
+            and self.evidence_cutoff is not None
+        )
+
+
+def new_risk_decision_context_incompatibility(
+    *,
+    decision_basis_kind: DecisionBasisKind,
+    decision_context: PlanDecisionContext | None,
+) -> str | None:
+    """Return one current-admission reason without invalidating old history."""
+
+    if decision_context is None or not decision_context.experiment_complete:
+        return "PLAN_DECISION_EXPERIMENT_INCOMPLETE"
+    if decision_basis_kind is DecisionBasisKind.DIRECT_EXECUTION:
+        if decision_context.playbook_ref is None:
+            return "PLAN_DECISION_PLAYBOOK_REF_REQUIRED"
+    elif decision_context.playbook_ref is not None:
+        return "PLAN_DECISION_PLAYBOOK_REF_UNEXPECTED"
+    return None
 
 
 class PositionAlignmentSpec(PlanningModel):

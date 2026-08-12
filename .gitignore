@@ -48,9 +48,9 @@ test-results/
 /frontend/output/
 /.playwright-cli/
 /output/
+/outputs/
 .tmp-*.png
 
-# Local configuration and credentials
 /config/halpha.toml
 /config/halpha.live-read-only.toml
 /config/halpha.live-write.toml

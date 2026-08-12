@@ -3,6 +3,7 @@ export type ReviewPerformanceTrade = {
   commission: number;
   entryNotional?: number | null;
   classification?: string;
+  profitSeekingEligible?: boolean;
 };
 
 export const LOSS_STREAK_ALERT_THRESHOLD = 3;
@@ -37,9 +38,9 @@ export type ReviewPerformanceSummary = {
   currentStreakCount: number;
 };
 
-export type AccountAndStrategyPerformanceSummary = {
+export type AccountAndProfitSeekingPerformanceSummary = {
   account: ReviewPerformanceSummary;
-  strategy: ReviewPerformanceSummary;
+  profitSeeking: ReviewPerformanceSummary;
 };
 
 export function summarizeReviewPerformance(
@@ -119,14 +120,15 @@ export function summarizeReviewPerformance(
   };
 }
 
-export function summarizeAccountAndStrategyPerformance(
+export function summarizeAccountAndProfitSeekingPerformance(
   tradesInClosingOrder: ReviewPerformanceTrade[],
-): AccountAndStrategyPerformanceSummary {
+): AccountAndProfitSeekingPerformanceSummary {
   return {
     account: summarizeReviewPerformance(tradesInClosingOrder),
-    strategy: summarizeReviewPerformance(
+    profitSeeking: summarizeReviewPerformance(
       tradesInClosingOrder.filter((trade) => (
-        isStrategyPerformanceClassification(trade.classification)
+        trade.profitSeekingEligible === true
+        && isStrategyPerformanceClassification(trade.classification)
       )),
     ),
   };

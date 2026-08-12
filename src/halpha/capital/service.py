@@ -8,6 +8,7 @@ from typing import Any
 from psycopg import Connection
 
 from halpha.capital.checks import check_action
+from halpha.capital.discipline import read_new_risk_discipline
 from halpha.capital.models import (
     AccountSystemStopReleaseRequest,
     AccountSystemStopSource,
@@ -16,6 +17,8 @@ from halpha.capital.models import (
     AuthorityClass,
     CapDecision,
     EnvironmentKind,
+    NewRiskDisciplinePolicy,
+    NewRiskDisciplineStatus,
     StopCategory,
     StopStateVersion,
 )
@@ -66,6 +69,31 @@ class CapitalApplicationService:
             action,
             boundary=boundary,
             stop_states=stop_states,
+        )
+
+    def new_risk_discipline_status(
+        self,
+        *,
+        account_ref: str,
+        policy: NewRiskDisciplinePolicy,
+        observed_at: datetime,
+        entry_instrument_ref: str | None = None,
+        entry_direction: str | None = None,
+        is_frozen_scale_in: bool = False,
+        lock: bool = False,
+    ) -> NewRiskDisciplineStatus:
+        """Read the same account-wide admission contract used at activation."""
+
+        return read_new_risk_discipline(
+            self._connection,
+            environment_id=self._environment_id,
+            account_ref=account_ref,
+            policy=policy,
+            observed_at=observed_at,
+            entry_instrument_ref=entry_instrument_ref,
+            entry_direction=entry_direction,
+            is_frozen_scale_in=is_frozen_scale_in,
+            lock=lock,
         )
 
     def new_risk_allowed(self, activation_id: str) -> bool:

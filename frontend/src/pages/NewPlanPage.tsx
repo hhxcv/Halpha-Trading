@@ -31,6 +31,7 @@ import {
   ApiFailure,
   createActivation,
   createPlan,
+  exportPlaybookQualification,
   fixPlan,
   getActivationPreview,
   getExecutionFeeEvidence,
@@ -38,6 +39,8 @@ import {
   getPlan,
   getStrategies,
   isUnknownMutationResult,
+  previewDecisionEvidence,
+  type DecisionEvidencePreviewPayload,
   type PlanCreatePayload,
   type PlanDraftPayload,
   type OrderScheduleSpec,
@@ -57,6 +60,7 @@ import { currentEntryBoundaryBreach } from "../components/orderScheduleDecisionA
 import { retargetGeneratedEventCondition } from "../components/orderScheduleDirectionModel";
 import type { OrderChartPriceAnnotation } from "../components/orderScheduleChartModel";
 import StrategyIntroduction from "../components/StrategyIntroduction";
+import DecisionEvidencePanel from "../components/DecisionEvidencePanel";
 import {
   closedBarBreakoutGapPercent,
   entryExtensionBoundary,
@@ -97,14 +101,31 @@ import {
   writeChartIntervalPreference,
 } from "../chartIntervalPreference";
 import { surfaceFrameSx } from "../theme";
+import {
+  initialStrategyPlanIntent,
+  strategyAllowsPlanIntent,
+} from "../strategyIntentQualification";
+import { isValidPlaybookRef, normalizePlaybookRef } from "../playbookIdentity";
+import {
+  playbookQualificationFilename,
+  serializePlaybookQualification,
+  type PlaybookQualificationTarget,
+} from "../playbookQualificationArtifact";
 
 
 type Direction = "LONG" | "SHORT";
 type PlanCreatorKind = "HUMAN" | "AI";
+type PlanDecisionIntent = NonNullable<PlanCreatePayload["decision_context"]["intent"]>;
+type PlanSetupFamily = NonNullable<PlanCreatePayload["decision_context"]["setup_family"]>;
 type PlanDecisionContextInput = {
   rationale: string;
   evidence: string;
   limitations: string;
+  intent: PlanDecisionIntent | "";
+  setup_family: PlanSetupFamily | "";
+  playbook_ref: string;
+  invalidation: string;
+  evidence_cutoff: string | null;
 };
 type StrategyDirectionFilter = "ALL" | Direction;
 type StrategySort = "NAME_ASC" | "NAME_DESC" | "VERSION_DESC";
@@ -130,11 +151,30 @@ type QuickStartAttempt = {
   createIdentity: StableRequestIdentity;
 };
 
+function qualificationExportError(error: unknown): string {
+  const code = error instanceof ApiFailure
+    ? error.code
+    : "PLAYBOOK_QUALIFICATION_EXPORT_FAILED";
+  const labels: Record<string, string> = {
+    PLAYBOOK_QUALIFICATION_EVIDENCE_NOT_CANDIDATE: "服务端最新证据已不再满足可重复性筛查",
+    PLAYBOOK_QUALIFICATION_TRACEABILITY_INCOMPLETE: "样本复盘身份或事实截止不完整",
+    PLAYBOOK_QUALIFICATION_SAMPLE_DIGEST_MISMATCH: "样本身份摘要与当前复盘集合不一致",
+    PLAYBOOK_QUALIFICATION_EVIDENCE_INCOMPLETE: "筛查指标不完整",
+    PLAYBOOK_QUALIFICATION_EXPORT_REQUIRES_DEMO: "只能在 Demo 上下文生成证据包",
+  };
+  return labels[code] ?? code;
+}
+
 const DIRECT_EXECUTION_REF = "DIRECT_EXECUTION@1";
 const DIRECT_DECISION_CONTEXT: PlanDecisionContextInput = {
-  rationale: "基于当前价格、盘口、订单结构和风险收益评估执行本次订单计划。",
-  evidence: "以保存时页面可用的 Binance 当前环境盘口、服务端交易所规则、订单标准化预览及费用证据为依据；不可用项保持未知。",
-  limitations: "未来价格、成交概率、触发后滑点和持有期间累计资金费未知；本说明不构成可执行交易条件。",
+  rationale: "",
+  evidence: "",
+  limitations: "",
+  intent: "",
+  setup_family: "",
+  playbook_ref: "",
+  invalidation: "",
+  evidence_cutoff: null,
 };
 const ignoreStrategyChartRangeChange = () => undefined;
 const ignoreStrategyChartPriceChange = () => undefined;
@@ -152,8 +192,22 @@ function strategyDecisionContext(
     rationale: strategy.value_logic,
     evidence: `执行依据为 ${strategy.display_name}（${strategy.strategy_id}@${strategy.strategy_version}）；当前盈利证据状态为 ${evidenceState}。`,
     limitations: evidenceLimit,
+    intent: initialStrategyPlanIntent(strategy.economic_scope),
+    setup_family: "BREAKOUT_CONTINUATION",
+    playbook_ref: "",
+    invalidation: "未形成固定的闭合 K 线确认、超过最大追价边界、执行前价差不合格或保护边界无法成立时，不入场；入场后由固定止损与时间退出证伪。",
+    evidence_cutoff: null,
   };
 }
+
+const setupFamilyLabels: Record<PlanSetupFamily, string> = {
+  BREAKOUT_CONTINUATION: "突破延续",
+  PULLBACK_CONTINUATION: "回调延续",
+  RANGE_MEAN_REVERSION: "区间均值回归",
+  REVERSAL: "趋势反转",
+  EVENT_DRIVEN: "事件驱动",
+  OTHER: "其他（需写清规则）",
+};
 
 function fundingRatePercent(value: string): string {
   const rate = Number(value);
@@ -527,6 +581,14 @@ export default function NewPlanPage() {
   const strategyId = directExecution ? "" : selectedBasisRef;
   const selectingStrategy = !editing && !copying && creationStep === "strategy";
   const selectedStrategy = strategies.data?.find((strategy) => strategy.strategy_id === strategyId);
+  const profitSeekingIntentAllowed = directExecution || Boolean(
+    selectedStrategy
+    && strategyAllowsPlanIntent(selectedStrategy.economic_scope, "PROFIT_SEEKING"),
+  );
+  const validationIntentAllowed = directExecution || Boolean(
+    selectedStrategy
+    && strategyAllowsPlanIntent(selectedStrategy.economic_scope, "VALIDATION"),
+  );
   const initialPlanNameRef = useRef(
     directModeRequested
       ? `${requestedInstrument.replace(/-PERP$/, "")} ${addPositionRequested ? "独立追加开仓" : "直接执行"} ${formatUserVisibleTime(new Date().toISOString())}`.slice(0, 80)
@@ -712,7 +774,16 @@ export default function NewPlanPage() {
       ? source.plan_name ?? ""
       : `${source.plan_name?.trim() || "未命名计划"} 副本`.slice(0, 80));
     if (source.decision_context) {
-      setDecisionContext(source.decision_context);
+      setDecisionContext({
+        rationale: source.decision_context.rationale,
+        evidence: source.decision_context.evidence,
+        limitations: source.decision_context.limitations,
+        intent: source.decision_context.intent ?? "",
+        setup_family: source.decision_context.setup_family ?? "",
+        playbook_ref: source.decision_context.playbook_ref ?? "",
+        invalidation: source.decision_context.invalidation ?? "",
+        evidence_cutoff: source.decision_context.evidence_cutoff ?? null,
+      });
     }
     const duration = Math.round(
       (Date.parse(source.valid_until) - Date.parse(source.valid_from)) / 60_000,
@@ -808,14 +879,6 @@ export default function NewPlanPage() {
     && Number.isInteger(Number(validMinutes));
   const normalizedPlanName = planName.trim();
   const planNameValid = normalizedPlanName.length > 0 && normalizedPlanName.length <= 80;
-  const normalizedDecisionContext: PlanDecisionContextInput = {
-    rationale: decisionContext.rationale.trim(),
-    evidence: decisionContext.evidence.trim(),
-    limitations: decisionContext.limitations.trim(),
-  };
-  const decisionContextValid = Object.values(normalizedDecisionContext).every(
-    (value) => value.length > 0 && value.length <= 2000,
-  );
   const tradeAmountValid = Number(tradeAmount) > 0 && Number.isFinite(Number(tradeAmount));
   const initialStopValid = numberInRange(parameters.initial_stop_atr_multiple, 1, 3);
   const maxExtensionValid = numberInRange(parameters.max_entry_extension_atr, .1, 1);
@@ -887,6 +950,111 @@ export default function NewPlanPage() {
   const visibleSourceCutoff = usableLiveQuote?.source_cutoff
     ?? currentMarket?.source_cutoff
     ?? null;
+  const normalizedDecisionContext: PlanDraftPayload["decision_context"] = {
+    rationale: decisionContext.rationale.trim(),
+    evidence: decisionContext.evidence.trim(),
+    limitations: decisionContext.limitations.trim(),
+    intent: decisionContext.intent || null,
+    setup_family: decisionContext.setup_family || null,
+    playbook_ref: directExecution
+      ? normalizePlaybookRef(decisionContext.playbook_ref) || null
+      : null,
+    invalidation: decisionContext.invalidation.trim() || null,
+    evidence_cutoff: visibleSourceCutoff ?? decisionContext.evidence_cutoff,
+  };
+  const decisionContextValid = (
+    normalizedDecisionContext.rationale.length > 0
+    && normalizedDecisionContext.rationale.length <= 2000
+    && normalizedDecisionContext.evidence.length > 0
+    && normalizedDecisionContext.evidence.length <= 2000
+    && normalizedDecisionContext.limitations.length > 0
+    && normalizedDecisionContext.limitations.length <= 2000
+    && typeof normalizedDecisionContext.invalidation === "string"
+    && normalizedDecisionContext.invalidation.length > 0
+    && normalizedDecisionContext.invalidation.length <= 2000
+    && normalizedDecisionContext.intent !== null
+    && normalizedDecisionContext.setup_family !== null
+    && (!directExecution || isValidPlaybookRef(decisionContext.playbook_ref))
+    && Boolean(normalizedDecisionContext.evidence_cutoff)
+    && (!parameters.demo_immediate_entry || normalizedDecisionContext.intent === "VALIDATION")
+    && (
+      (normalizedDecisionContext.intent === "PROFIT_SEEKING" && profitSeekingIntentAllowed)
+      || (normalizedDecisionContext.intent === "VALIDATION" && validationIntentAllowed)
+    )
+  );
+  const decisionEvidencePayload: DecisionEvidencePreviewPayload = {
+    instrument_ref: instrument,
+    direction: parameters.direction,
+    decision_basis: directExecution
+      ? {
+          kind: "DIRECT_EXECUTION",
+          decision_basis_ref: DIRECT_EXECUTION_REF,
+          parameters: {},
+        }
+      : {
+          kind: "STRATEGY_SIGNAL",
+          decision_basis_ref: strategyId,
+          parameters,
+        },
+    intent: decisionContext.intent as PlanDecisionIntent,
+    setup_family: decisionContext.setup_family as PlanSetupFamily,
+    playbook_ref: normalizedDecisionContext.playbook_ref,
+  };
+  const decisionEvidence = useQuery({
+    queryKey: [
+      "decision-evidence-preview",
+      environmentScope,
+      instrument,
+      parameters.direction,
+      directExecution ? DIRECT_EXECUTION_REF : strategyId,
+      directExecution ? "{}" : JSON.stringify(parameters),
+      decisionContext.intent,
+      decisionContext.setup_family,
+      normalizedDecisionContext.playbook_ref,
+    ],
+    queryFn: () => previewDecisionEvidence(decisionEvidencePayload),
+    enabled: !selectingStrategy
+      && Boolean(directExecution || strategyId)
+      && Boolean(decisionContext.intent)
+      && Boolean(decisionContext.setup_family)
+      && (!directExecution || isValidPlaybookRef(decisionContext.playbook_ref))
+      && (directExecution || strategyParameterRangesValid),
+    retry: 1,
+    staleTime: 30_000,
+  });
+  const qualificationExport = useMutation({
+    mutationFn: (target: PlaybookQualificationTarget) => (
+      exportPlaybookQualification({
+        ...decisionEvidencePayload,
+        target_venue_account_type: target,
+      })
+    ),
+    onSuccess: (result, target) => {
+      const content = serializePlaybookQualification(result);
+      const filename = playbookQualificationFilename(
+        result.artifact.cohort.playbook_ref,
+        target,
+        result.artifact_content_digest,
+      );
+      const url = window.URL.createObjectURL(
+        new Blob([content], { type: "application/json;charset=utf-8" }),
+      );
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      anchor.hidden = true;
+      document.body.appendChild(anchor);
+      try {
+        anchor.click();
+      } finally {
+        anchor.remove();
+        window.URL.revokeObjectURL(url);
+      }
+    },
+  });
+  useEffect(() => {
+    qualificationExport.reset();
+  }, [decisionEvidence.data?.sample_identity_digest]);
   const strategyPriceTickSize = instrument === "BTCUSDT-PERP" ? "0.1" : null;
   const strategyPrice = (value: string | number) => (
     tradingPrice(value, strategyPriceTickSize)
@@ -1402,13 +1570,80 @@ export default function NewPlanPage() {
     <Box sx={{ pt: 1.25, borderTop: 1, borderColor: "divider" }}>
       <Typography component="h3" variant="subtitle2">决策记录</Typography>
       <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: .25, mb: 1.25 }}>
-        随计划版本保存，用于启动与复核；这些文字不会被转换成触发或下单条件。
+        随计划版本保存，用于启动与复核；先固定假设和证伪条件，不能在看到结果后改写。
       </Typography>
       <Stack spacing={1.25}>
+        {directExecution && <TextField
+          size="small"
+          label="交易剧本标识"
+          value={decisionContext.playbook_ref}
+          onChange={(event) => setDecisionContext((current) => ({
+            ...current,
+            playbook_ref: event.target.value,
+          }))}
+          error={!isValidPlaybookRef(decisionContext.playbook_ref)}
+          helperText={isValidPlaybookRef(decisionContext.playbook_ref)
+            ? "同一标识只用于同一套入场、失效、保护和退出规则；规则实质变化时必须换新标识"
+            : "必填：1–96 位字母、数字或 . _ : -，如 BTC_BREAKOUT_V1；不要填写每笔唯一信号 ID"}
+          slotProps={{ htmlInput: { maxLength: 96 } }}
+          required
+        />}
+        <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "repeat(2,minmax(0,1fr))" }, gap: 1.25 }}>
+          <TextField
+            select
+            size="small"
+            label="本次目的"
+            value={decisionContext.intent}
+            onChange={(event) => setDecisionContext((current) => ({
+              ...current,
+              intent: event.target.value as PlanDecisionIntent,
+            }))}
+            error={!decisionContext.intent
+              || (decisionContext.intent === "PROFIT_SEEKING" && !profitSeekingIntentAllowed)
+              || (decisionContext.intent === "VALIDATION" && !validationIntentAllowed)}
+            helperText={decisionContext.intent === "PROFIT_SEEKING" && !profitSeekingIntentAllowed
+              ? "当前策略未取得盈利导向资格；请选择机制验证。服务端也会拒绝把它固定或激活为盈利样本"
+              : decisionContext.intent === "VALIDATION" && !validationIntentAllowed
+                ? "当前策略未取得验证用途资格；不能保存或激活这个目的"
+              : decisionContext.intent === "VALIDATION"
+              ? "验证软件或执行闭环；实际盈亏保留，但不进入策略收益样本"
+              : decisionContext.intent === "PROFIT_SEEKING"
+                ? "按固定交易假设获取市场收益；盈利与亏损都进入后续评价"
+                : "必须明确是盈利导向还是机制验证"}
+            required
+          >
+            <MenuItem value="" disabled>请选择本次目的</MenuItem>
+            <MenuItem value="PROFIT_SEEKING" disabled={!profitSeekingIntentAllowed}>
+              盈利导向交易{profitSeekingIntentAllowed ? "" : "（当前策略未获资格）"}
+            </MenuItem>
+            <MenuItem value="VALIDATION" disabled={!validationIntentAllowed}>
+              机制 / 软件验证{validationIntentAllowed ? "" : "（当前策略未获资格）"}
+            </MenuItem>
+          </TextField>
+          <TextField
+            select
+            size="small"
+            label="交易形态"
+            value={decisionContext.setup_family}
+            onChange={(event) => setDecisionContext((current) => ({
+              ...current,
+              setup_family: event.target.value as PlanSetupFamily,
+            }))}
+            error={!decisionContext.setup_family}
+            helperText="历史证据只与同一形态比较；不要为迎合结果改标签"
+            required
+          >
+            <MenuItem value="" disabled>请选择交易形态</MenuItem>
+            {(Object.entries(setupFamilyLabels) as Array<[PlanSetupFamily, string]>).map(([value, label]) => (
+              <MenuItem key={value} value={value}>{label}</MenuItem>
+            ))}
+          </TextField>
+        </Box>
         {([
-          ["rationale", "交易理由", "说明为什么此时、此方向值得承担风险"],
-          ["evidence", "依据与证据", "记录所用策略、行情、规则或量化证据"],
-          ["limitations", "已知局限", "记录未知项、失效场景和证据边界"],
+          ["rationale", "可证伪交易假设", "必须说明价格为何应在什么条件下向所选方向发展，不能只写“看涨/突破”"],
+          ["evidence", "入场前证据", "记录结构、K 线、成交量、波动、订单条件或外部信号；页面会另存当前行情截止点"],
+          ["invalidation", "假设失效与放弃条件", "说明什么事实出现时不再入场或承认判断错误；文字不会自动成为订单条件，需在订单计划中落实"],
+          ["limitations", "已知局限", "记录样本不足、未知项、滑点、资金费、数据或方法边界"],
         ] as const).map(([key, label, helper]) => {
           const value = decisionContext[key];
           const valid = value.trim().length > 0 && value.trim().length <= 2000;
@@ -1432,9 +1667,48 @@ export default function NewPlanPage() {
             />
           );
         })}
+        <TextField
+          size="small"
+          label="Halpha 行情证据截止"
+          value={normalizedDecisionContext.evidence_cutoff
+            ? formatUserVisibleTime(normalizedDecisionContext.evidence_cutoff)
+            : "等待当前环境行情"}
+          helperText="由当前环境行情自动固定；不是未来价格承诺"
+          slotProps={{ htmlInput: { readOnly: true } }}
+          error={!normalizedDecisionContext.evidence_cutoff}
+        />
+        <Alert severity="info" variant="outlined">
+          这些文字只记录决策。真正阻止追价、失效入场或扩大损失的边界，必须同时配置为订单条件、取消规则、止损或时间退出。
+        </Alert>
       </Stack>
     </Box>
   );
+  const decisionEvidencePanel = decisionContext.intent
+    && decisionContext.setup_family
+    && (!directExecution || isValidPlaybookRef(decisionContext.playbook_ref))
+    ? <DecisionEvidencePanel
+        evidence={decisionEvidence.data}
+        pending={decisionEvidence.isPending || decisionEvidence.isFetching}
+        failed={decisionEvidence.isError}
+        qualificationExportAvailable={status.environment_kind === "DEMO"}
+        qualificationExportPending={qualificationExport.isPending}
+        qualificationExportTarget={qualificationExport.variables ?? null}
+        qualificationExportError={qualificationExport.isError
+          ? qualificationExportError(qualificationExport.error)
+          : null}
+        qualificationExportSuccess={qualificationExport.isSuccess
+          ? {
+              target: qualificationExport.variables,
+              digest: qualificationExport.data.artifact_content_digest,
+            }
+          : null}
+        onExportQualification={(target) => qualificationExport.mutate(target)}
+      />
+    : <Alert severity="info" variant="outlined" sx={{ mt: 2 }}>
+        {directExecution
+          ? "填写交易剧本标识并选择本次目的和交易形态后，Halpha 才能核对完全同类历史样本；不会用全品种、相似标签或单次信号 ID 扫描凑数。"
+          : "选择本次目的和交易形态后，Halpha 才能核对完全同类历史样本；不会用全品种或相似标签扫描凑数。"}
+      </Alert>;
 
   if (selectingStrategy) {
     return <StrategySelection
@@ -1456,7 +1730,7 @@ export default function NewPlanPage() {
       : !planNameValid
         ? "填写有效计划名称。"
         : !decisionContextValid
-          ? "补全交易理由、依据与证据、已知局限。"
+          ? "补全交易目的、形态、可证伪假设、失效条件、依据、局限与当前行情截止。"
         : !tradeAmountValid
           ? "计划资金上限必须大于 0。"
           : !planValidityValid
@@ -1543,12 +1817,13 @@ export default function NewPlanPage() {
               <TextField
                 size="small"
                 label="创建来源"
-                value={draft.data?.content.creator_kind === "AI" ? "AI 创建" : draft.data?.content.creator_kind === "HUMAN" ? "人工创建" : "未知"}
+                value={draft.data?.content.creator_kind === "AI" ? "AI 创建" : draft.data?.content.creator_kind === "HUMAN" ? "人工创建" : draft.data?.content.creator_kind === "MONITOR" ? "Monitor 创建" : "未知"}
                 slotProps={{ htmlInput: { readOnly: true } }}
               />
             )}
           </Box>
           {decisionContextFields}
+          {decisionEvidencePanel}
         </Stack>
       </Box>
     );
@@ -1965,13 +2240,14 @@ export default function NewPlanPage() {
           ) : (
             <TextField
               label="创建来源"
-              value={draft.data?.content.creator_kind === "AI" ? "AI 创建" : draft.data?.content.creator_kind === "HUMAN" ? "人工创建" : "未知"}
+              value={draft.data?.content.creator_kind === "AI" ? "AI 创建" : draft.data?.content.creator_kind === "HUMAN" ? "人工创建" : draft.data?.content.creator_kind === "MONITOR" ? "Monitor 创建" : "未知"}
               helperText={draft.data?.content.created_at ? `创建于 ${formatUserVisibleTime(draft.data.content.created_at)}` : "创建时间未知"}
               slotProps={{ htmlInput: { readOnly: true } }}
             />
           )}
         </Box>
         <Box sx={{ mt: 2 }}>{decisionContextFields}</Box>
+        {decisionEvidencePanel}
       </Box>
 
       {selectedStrategy ? (
@@ -2073,7 +2349,12 @@ export default function NewPlanPage() {
 
       {status.environment_kind === "DEMO" && <Box sx={{ ...surfaceFrameSx, mt: 3, p: 2, borderColor: parameters.demo_immediate_entry ? "warning.main" : "divider" }}>
         <FormControlLabel
-          control={<Checkbox checked={parameters.demo_immediate_entry} onChange={(event) => update("demo_immediate_entry", event.target.checked)} />}
+          control={<Checkbox checked={parameters.demo_immediate_entry} onChange={(event) => {
+            update("demo_immediate_entry", event.target.checked);
+            if (event.target.checked) {
+              setDecisionContext((current) => ({ ...current, intent: "VALIDATION" }));
+            }
+          }} />}
           label="下单流程验证"
         />
         <Typography color="text.secondary" variant="body2">

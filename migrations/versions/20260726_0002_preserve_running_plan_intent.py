@@ -22,7 +22,7 @@ depends_on = None
 
 
 _DEMO_ENVIRONMENT_ID = "binance-demo-primary"
-_STALE_STOP_ID = "5b26bd1d-f8bb-45ca-82fa-214d5d7edccf"
+_STALE_STOP_ID = "00000000-0000-4000-8000-000000000002"
 
 
 def _json_value(value: object) -> object:

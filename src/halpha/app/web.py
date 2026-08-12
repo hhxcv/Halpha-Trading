@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -39,14 +40,18 @@ from halpha.app.api_models import (
     ActivationSummaryResponse,
     ActivationTimelineEntryResponse,
     ControlPreviewResponse,
+    DecisionEvidenceResponse,
     ExecutionFeeEvidenceResponse,
     OrderSchedulePreviewPayload,
     OverviewResponse,
     PlanDeleteResponse,
     PlanSummaryResponse,
+    PlaybookQualificationExportResponse,
     ReceiptResponse,
     ReviewCompletionResponse,
     ReviewHistoryResponse,
+    ReviewPricePathEvidenceResponse,
+    ReviewSequenceEvidenceResponse,
     ReviewResponse,
     SettingsStatusResponse,
     StrategySummaryResponse,
@@ -84,7 +89,9 @@ from halpha.app.planning_api import (
     SystemStopReleasePayload,
 )
 from halpha.app.outcomes_api import (
+    DecisionEvidencePreviewPayload,
     OutcomesApiUnavailable,
+    PlaybookQualificationExportPayload,
     PostgreSQLOutcomesApi,
     ReviewCompletionPayload,
     ReviewRefreshPayload,
@@ -99,10 +106,14 @@ from halpha.app.secrets import AppSecrets
 from halpha.app.security import (
     CsrfMiddleware,
     LocalRequestBoundaryMiddleware,
+    PROGRAMMATIC_MONITOR_CALLER,
+    add_programmatic_plan_openapi_contract,
     allowed_local_origin,
     csrf_cookie_name,
+    programmatic_caller,
 )
 from halpha.capital.repository import CapitalConflict
+from halpha.capital.discipline import evaluate_new_risk_discipline
 from halpha.configuration import HalphaSettings, app_settings
 from halpha.database.schema_version import require_current_schema
 from halpha.live_write_gate import LiveWriteGateStatus, evaluate_live_write_gate
@@ -117,18 +128,43 @@ from halpha.planning.order_schedule import (
     validate_new_direct_execution_schedule,
 )
 from halpha.outcomes.models import Review, StageReview
+from halpha.outcomes.price_path import (
+    ReviewPricePathBasis,
+    ReviewPricePathInterval,
+    prepare_review_price_path,
+    summarize_review_price_path,
+)
+from halpha.outcomes.sequence_evidence import (
+    ReviewSequenceScope,
+    ReviewSequenceTrade,
+    prepare_review_sequence,
+    summarize_review_sequence,
+    unavailable_sequence_price_path,
+)
 from halpha.planning.models import TradePlanDraft, TradePlanVersion
-from halpha.planning.registry import DecisionBasisKind, Direction
+from halpha.planning.live_profit_qualification import (
+    LiveProfitQualificationStatus,
+    build_playbook_qualification_artifact,
+    evaluate_live_profit_qualification,
+)
+from halpha.planning.registry import (
+    DecisionBasisKind,
+    Direction,
+    build_fixed_decision_basis,
+)
 from halpha.planning.transitions import ControlIntent
 from halpha.outcomes.repository import OutcomeConflict
 from halpha.user_workbench.repository import CommandConflict
 
 
 ACTIVATION_SCHEDULE_PREVIEW_TTL_SECONDS = 60
+REVIEW_SEQUENCE_MARKET_CONCURRENCY = 4
 LIVE_READ_ONLY_ALLOWED_POST_PATHS = frozenset(
     {
         "/api/v1/account-position-operations/preview",
+        "/api/v1/decision-evidence/preview",
         "/api/v1/order-schedules/preview",
+        "/api/v1/playbook-qualification/export",
         "/api/v1/settings/test-email",
     }
 )
@@ -638,6 +674,7 @@ def create_app(
         password=app_secrets.database_password,
         environment_id=settings.release.environment_id,
         account_id=settings.release.account_id,
+        new_risk_discipline_policy=settings.new_risk_discipline,
         read_only=settings.release.profile == "BINANCE_LIVE_READ_ONLY",
     )
     if schema_guard is not None:
@@ -754,6 +791,18 @@ def create_app(
         except Exception:
             return base_status
 
+    def current_live_profit_qualification(
+        version: TradePlanVersion,
+        observed_at: datetime,
+    ) -> LiveProfitQualificationStatus:
+        return evaluate_live_profit_qualification(
+            version,
+            environment_kind=_environment_kind(settings),
+            target_venue_account_type=settings.release.venue_account_type.value,
+            references=settings.live_profit_qualifications,
+            observed_at=observed_at,
+        )
+
     frontend_dist = (static_dist or (repo_root / "frontend" / "dist")).resolve()
     planning_api = PostgreSQLPlanningApi(
         database_name=settings.release.database_name,
@@ -765,7 +814,10 @@ def create_app(
         account_ref=settings.release.account_id,
         product_build_id=current_product_build_id,
         profile=settings.release.profile,
+        new_risk_discipline_policy=settings.new_risk_discipline,
         gate_status_provider=current_gate_status,
+        venue_account_type=settings.release.venue_account_type.value,
+        live_profit_qualification_provider=current_live_profit_qualification,
     )
     outcomes_api = PostgreSQLOutcomesApi(
         database_name=settings.release.database_name,
@@ -787,12 +839,23 @@ def create_app(
 
     app = FastAPI(
         title="Halpha local owner API",
+        description=(
+            "The workbench and native loopback Monitor use the same trade-plan "
+            "schemas and lifecycle operations. Programmatic mutation operations "
+            "declare their X-Halpha-Caller requirement in this document."
+        ),
         version="0.1.0.dev0",
         docs_url=None,
         redoc_url=None,
         openapi_url="/api/v1/openapi.json",
         lifespan=lifespan,
     )
+    default_openapi = app.openapi
+
+    def openapi_with_programmatic_plan_contract() -> dict[str, Any]:
+        return add_programmatic_plan_openapi_contract(default_openapi())
+
+    app.openapi = openapi_with_programmatic_plan_contract
     app.state.workbench_projection = database
     app.state.live_write_gate_status_provider = current_gate_status
     app.state.public_market_stream = public_market_stream
@@ -950,6 +1013,14 @@ def create_app(
                 detail={"code": "DATABASE_FACTS_UNAVAILABLE"},
             ) from None
         gate_status = current_gate_status()
+        discipline = summary.get("new_risk_discipline")
+        if not isinstance(discipline, dict):
+            discipline = evaluate_new_risk_discipline(
+                policy=settings.new_risk_discipline,
+                observed_at=datetime.now(UTC),
+                account_equity=None,
+                attempts=(),
+            ).model_dump(mode="json")
         account_positions = []
         for position in summary.get("account_positions", []):
             origin = str(position.get("origin", "EXTERNAL_UNMANAGED"))
@@ -997,6 +1068,8 @@ def create_app(
             account_algo_open_order_count=summary.get(
                 "account_algo_open_order_count"
             ),
+            account_summary=summary.get("account_summary"),
+            new_risk_discipline=discipline,
             account_positions=account_positions,
             account_orders=summary.get("account_orders", []),
         )
@@ -1178,9 +1251,21 @@ def create_app(
         status_code=201,
     )
     def create_plan(
+        request: Request,
         payload: PlanCreatePayload,
         idempotency_key: IdempotencyKey,
     ) -> dict[str, Any]:
+        caller = programmatic_caller(request.scope)
+        if caller == PROGRAMMATIC_MONITOR_CALLER and payload.creator_kind.value != caller:
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "PROGRAMMATIC_CREATOR_KIND_MISMATCH"},
+            )
+        if caller is None and payload.creator_kind.value == PROGRAMMATIC_MONITOR_CALLER:
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "MONITOR_CREATOR_REQUIRES_PROGRAMMATIC_CALLER"},
+            )
         return domain_call(
             lambda: planning_api.save_new_plan(
                 payload,
@@ -1513,6 +1598,63 @@ def create_app(
         return domain_call(outcomes_api.list_reviews)
 
     @app.get(
+        "/api/v1/review-sequence-evidence",
+        response_model=ReviewSequenceEvidenceResponse,
+    )
+    async def review_sequence_evidence(
+        scope: ReviewSequenceScope = "ACCOUNT_RESULTS",
+        range_start: datetime | None = None,
+        range_end: datetime | None = None,
+        include_price_path: bool = False,
+        interval: ReviewPricePathInterval = "1m",
+    ) -> dict[str, Any]:
+        current_reviews = domain_call(outcomes_api.list_reviews)
+        selection = domain_call(
+            lambda: prepare_review_sequence(
+                current_reviews,
+                scope=scope,
+                range_start=range_start,
+                range_end=range_end,
+            )
+        )
+        if not include_price_path:
+            return summarize_review_sequence(selection)
+
+        semaphore = asyncio.Semaphore(REVIEW_SEQUENCE_MARKET_CONCURRENCY)
+
+        async def price_path_for_trade(
+            trade: ReviewSequenceTrade,
+        ) -> tuple[tuple[str, int], dict[str, Any]]:
+            prepared = prepare_review_price_path(trade.review, interval=interval)
+            if not isinstance(prepared, ReviewPricePathBasis):
+                return (trade.review_id, trade.review_version), prepared
+            try:
+                async with semaphore:
+                    window = await public_market_context.fetch_window(
+                        prepared.instrument_ref,
+                        prepared.interval,
+                        prepared.window_start_at,
+                        prepared.window_end_open_at,
+                    )
+                require_current_market_source(window.source)
+                result = summarize_review_price_path(prepared, window)
+            except MarketContextUnavailable:
+                result = unavailable_sequence_price_path(interval=interval)
+            return (trade.review_id, trade.review_version), result
+
+        price_paths = dict(
+            await asyncio.gather(
+                *(price_path_for_trade(trade) for trade in selection.trades)
+            )
+        )
+        return summarize_review_sequence(
+            selection,
+            price_paths=price_paths,
+            price_path_requested=True,
+            price_path_interval=interval,
+        )
+
+    @app.get(
         "/api/v1/execution-fee-evidence",
         response_model=ExecutionFeeEvidenceResponse,
     )
@@ -1522,6 +1664,68 @@ def create_app(
         return domain_call(
             lambda: outcomes_api.execution_fee_evidence(instrument_ref)
         )
+
+    @app.post(
+        "/api/v1/decision-evidence/preview",
+        response_model=DecisionEvidenceResponse,
+    )
+    def decision_evidence_preview(
+        payload: DecisionEvidencePreviewPayload,
+    ) -> dict[str, Any]:
+        basis = domain_call(
+            lambda: build_fixed_decision_basis(
+                payload.decision_basis,
+                product_build_id=current_product_build_id,
+            )
+        )
+        return domain_call(
+            lambda: outcomes_api.decision_evidence(
+                payload,
+                decision_basis_ref=basis.decision_basis_ref,
+                parameter_digest=basis.parameter_digest,
+            )
+        )
+
+    @app.post(
+        "/api/v1/playbook-qualification/export",
+        response_model=PlaybookQualificationExportResponse,
+    )
+    def export_playbook_qualification(
+        payload: PlaybookQualificationExportPayload,
+    ) -> dict[str, Any]:
+        if settings.release.profile != "BINANCE_DEMO":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "PLAYBOOK_QUALIFICATION_EXPORT_REQUIRES_DEMO"},
+            )
+        basis = domain_call(
+            lambda: build_fixed_decision_basis(
+                payload.decision_basis,
+                product_build_id=current_product_build_id,
+            )
+        )
+        evidence = domain_call(
+            lambda: outcomes_api.decision_evidence(
+                payload,
+                decision_basis_ref=basis.decision_basis_ref,
+                parameter_digest=basis.parameter_digest,
+            )
+        )
+        artifact, artifact_digest = domain_call(
+            lambda: build_playbook_qualification_artifact(
+                evidence,
+                source_environment_id=settings.release.environment_id,
+                source_product_build_id=current_product_build_id,
+                target_venue_account_type=payload.target_venue_account_type,
+                decision_basis_kind=basis.kind,
+                issued_at=datetime.now(UTC),
+            )
+        )
+        return {
+            "artifact": artifact.model_dump(mode="json"),
+            "artifact_content_digest": artifact_digest,
+            "save_outside_repository": True,
+        }
 
     @app.get(
         "/api/v1/stage-reviews",
@@ -1552,6 +1756,53 @@ def create_app(
     )
     def review(review_id: str) -> dict[str, Any]:
         return domain_call(lambda: outcomes_api.read_review(review_id))
+
+    @app.get(
+        "/api/v1/reviews/{review_id}/price-path-evidence",
+        response_model=ReviewPricePathEvidenceResponse,
+    )
+    async def review_price_path_evidence(
+        review_id: str,
+        review_version: int | None = None,
+        interval: ReviewPricePathInterval = "1m",
+    ) -> dict[str, Any]:
+        history = domain_call(lambda: outcomes_api.read_review(review_id))
+        versions = history.get("versions")
+        selected = history.get("review") if review_version is None else None
+        if review_version is not None and isinstance(versions, list):
+            selected = next(
+                (
+                    item
+                    for item in versions
+                    if isinstance(item, dict)
+                    and int(item.get("review_version", 0)) == review_version
+                ),
+                None,
+            )
+        if not isinstance(selected, dict):
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "REVIEW_VERSION_NOT_FOUND"},
+            )
+        prepared = domain_call(
+            lambda: prepare_review_price_path(selected, interval=interval)
+        )
+        if not isinstance(prepared, ReviewPricePathBasis):
+            return prepared
+        try:
+            window = await public_market_context.fetch_window(
+                prepared.instrument_ref,
+                prepared.interval,
+                prepared.window_start_at,
+                prepared.window_end_open_at,
+            )
+            require_current_market_source(window.source)
+        except MarketContextUnavailable as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": str(exc)},
+            ) from None
+        return summarize_review_price_path(prepared, window)
 
     @app.put(
         "/api/v1/reviews/{review_id}",

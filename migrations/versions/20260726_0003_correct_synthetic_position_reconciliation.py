@@ -22,7 +22,7 @@ depends_on = None
 
 
 _DEMO_ENVIRONMENT_ID = "binance-demo-primary"
-_SYNTHETIC_STOP_ID = "f3ab98de-f611-4af8-9870-41cf0221bd37"
+_SYNTHETIC_STOP_ID = "00000000-0000-4000-8000-000000000003"
 _UUID_TEXT = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )

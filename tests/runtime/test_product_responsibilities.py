@@ -135,6 +135,7 @@ def _facts(
     current_abs_position: str = "0.01",
     current_reference_price: str | None = None,
     position_fact: object | None = None,
+    open_order_client_ids: tuple[str, ...] = (),
     open_algo_client_ids: tuple[str, ...] = (),
     checked_at: datetime = NOW,
     attribution_cutoff: datetime | None = None,
@@ -151,6 +152,7 @@ def _facts(
         current_abs_position=current_abs_position,
         current_reference_price=current_reference_price,
         position_fact=position_fact,
+        open_order_client_ids=open_order_client_ids,
         open_algo_client_ids=open_algo_client_ids,
         attribution_cutoff=attribution_cutoff,
     )
@@ -786,6 +788,111 @@ def test_zero_fill_activation_skips_funding_query() -> None:
         return calls
 
     assert asyncio.run(scenario()) == 0
+
+
+def test_direct_entry_waiting_for_first_fill_has_no_aggregate_targets_yet() -> None:
+    async def scenario() -> _Coordinator:
+        activation = _activation().model_copy(
+            update={
+                "decision_basis_ref": "DIRECT_EXECUTION@1",
+                "order_schedule_snapshot": SimpleNamespace(
+                    full_fill_protection_estimate=object(),
+                    schedule_spec=SimpleNamespace(dynamic_rules=()),
+                ),
+            }
+        )
+        coordinator = _Coordinator(activation)
+        entry = _action(
+            "entry-action",
+            ExecutionActionKind.ENTRY,
+            state=ExecutionActionState.OPEN,
+            terms={
+                "action_profile": "ENTRY_LIMIT",
+                "quantity": "0.01",
+            },
+            client_order_id="e" * 32,
+            call_started_at=NOW,
+        )
+        coordinator.actions[entry.execution_action_id] = entry
+        coordinator.facts[entry.execution_action_id] = (
+            _venue_fact(
+                "entry-working",
+                VenueFactKind.ORDER_STATE,
+                status="WORKING",
+                action_ref=entry.execution_action_id,
+                activation_ref=activation.activation_id,
+            ),
+        )
+        boundary = ProductResponsibilityBoundary(
+            loop=asyncio.get_running_loop(),
+            coordinator=coordinator,
+            fact_provider=lambda _activation: asyncio.sleep(
+                0,
+                result=_facts(
+                    current_abs_position="0",
+                    open_order_client_ids=(entry.client_order_id,),
+                ),
+            ),
+            environment_id="demo-1",
+        )
+
+        await boundary.sync(activation.activation_id, force=True)
+        boundary.close()
+        return coordinator
+
+    coordinator = asyncio.run(scenario())
+
+    assert coordinator.protection_replacement_requests == []
+    assert coordinator.take_profit_replacement_requests == []
+    assert coordinator.called_queries == []
+
+
+@pytest.mark.parametrize(
+    ("method_name", "reason_code"),
+    (
+        (
+            "_manage_aggregate_entry_protection",
+            "PROTECTION_AGGREGATE_TARGET_UNKNOWN",
+        ),
+        (
+            "_manage_aggregate_entry_take_profits",
+            "TAKE_PROFIT_AGGREGATE_TARGET_UNKNOWN",
+        ),
+    ),
+)
+def test_confirmed_direct_fill_with_missing_aggregate_target_fails_closed(
+    method_name: str,
+    reason_code: str,
+) -> None:
+    activation = _activation().model_copy(
+        update={
+            "decision_basis_ref": "DIRECT_EXECUTION@1",
+            "has_entry_fill": True,
+            "order_schedule_snapshot": SimpleNamespace(
+                full_fill_protection_estimate=object(),
+            ),
+            "rule_state": {
+                "direct_protection": {
+                    "fills": {"fill-fact": {}},
+                }
+            },
+        }
+    )
+    coordinator = _Coordinator(activation)
+    loop = asyncio.new_event_loop()
+    boundary = ProductResponsibilityBoundary(
+        loop=loop,
+        coordinator=coordinator,
+        fact_provider=lambda _activation: asyncio.sleep(0, result=_facts()),
+        environment_id="demo-1",
+    )
+
+    try:
+        with pytest.raises(ValueError, match=reason_code):
+            getattr(boundary, method_name)(activation, _facts(), ())
+    finally:
+        boundary.close()
+        loop.close()
 
 
 def test_funding_query_failure_is_nonfatal_accounting_unavailability() -> None:
@@ -1682,6 +1789,111 @@ def test_user_takeover_closure_preserves_handover_command_identity() -> None:
     assert coordinator.closures[0]["user_takeover"] is True
     assert coordinator.closures[0]["handover_command_ref"] == "command-takeover-1"
     assert coordinator.closures[0]["fact_refs"] == ("position-zero",)
+
+
+def test_user_takeover_closes_venue_downsized_terminal_order_after_account_flat() -> (
+    None
+):
+    async def scenario() -> _Coordinator:
+        activation = _activation().model_copy(
+            update={
+                "lifecycle": PlanLifecycle.USER_TAKEOVER,
+                "takeover_scope": {"command_ref": "command-takeover-1"},
+            }
+        )
+        coordinator = _Coordinator(activation)
+        entry = _action(
+            "entry-closed",
+            ExecutionActionKind.ENTRY,
+            state=ExecutionActionState.CLOSED,
+            terms={"quantity": "0.0012"},
+            client_order_id="a" * 32,
+        )
+        take_profit = _action(
+            "take-profit-downsized",
+            ExecutionActionKind.TAKE_PROFIT,
+            state=ExecutionActionState.OPEN,
+            terms={"quantity": "0.0019"},
+            client_order_id="b" * 32,
+        )
+        coordinator.actions = {
+            entry.execution_action_id: entry,
+            take_profit.execution_action_id: take_profit,
+        }
+        coordinator.facts[entry.execution_action_id] = (
+            _venue_fact(
+                "entry-fill",
+                VenueFactKind.FILL,
+                trade_id="trade-entry",
+                last_quantity="0.0012",
+                action_ref=entry.execution_action_id,
+                activation_ref=activation.activation_id,
+            ),
+            _venue_fact(
+                "entry-fee",
+                VenueFactKind.COMMISSION,
+                trade_id="trade-entry",
+                action_ref=entry.execution_action_id,
+                activation_ref=activation.activation_id,
+            ),
+        )
+        coordinator.facts[take_profit.execution_action_id] = (
+            _venue_fact(
+                "take-profit-terminal",
+                VenueFactKind.ORDER_STATE,
+                status="FILLED",
+                cumulative_filled_quantity="0.0012",
+                action_ref=take_profit.execution_action_id,
+                activation_ref=activation.activation_id,
+            ),
+            _venue_fact(
+                "take-profit-fill",
+                VenueFactKind.FILL,
+                trade_id="trade-take-profit",
+                last_quantity="0.0012",
+                action_ref=take_profit.execution_action_id,
+                activation_ref=activation.activation_id,
+            ),
+            _venue_fact(
+                "take-profit-fee",
+                VenueFactKind.COMMISSION,
+                trade_id="trade-take-profit",
+                action_ref=take_profit.execution_action_id,
+                activation_ref=activation.activation_id,
+            ),
+        )
+        position = _venue_fact(
+            "position-zero-after-takeover",
+            VenueFactKind.POSITION_STATE,
+            position_quantity="0",
+        )
+        boundary = ProductResponsibilityBoundary(
+            loop=asyncio.get_running_loop(),
+            coordinator=coordinator,
+            fact_provider=lambda _activation: asyncio.sleep(
+                0,
+                result=_facts(current_abs_position="0", position_fact=position),
+            ),
+            environment_id="demo-1",
+        )
+
+        await boundary.sync("activation-1", force=True)
+        return coordinator
+
+    coordinator = asyncio.run(scenario())
+
+    assert coordinator.actions["take-profit-downsized"].state is ExecutionActionState.CLOSED
+    assert len(coordinator.reconciliations) == 1
+    evidence = coordinator.reconciliations[0]["closure_evidence"]
+    assert evidence["user_takeover_downsized_terminal_accounted"] is True
+    assert len(coordinator.closures) == 1
+    assert coordinator.closures[0]["user_takeover"] is True
+    assert coordinator.closures[0]["fact_refs"] == (
+        "position-zero-after-takeover",
+        "take-profit-fee",
+        "take-profit-fill",
+        "take-profit-terminal",
+    )
 
 
 def test_late_fill_event_during_user_takeover_never_creates_protection() -> None:

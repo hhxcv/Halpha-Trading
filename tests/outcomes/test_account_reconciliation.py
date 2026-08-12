@@ -11,62 +11,62 @@ from halpha.outcomes.account_reconciliation import (
 from halpha.outcomes.trade_result import summarize_trade_result
 
 
-def _facts(*, reduce_only: bool = True, realized_pnl: str = "-0.190350"):
+def _facts(*, reduce_only: bool = True, realized_pnl: str = "-5"):
     return build_external_account_closure_facts(
         environment_id="demo-main",
         account_ref="demo-account",
-        instrument_ref="BTCUSDT-PERP",
+        instrument_ref="TESTUSDT-PERP",
         activation_id="activation-1",
         direction="LONG",
-        open_quantity="0.0015",
-        average_entry_price="65549.9",
-        attributed_trade_ids=frozenset({"519484642"}),
+        open_quantity="1",
+        average_entry_price="100",
+        attributed_trade_ids=frozenset({"synthetic-entry-trade"}),
         order={
-            "order_id": "22983261835",
-            "client_order_id": "2e5b705f947c5a71bcc66f4471ddc1f4",
-            "symbol": "BTCUSDT",
+            "order_id": "synthetic-exit-order",
+            "client_order_id": "synthetic-client-order",
+            "symbol": "TESTUSDT",
             "status": "FILLED",
             "side": "SELL",
             "order_type": "MARKET",
-            "executed_quantity": "0.0015",
-            "average_price": "65423.0",
+            "executed_quantity": "1",
+            "average_price": "90",
             "reduce_only": reduce_only,
-            "update_time_ms": 1784563676828,
+            "update_time_ms": 1894665840000,
         },
         trades=(
             {
-                "trade_id": "519485905",
-                "order_id": "22983261835",
-                "symbol": "BTCUSDT",
+                "trade_id": "synthetic-exit-trade-1",
+                "order_id": "synthetic-exit-order",
+                "symbol": "TESTUSDT",
                 "side": "SELL",
-                "price": "65423.8",
-                "quantity": "0.0011",
-                "commission": "0.02878647",
+                "price": "90",
+                "quantity": "0.6",
+                "commission": "0.06",
                 "commission_asset": "USDT",
-                "realized_pnl": "-0.13871",
-                "time_ms": 1784563676828,
+                "realized_pnl": "-6",
+                "time_ms": 1894665840000,
                 "maker": False,
             },
             {
-                "trade_id": "519485906",
-                "order_id": "22983261835",
-                "symbol": "BTCUSDT",
+                "trade_id": "synthetic-exit-trade-2",
+                "order_id": "synthetic-exit-order",
+                "symbol": "TESTUSDT",
                 "side": "SELL",
-                "price": "65420.8",
-                "quantity": "0.0004",
-                "commission": "0.01046732",
+                "price": "90",
+                "quantity": "0.4",
+                "commission": "0.04",
                 "commission_asset": "USDT",
                 "realized_pnl": realized_pnl,
-                "time_ms": 1784563676828,
+                "time_ms": 1894665840000,
                 "maker": False,
             },
         ),
-        observed_at=datetime(2026, 7, 22, tzinfo=UTC),
+        observed_at=datetime(2030, 1, 15, 0, 4, tzinfo=UTC),
     )
 
 
 def test_external_closure_remains_unclaimed_but_closes_exact_account_result() -> None:
-    facts = _facts(realized_pnl="-0.05164")
+    facts = _facts(realized_pnl="-4")
 
     assert len(facts) == 5
     assert all(fact.activation_ref is None for fact in facts)
@@ -81,19 +81,19 @@ def test_external_closure_remains_unclaimed_but_closes_exact_account_result() ->
         {
             "kind": "FILL",
             "action_ref": "entry-action",
-            "source_time": "2026-07-20T16:04:01.139+00:00",
+            "source_time": "2030-01-15T00:00:00+00:00",
             "payload": {
-                "trade_id": "519484642",
-                "last_price": "65549.9",
-                "last_quantity": "0.0015",
+                "trade_id": "synthetic-entry-trade",
+                "last_price": "100",
+                "last_quantity": "1",
             },
         },
         {
             "kind": "COMMISSION",
             "action_ref": "entry-action",
             "payload": {
-                "trade_id": "519484642",
-                "amount": "0.03932994 USDT",
+                "trade_id": "synthetic-entry-trade",
+                "amount": "0.1 USDT",
                 "currency": "USDT",
             },
         },
@@ -115,11 +115,11 @@ def test_external_closure_remains_unclaimed_but_closes_exact_account_result() ->
     )
 
     assert result["closed"] is True
-    assert result["average_exit_price"] == "65423"
-    assert result["gross_pnl"] == "-0.19035"
-    assert result["commission"] == "0.07858373"
-    assert result["net_pnl"] == "-0.26893373"
-    assert result["holding_duration_seconds"] == "235.689"
+    assert result["average_exit_price"] == "90"
+    assert result["gross_pnl"] == "-10"
+    assert result["commission"] == "0.2"
+    assert result["net_pnl"] == "-10.2"
+    assert result["holding_duration_seconds"] == "240"
     assert result["result_scope"] == "ACCOUNT_FACTS_WITH_EXTERNAL_CLOSURE"
     assert result["strategy_attribution_complete"] is False
     assert result["external_closure_fill_count"] == 2
@@ -130,7 +130,7 @@ def test_external_closure_requires_reduce_only_order() -> None:
         AccountReconciliationError,
         match="EXTERNAL_ORDER_NOT_REDUCE_ONLY",
     ):
-        _facts(reduce_only=False, realized_pnl="-0.05164")
+        _facts(reduce_only=False, realized_pnl="-4")
 
 
 def test_external_closure_rejects_exchange_pnl_mismatch() -> None:

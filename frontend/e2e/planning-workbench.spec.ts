@@ -186,6 +186,7 @@ async function routeReadyDemoExecutor(
     statusOverrides?: Record<string, unknown>;
   } = {},
 ) {
+  await addBrowserScopedCsrfCookie(page);
   await page.route("**/api/v1/execution-fee-evidence?**", async (route) => {
     const sourceCutoff = new Date().toISOString();
     await route.fulfill({
@@ -556,9 +557,32 @@ async function openDirectMilestone(
   await expect(button).toHaveAttribute("aria-current", "step");
 }
 
+async function completeDirectDecisionRecord(page: Page) {
+  await page.getByRole("textbox", { name: "交易剧本标识" })
+    .fill("E2E_DIRECT_EXECUTION_V1");
+
+  const intent = page.getByRole("combobox", { name: "本次目的" });
+  await intent.click();
+  await page.getByRole("option", { name: "盈利导向交易" }).click();
+
+  const setupFamily = page.getByRole("combobox", { name: "交易形态" });
+  await setupFamily.click();
+  await page.getByRole("option", { name: "突破延续" }).click();
+
+  await page.getByRole("textbox", { name: "可证伪交易假设" })
+    .fill("闭合价格确认突破后，价格应延续至预设方向。");
+  await page.getByRole("textbox", { name: "入场前证据" })
+    .fill("当前闭合 K 线、盘口与价格边界均在计划允许范围内。");
+  await page.getByRole("textbox", { name: "假设失效与放弃条件" })
+    .fill("突破确认失效、价格越过预设边界或保护无法建立时放弃入场。");
+  await page.getByRole("textbox", { name: "已知局限" })
+    .fill("样本不足，滑点、手续费与行情变化仍可能使结果偏离预期。");
+}
+
 async function openDirectReview(page: Page) {
   await openDirectMilestone(page, "4 核对");
   await expect(page.getByRole("heading", { name: "计划概要" })).toBeVisible();
+  await completeDirectDecisionRecord(page);
 }
 
 function rectsIntersect(left: LayoutRect, right: LayoutRect, tolerance = 0.5) {
@@ -818,16 +842,20 @@ test("direct execution layout stays usable without overlap or clipped chart deta
     await openDirectMilestone(page, "3 退出");
     await expect(page.getByRole("heading", { name: "自动退出", exact: true })).toBeVisible();
     await openDirectReview(page);
-    await expect(page.getByText(/^技术预览可保存 ·/)).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByText("技术预览通过", { exact: true })).toBeVisible({ timeout: 15_000 });
     await assertLastChartDetailReachable(chartRegion, testInfo, viewport.name);
     await assertNoDocumentHorizontalOverflow(page, testInfo, viewport.name);
   }
 
   expect(attemptedTradingWrites, "布局回归只允许读取行情和生成安全预览").toEqual([]);
   await expect(page).toHaveURL(/\/plans\/new\?mode=direct$/);
+  await testInfo.attach(`direct-layout-${testInfo.project.name}.png`, {
+    body: await page.screenshot({ fullPage: true }),
+    contentType: "image/png",
+  });
 });
 
-test("direct shortcut reaches a launch-ready workspace without strategy or naming detours", async ({ page }) => {
+test("direct shortcut reaches a launch-ready workspace once its decision record is complete", async ({ page }) => {
   const attemptedTradingWrites: string[] = [];
   await routeCurrentDemoMarketStream(page);
   await routeCurrentDemoMarketWindow(page);
@@ -1607,12 +1635,12 @@ test("overview previews plan-bound external position operations without creating
     url: `${browserBaseUrl.origin}/`,
   }]);
   const cutoff = new Date().toISOString();
-  const snapshotRef = "account-snapshot-sol-1";
+  const snapshotRef = "synthetic-account-snapshot-1";
   const previewedOperations: string[] = [];
   const accountOrders = Array.from({ length: 4 }, (_item, index) => ({
     kind: index === 3 ? "ALGO" : "ORDINARY",
-    instrument_ref: "SOLUSDT-PERP",
-    symbol: "SOLUSDT",
+    instrument_ref: "TESTUSDT-PERP",
+    symbol: "TESTUSDT",
     order_id: String(7000 + index),
     client_order_id: `external-order-${index}`,
     side: "BUY",
@@ -1620,8 +1648,8 @@ test("overview previews plan-bound external position operations without creating
     order_type: index === 3 ? "STOP_MARKET" : "LIMIT",
     status: "NEW",
     time_in_force: "GTC",
-    price: index === 3 ? "0" : String(150 + index),
-    trigger_price: index === 3 ? "160" : "0",
+    price: index === 3 ? "0" : String(98 + index),
+    trigger_price: index === 3 ? "110" : "0",
     quantity: "0.5",
     executed_quantity: index === 3 ? null : "0",
     reduce_only: true,
@@ -1651,22 +1679,74 @@ test("overview previews plan-bound external position operations without creating
         account_snapshot_age_seconds: 1,
         account_ordinary_open_order_count: 3,
         account_algo_open_order_count: 1,
+        account_summary: {
+          can_trade: true,
+          wallet_balance: "1000",
+          unrealized_pnl: "-12.5",
+          margin_balance: "987.5",
+          available_balance: "800",
+          initial_margin: "187.5",
+          maintenance_margin: "25",
+          position_initial_margin: "150",
+          open_order_initial_margin: "37.5",
+          cross_wallet_balance: "1000",
+          cross_unrealized_pnl: "-12.5",
+          source_update_time_ms: Date.parse(cutoff),
+          fact_cutoff: cutoff,
+          snapshot_ref: snapshotRef,
+        },
+        new_risk_discipline: {
+          status: "ALLOWED",
+          new_risk_allowed: true,
+          blocker_codes: [],
+          evaluated_at: cutoff,
+          account_snapshot_ref: snapshotRef,
+          account_snapshot_cutoff: cutoff,
+          risk_equity: "987.5",
+          max_plan_loss: "4.9375",
+          open_risk_limit: "19.75",
+          open_risk_committed: "0",
+          open_risk_after_proposal: "4.9375",
+          gross_exposure_limit: "2962.5",
+          gross_exposure: "0",
+          gross_exposure_after_proposal: "250",
+          instrument_ref: "BTCUSDT-PERP",
+          instrument_exposure_limit: "1481.25",
+          instrument_exposure: "0",
+          instrument_exposure_after_proposal: "250",
+          correlation_cluster: "CRYPTO_MAJOR_BETA",
+          correlated_exposure_limit: "1975",
+          correlated_exposure: "0",
+          correlated_exposure_after_proposal: "250",
+          daily_loss_limit: "14.8125",
+          daily_loss_measure: "0",
+          weekly_loss_limit: "39.5",
+          weekly_loss_measure: "0",
+          rolling_peak_equity: "987.5",
+          rolling_drawdown: "0",
+          rolling_drawdown_fraction: "0",
+          rolling_drawdown_limit_fraction: "0.06",
+          rolling_drawdown_lookback_days: 30,
+          open_new_risk_activation_count: 0,
+          day_window_started_at: cutoff,
+          week_window_started_at: cutoff,
+        },
         account_positions: [{
           snapshot_ref: snapshotRef,
-          instrument_ref: "SOLUSDT-PERP",
-          symbol: "SOLUSDT",
+          instrument_ref: "TESTUSDT-PERP",
+          symbol: "TESTUSDT",
           direction: "SHORT",
           position_side: "SHORT",
           quantity: "-2.5",
           absolute_quantity: "2.5",
-          entry_price: "152.25",
-          break_even_price: "152.31",
-          mark_price: "154",
-          unrealized_pnl: "-4.375",
-          liquidation_price: "271.8",
-          leverage: 3,
+          entry_price: "100",
+          break_even_price: "100.1",
+          mark_price: "105",
+          unrealized_pnl: "-12.5",
+          liquidation_price: "200",
+          leverage: 2,
           margin_mode: "CROSS",
-          notional: "-385",
+          notional: "-262.5",
           isolated_margin: "0",
           fact_cutoff: cutoff,
           origin: "EXTERNAL_UNMANAGED",
@@ -1701,7 +1781,7 @@ test("overview previews plan-bound external position operations without creating
         operation: payload.operation,
         snapshot_ref: snapshotRef,
         fact_cutoff: cutoff,
-        instrument_ref: "SOLUSDT-PERP",
+        instrument_ref: "TESTUSDT-PERP",
         position_side: "SHORT",
         direction: "SHORT",
         preparation_allowed: true,
@@ -1713,10 +1793,10 @@ test("overview previews plan-bound external position operations without creating
         ],
         plan_prefill: {
           kind: newExposure ? "NEW_EXPOSURE" : "POSITION_DISPOSITION",
-          plan_name: newExposure ? "SOLUSDT-PERP 独立追加开仓" : `SOLUSDT-PERP ${payload.operation === "CLOSE" ? "平仓" : "减仓"}处置`,
-          instrument_ref: "SOLUSDT-PERP",
+          plan_name: newExposure ? "TESTUSDT-PERP 独立追加开仓" : `TESTUSDT-PERP ${payload.operation === "CLOSE" ? "平仓" : "减仓"}处置`,
+          instrument_ref: "TESTUSDT-PERP",
           direction: "SHORT",
-          trade_amount: newExposure ? payload.requested_notional ?? "100" : String(Number(reduction) * 154),
+          trade_amount: newExposure ? payload.requested_notional ?? "100" : String(Number(reduction) * 105),
           valid_minutes: 60,
           baseline_quantity: "2.5",
           target_quantity_after: target,
@@ -1727,14 +1807,14 @@ test("overview previews plan-bound external position operations without creating
             fact_cutoff: cutoff,
             account_ref: "binance-usdm-copy-lead-primary",
             venue_ref: "BINANCE_USDM",
-            instrument_ref: "SOLUSDT-PERP",
+            instrument_ref: "TESTUSDT-PERP",
             direction: "SHORT",
             position_side: "SHORT",
             baseline_quantity: "2.5",
             requested_reduction_quantity: reduction,
             target_quantity_after: target,
-            baseline_entry_price: "152.25",
-            baseline_mark_price: "154",
+            baseline_entry_price: "100",
+            baseline_mark_price: "105",
           },
         },
       },
@@ -1754,23 +1834,23 @@ test("overview previews plan-bound external position operations without creating
 
   await expect(page.getByRole("tab", { name: "当前仓位（1）" })).toBeVisible();
   const accountPositions = page.getByRole("region", { name: "交易所账户当前仓位" });
-  await expect(accountPositions).toContainText("SOLUSDT-PERP");
+  await expect(accountPositions).toContainText("TESTUSDT-PERP");
   await expect(accountPositions).toContainText("外部");
   await expect(accountPositions).toContainText("未实现盈亏");
-  await expect(accountPositions).toContainText("-4.375 USDT");
+  await expect(accountPositions).toContainText("-12.50 USDT");
   await expect(accountPositions).toContainText("SHORT");
-  await expect(accountPositions).toContainText("3× · 全仓");
+  await expect(accountPositions).toContainText("2× · 全仓");
   const ordersTab = page.getByRole("tab", { name: "当前委托（4）" });
   await ordersTab.click();
   const accountOrderTable = page.getByRole("region", { name: "交易所账户当前委托" });
   await expect(accountOrderTable).toContainText("普通");
   await expect(accountOrderTable).toContainText("条件");
-  await expect(accountOrderTable).toContainText("160");
+  await expect(accountOrderTable).toContainText("110");
   await page.getByRole("tab", { name: "当前仓位（1）" }).click();
   const operationButton = accountPositions.getByRole("button", { name: "策略调整" });
   await expect(operationButton).toBeEnabled();
   await operationButton.click();
-  const dialog = page.getByRole("dialog", { name: "策略计划对齐 · SOLUSDT-PERP" });
+  const dialog = page.getByRole("dialog", { name: "策略计划对齐 · TESTUSDT-PERP" });
   await expect(dialog).toContainText("做空 · SHORT");
   await expect(dialog).toContainText("既有入场仍为外部事实，不计入 Halpha ENTRY 或策略盈亏");
   await dialog.getByRole("button", { name: "核对计划对齐" }).click();
@@ -1798,9 +1878,9 @@ test("overview previews plan-bound external position operations without creating
   await dialog.getByRole("button", { name: "查看独立开仓计划" }).click();
   await expect(page).toHaveURL(/positionOperation=ADD/);
   await expect(page.getByRole("heading", { name: "独立追加开仓" })).toBeVisible();
-  await expect(page.getByText("SOLUSDT-PERP", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("TESTUSDT-PERP", { exact: true }).first()).toBeVisible();
   await expect(page.getByRole("button", { name: "做空", exact: true })).toHaveAttribute("aria-pressed", "true");
-  await expect(page.getByRole("textbox", { name: "资金上限（USDT）" })).toHaveValue("96.25");
+  await expect(page.getByRole("textbox", { name: "资金上限（USDT）" })).toHaveValue("65.63");
   await expect(page.getByText("这是独立的新风险计划")).toBeVisible();
 });
 

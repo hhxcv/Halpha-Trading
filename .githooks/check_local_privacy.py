@@ -199,6 +199,8 @@ def _path_categories(path: str) -> set[str]:
     name = normalized.rsplit("/", 1)[-1]
     suffix = Path(name).suffix
     categories: set[str] = set()
+    if normalized.startswith("outputs/"):
+        categories.add("repository-boundary")
     if name in SENSITIVE_FILE_NAMES or suffix in SENSITIVE_FILE_SUFFIXES:
         categories.add("sensitive-file")
     if (
@@ -237,7 +239,7 @@ def _content_categories(
     credential_url = CREDENTIAL_URL.search(line)
     if credential_url and not any(
         marker in credential_url.group(0).casefold()
-        for marker in (*SAFE_LITERAL_MARKERS, "user:secret@")
+        for marker in (*SAFE_LITERAL_MARKERS, "synthetic-user:synthetic-secret@")
     ):
         categories.add("credential-url")
     for match in SECRET_LITERAL.finditer(line):
@@ -470,6 +472,8 @@ def _self_test() -> None:
         raise AssertionError("self-test failed for credential filename")
     if "enabled-local-config" not in _path_categories("config/runtime.toml"):
         raise AssertionError("self-test failed for enabled-local-config")
+    if "repository-boundary" not in _path_categories("outputs/example.json"):
+        raise AssertionError("self-test failed for repository-boundary")
 
 
 def main() -> int:

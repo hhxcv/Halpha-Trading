@@ -30,6 +30,7 @@ from halpha.app.secrets import AppSecrets
 from halpha.app.web import create_app, _live_read_only_request_is_non_mutating
 from halpha.capital.repository import CapitalConflict
 from halpha.configuration import load_settings
+from halpha.domain_values import content_digest
 from halpha.planning.registry import Direction, OneShotParameters
 from halpha.planning.order_schedule import InstrumentOrderRules
 from halpha.user_workbench.repository import CommandConflict
@@ -264,6 +265,86 @@ def csrf(client: TestClient) -> str:
     return token
 
 
+def _programmatic_direct_plan_payload(
+    *,
+    creator_kind: str = "MONITOR",
+) -> dict[str, Any]:
+    return {
+        "plan_name": "Monitor signal execution",
+        "creator_kind": creator_kind,
+        "decision_context": {
+            "rationale": "A stable Monitor signal selected this execution.",
+            "evidence": "monitor-signal:btc-breakout:20260720T000000Z",
+            "limitations": "The signal does not bypass Trading facts or checks.",
+            "intent": "PROFIT_SEEKING",
+            "setup_family": "BREAKOUT_CONTINUATION",
+            "playbook_ref": "MONITOR_BTC_BREAKOUT_V1",
+            "invalidation": "Cancel if the fixed Monitor invalidation is reached.",
+            "evidence_cutoff": "2026-07-20T00:00:00+00:00",
+        },
+        "decision_basis": {
+            "kind": "DIRECT_EXECUTION",
+            "decision_basis_ref": "DIRECT_EXECUTION@1",
+            "parameters": {},
+        },
+        "order_schedule_spec": {
+            "entry_program": {"kind": "ONE_TIME"},
+            "price_distribution": {
+                "kind": "SINGLE",
+                "limit_price": "100",
+            },
+            "amount_distribution": {
+                "mode": "FIXED",
+                "base_notional": "100",
+            },
+            "venue_policy": {
+                "order_type": "LIMIT",
+                "time_in_force": "GTC",
+            },
+            "protection_policy": {
+                "initial_stop": {"distance_bps": "100"},
+                "time_exit_seconds": 3600,
+                "full_fill_loss_budget": {
+                    "entry_fee_bps": "2",
+                    "exit_fee_bps": "5",
+                },
+            },
+        },
+        "instrument_ref": "BTCUSDT-PERP",
+        "direction": "LONG",
+        "target_exposure": "100",
+        "max_margin": "100",
+        "max_notional": "100",
+        "max_allowed_loss": "10",
+        "valid_minutes": 15,
+    }
+
+
+def test_programmatic_direct_plan_requires_a_stable_playbook_ref(
+    tmp_path: Path,
+) -> None:
+    client = make_client(tmp_path)
+    token = csrf(client)
+    payload = _programmatic_direct_plan_payload()
+    payload["decision_context"].pop("playbook_ref")
+
+    response = client.post(
+        "/api/v1/plans",
+        headers={
+            "Origin": ORIGIN,
+            "X-CSRFToken": token,
+            "Idempotency-Key": "direct-plan-missing-playbook",
+        },
+        json=payload,
+    )
+
+    assert response.status_code == 422
+    assert any(
+        "PLAN_DECISION_PLAYBOOK_REF_REQUIRED" in detail["msg"]
+        for detail in response.json()["detail"]
+    )
+
+
 def test_read_surface_is_available_without_login(tmp_path: Path) -> None:
     client = make_client(tmp_path)
 
@@ -276,10 +357,25 @@ def test_read_surface_is_available_without_login(tmp_path: Path) -> None:
     assert client.get("/api/v1/session/logout").status_code == 404
 
 
+def test_overview_exposes_new_risk_discipline_without_return_target_tracking(
+    tmp_path: Path,
+) -> None:
+    overview = make_client(tmp_path).get("/api/v1/overview")
+
+    assert overview.status_code == 200
+    payload = overview.json()
+    assert "performance_reference" not in payload
+    assert payload["new_risk_discipline"]["status"] == "UNKNOWN"
+    assert payload["new_risk_discipline"]["new_risk_allowed"] is False
+    assert payload["new_risk_discipline"]["blocker_codes"] == [
+        "ACCOUNT_EQUITY_SNAPSHOT_UNAVAILABLE"
+    ]
+
+
 def test_overview_returns_typed_account_positions_and_orders(
     tmp_path: Path,
 ) -> None:
-    cutoff = "2026-07-17T00:00:00Z"
+    cutoff = "2030-01-15T04:00:00Z"
     client = make_client(
         tmp_path,
         projection=FakeProjection(
@@ -290,22 +386,38 @@ def test_overview_returns_typed_account_positions_and_orders(
                 "account_snapshot_age_seconds": 0,
                 "account_ordinary_open_order_count": 1,
                 "account_algo_open_order_count": 0,
+                "account_summary": {
+                    "can_trade": True,
+                    "wallet_balance": "1000",
+                    "unrealized_pnl": "-12.5",
+                    "margin_balance": "987.5",
+                    "available_balance": "800",
+                    "initial_margin": "187.5",
+                    "maintenance_margin": "25",
+                    "position_initial_margin": "150",
+                    "open_order_initial_margin": "37.5",
+                    "cross_wallet_balance": "1000",
+                    "cross_unrealized_pnl": "-12.5",
+                    "source_update_time_ms": 1894680004000,
+                    "fact_cutoff": cutoff,
+                    "snapshot_ref": "snapshot-1",
+                },
                 "account_positions": [
                     {
-                        "instrument_ref": "SOLUSDT-PERP",
-                        "symbol": "SOLUSDT",
+                        "instrument_ref": "TESTUSDT-PERP",
+                        "symbol": "TESTUSDT",
                         "direction": "SHORT",
                         "position_side": "SHORT",
                         "quantity": "-2.5",
                         "absolute_quantity": "2.5",
-                        "entry_price": "152.25",
-                        "break_even_price": "152.31",
-                        "mark_price": "154",
-                        "unrealized_pnl": "-4.375",
-                        "liquidation_price": "271.8",
-                        "leverage": 3,
+                        "entry_price": "100",
+                        "break_even_price": "100.1",
+                        "mark_price": "105",
+                        "unrealized_pnl": "-12.5",
+                        "liquidation_price": "200",
+                        "leverage": 2,
                         "margin_mode": "CROSS",
-                        "notional": "-385",
+                        "notional": "-262.5",
                         "isolated_margin": "0",
                         "fact_cutoff": cutoff,
                         "snapshot_ref": "snapshot-1",
@@ -315,8 +427,8 @@ def test_overview_returns_typed_account_positions_and_orders(
                 "account_orders": [
                     {
                         "kind": "ORDINARY",
-                        "instrument_ref": "SOLUSDT-PERP",
-                        "symbol": "SOLUSDT",
+                        "instrument_ref": "TESTUSDT-PERP",
+                        "symbol": "TESTUSDT",
                         "order_id": "1234",
                         "client_order_id": "external-order",
                         "side": "BUY",
@@ -330,8 +442,8 @@ def test_overview_returns_typed_account_positions_and_orders(
                         "executed_quantity": "0",
                         "reduce_only": True,
                         "close_position": False,
-                        "source_create_time_ms": 1785661200000,
-                        "source_update_time_ms": 1785661201000,
+                        "source_create_time_ms": 1894680000000,
+                        "source_update_time_ms": 1894680001000,
                         "fact_cutoff": cutoff,
                         "snapshot_ref": "snapshot-1",
                     }
@@ -348,6 +460,7 @@ def test_overview_returns_typed_account_positions_and_orders(
         "OBSERVED_ONLY"
     )
     assert payload["account_orders"][0]["order_id"] == "1234"
+    assert payload["account_summary"]["margin_balance"] == "987.5"
 
 
 def test_app_requires_schema_guard_before_serving(tmp_path: Path) -> None:
@@ -462,7 +575,15 @@ def test_live_read_only_http_boundary_rejects_all_product_mutations(
 def test_live_read_only_http_boundary_keeps_only_non_mutating_posts_open() -> None:
     assert _live_read_only_request_is_non_mutating(
         "POST",
+        "/api/v1/decision-evidence/preview",
+    )
+    assert _live_read_only_request_is_non_mutating(
+        "POST",
         "/api/v1/order-schedules/preview",
+    )
+    assert _live_read_only_request_is_non_mutating(
+        "POST",
+        "/api/v1/playbook-qualification/export",
     )
     assert _live_read_only_request_is_non_mutating(
         "POST",
@@ -476,6 +597,130 @@ def test_live_read_only_http_boundary_keeps_only_non_mutating_posts_open() -> No
         "POST",
         "/api/v1/activations/activation-ro/control-preview",
     )
+
+
+def test_demo_exports_a_content_addressed_playbook_qualification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sample_started_at = datetime.now(UTC) - timedelta(days=1)
+    sample_refs = [
+        {
+            "review_id": f"review-export-{index:02d}",
+            "review_version": 1,
+            "review_content_digest": content_digest({"review": index}),
+            "fact_cutoff": (sample_started_at + timedelta(minutes=index)).isoformat(),
+        }
+        for index in range(30)
+    ]
+
+    def decision_evidence(
+        _self: Any,
+        payload: Any,
+        *,
+        decision_basis_ref: str,
+        parameter_digest: str,
+    ) -> dict[str, Any]:
+        return {
+            "instrument_ref": payload.instrument_ref,
+            "direction": payload.direction.value,
+            "decision_basis_ref": decision_basis_ref,
+            "parameter_digest": parameter_digest,
+            "intent": payload.intent.value,
+            "setup_family": payload.setup_family.value,
+            "playbook_ref": payload.playbook_ref,
+            "source_cutoff": sample_refs[-1]["fact_cutoff"],
+            "comparable_trade_count": 30,
+            "sample_review_refs": sample_refs,
+            "sample_traceability_complete": True,
+            "sample_identity_digest": content_digest(sample_refs),
+            "metrics": {
+                "gross_profit": "120",
+                "gross_loss": "60",
+                "profit_factor": "2",
+            },
+            "repeatability": {
+                "status": "EVIDENCE_CANDIDATE",
+                "policy_version": "PLAYBOOK_REPEATABILITY_SCREEN@1",
+                "minimum_trade_count": 30,
+                "minimum_profit_factor": "1.2",
+                "risk_basis_trade_count": 30,
+                "net_r_multiple": "6",
+                "average_r_multiple": "0.2",
+                "net_r_without_best_trade": "4",
+                "early_segment_net_r": "3",
+                "recent_segment_net_r": "3",
+                "mean_r_lower_confidence_bound": "0.05",
+            },
+        }
+
+    monkeypatch.setattr(
+        "halpha.app.outcomes_api.PostgreSQLOutcomesApi.decision_evidence",
+        decision_evidence,
+    )
+    client = make_client(tmp_path)
+    token = csrf(client)
+    payload = {
+        "instrument_ref": "BTCUSDT-PERP",
+        "direction": "LONG",
+        "decision_basis": {
+            "kind": "DIRECT_EXECUTION",
+            "decision_basis_ref": "DIRECT_EXECUTION@1",
+            "parameters": {},
+        },
+        "intent": "PROFIT_SEEKING",
+        "setup_family": "OTHER",
+        "playbook_ref": "DIRECT_RULE_V1",
+        "target_venue_account_type": "USDM_COPY_LEAD",
+    }
+
+    response = client.post(
+        "/api/v1/playbook-qualification/export",
+        headers={"Origin": ORIGIN, "X-CSRFToken": token},
+        json=payload,
+    )
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["artifact"]["schema"] == "HALPHA_PLAYBOOK_QUALIFICATION@1"
+    assert result["artifact"]["target_venue_account_type"] == "USDM_COPY_LEAD"
+    assert result["artifact"]["comparable_trade_count"] == 30
+    assert len(result["artifact_content_digest"]) == 64
+    assert result["save_outside_repository"] is True
+
+
+def test_live_context_cannot_export_demo_qualification(tmp_path: Path) -> None:
+    client = make_client(
+        tmp_path,
+        config_path=ROOT / "config" / "halpha.live-copy-read-only.example.toml",
+    )
+    token = csrf(client)
+
+    response = client.post(
+        "/api/v1/playbook-qualification/export",
+        headers={
+            "Origin": "http://127.0.0.1:8766",
+            "X-CSRFToken": token,
+        },
+        json={
+            "instrument_ref": "BTCUSDT-PERP",
+            "direction": "LONG",
+            "decision_basis": {
+                "kind": "DIRECT_EXECUTION",
+                "decision_basis_ref": "DIRECT_EXECUTION@1",
+                "parameters": {},
+            },
+            "intent": "PROFIT_SEEKING",
+            "setup_family": "OTHER",
+            "playbook_ref": "DIRECT_RULE_V1",
+            "target_venue_account_type": "USDM_COPY_LEAD",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "PLAYBOOK_QUALIFICATION_EXPORT_REQUIRES_DEMO"
+    }
 
 
 def test_public_market_websocket_is_read_only_and_same_origin(tmp_path: Path) -> None:
@@ -1233,6 +1478,181 @@ def test_csrf_host_origin_and_authorization_boundaries(tmp_path: Path) -> None:
     assert bearer.json()["detail"]["code"] == "AUTHORIZATION_HEADER_FORBIDDEN"
 
 
+def test_programmatic_monitor_uses_the_full_plan_create_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def save_new_plan(
+        _self,
+        payload,
+        *,
+        idempotency_key: str,
+        observed_at: datetime,
+    ) -> dict[str, Any]:
+        captured.update(
+            payload=payload,
+            idempotency_key=idempotency_key,
+            observed_at=observed_at,
+        )
+        raise ValueError("PROGRAMMATIC_CREATE_REACHED")
+
+    monkeypatch.setattr(PostgreSQLPlanningApi, "save_new_plan", save_new_plan)
+    client = make_client(tmp_path)
+    csrf(client)  # Retain a browser cookie to prove the native channel skips CSRF.
+
+    response = client.post(
+        "/api/v1/plans",
+        headers={
+            "X-Halpha-Caller": "MONITOR",
+            "Idempotency-Key": "monitor:signal-001:create",
+        },
+        json=_programmatic_direct_plan_payload(),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {"code": "PROGRAMMATIC_CREATE_REACHED"}
+    assert captured["idempotency_key"] == "monitor:signal-001:create"
+    payload = captured["payload"]
+    assert payload.creator_kind.value == "MONITOR"
+    assert payload.decision_basis.kind.value == "DIRECT_EXECUTION"
+    assert payload.order_schedule_spec.entry_program.kind.value == "ONE_TIME"
+    assert payload.order_schedule_spec.protection_policy.time_exit_seconds == 3600
+
+
+def test_plan_creation_source_must_match_the_transport_channel(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+
+    programmatic = client.post(
+        "/api/v1/plans",
+        headers={
+            "X-Halpha-Caller": "MONITOR",
+            "Idempotency-Key": "monitor:source-mismatch:create",
+        },
+        json=_programmatic_direct_plan_payload(creator_kind="AI"),
+    )
+    token = csrf(client)
+    workbench = client.post(
+        "/api/v1/plans",
+        headers={
+            "Origin": ORIGIN,
+            "X-CSRFToken": token,
+            "Idempotency-Key": "workbench:source-mismatch:create",
+        },
+        json=_programmatic_direct_plan_payload(),
+    )
+
+    assert programmatic.status_code == 403
+    assert programmatic.json()["detail"] == {
+        "code": "PROGRAMMATIC_CREATOR_KIND_MISMATCH"
+    }
+    assert workbench.status_code == 403
+    assert workbench.json()["detail"] == {
+        "code": "MONITOR_CREATOR_REQUIRES_PROGRAMMATIC_CALLER"
+    }
+
+
+@pytest.mark.parametrize(
+    ("headers", "path", "expected_code"),
+    (
+        (
+            {"X-Halpha-Caller": "UNKNOWN"},
+            "/api/v1/plans",
+            "PROGRAMMATIC_CALLER_INVALID",
+        ),
+        (
+            {"X-Halpha-Caller": "MONITOR", "Origin": ORIGIN},
+            "/api/v1/plans",
+            "PROGRAMMATIC_BROWSER_ORIGIN_FORBIDDEN",
+        ),
+        (
+            {"X-Halpha-Caller": "MONITOR"},
+            "/api/v1/settings/test-email",
+            "PROGRAMMATIC_API_SCOPE_FORBIDDEN",
+        ),
+    ),
+)
+def test_programmatic_monitor_channel_rejects_invalid_source_or_scope(
+    tmp_path: Path,
+    headers: dict[str, str],
+    path: str,
+    expected_code: str,
+) -> None:
+    client = make_client(tmp_path)
+
+    response = client.post(path, headers=headers)
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == {"code": expected_code}
+
+
+def test_openapi_marks_the_shared_programmatic_plan_operations(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+
+    document = client.get("/api/v1/openapi.json").json()
+    expected_operations = (
+        ("/api/v1/account-position-operations/preview", "post"),
+        ("/api/v1/order-schedules/preview", "post"),
+        ("/api/v1/plans", "post"),
+        ("/api/v1/plans/{plan_id}", "put"),
+        ("/api/v1/plans/{plan_id}", "delete"),
+        ("/api/v1/plans/{plan_id}/fix", "post"),
+        ("/api/v1/plan-versions/{plan_version_id}/activation-preview", "post"),
+        ("/api/v1/activations", "post"),
+    )
+
+    for path, method in expected_operations:
+        operation = document["paths"][path][method]
+        assert operation["x-halpha-programmatic-caller"] == "MONITOR"
+        assert {
+            "$ref": "#/components/parameters/HalphaProgrammaticCaller"
+        } in operation["parameters"]
+    assert "x-halpha-programmatic-caller" not in document["paths"][
+        "/api/v1/settings/test-email"
+    ]["post"]
+    assert document["components"]["schemas"]["PlanCreatorKind"]["enum"] == [
+        "HUMAN",
+        "AI",
+        "MONITOR",
+    ]
+
+
+def test_programmatic_activation_keeps_the_same_executor_readiness_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        PostgreSQLPlanningApi,
+        "activation_replay",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        PostgreSQLPlanningApi,
+        "activate",
+        lambda *_args, **_kwargs: pytest.fail("activation must not be created"),
+    )
+    client = make_client(
+        tmp_path,
+        projection=FakeProjection(executor_status="UNAVAILABLE"),
+    )
+
+    response = client.post(
+        "/api/v1/activations",
+        headers={
+            "X-Halpha-Caller": "MONITOR",
+            "Idempotency-Key": "monitor:signal-001:activate",
+        },
+        json={
+            "plan_version_id": "plan-version-monitor-001",
+            "expected_schedule_digest": None,
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {"code": "EXECUTOR_NOT_READY"}
+
+
 @pytest.mark.parametrize(
     "endpoint",
     (
@@ -1385,6 +1805,11 @@ def test_new_direct_plan_rejects_legacy_creation_shortcuts(
                 "rationale": "Exercise the intended direct-contract boundary.",
                 "evidence": "The fixture isolates server contract validation.",
                 "limitations": "This request is not submitted to an exchange.",
+                "intent": "VALIDATION",
+                "setup_family": "OTHER",
+                "playbook_ref": "DIRECT_CONTRACT_VALIDATION_V1",
+                "invalidation": "Do not continue beyond this bounded contract check.",
+                "evidence_cutoff": "2026-07-20T00:00:00+00:00",
             },
             "decision_basis": {
                 "kind": "DIRECT_EXECUTION",
@@ -1788,6 +2213,12 @@ def _direct_activation_preview(plan_version_id: str) -> dict[str, Any]:
         "configured_runtime_real_write_gate": "CLOSED",
         "runtime_real_write_gate": "CLOSED",
         "live_activation_eligible": False,
+        "live_profit_qualification": {
+            "status": "NOT_APPLICABLE_DEMO",
+            "required": False,
+            "eligible_input": False,
+            "blocker_codes": [],
+        },
         "capital_notice": "Fixture notice.",
         "order_schedule_spec": {
             "price_distribution": {

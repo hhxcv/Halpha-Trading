@@ -64,7 +64,8 @@ def test_exact_stale_terminal_no_fill_replay_appends_one_correction(
     monkeypatch,
 ) -> None:
     revision = _revision_module()
-    started_at = datetime(2026, 7, 26, 4, 32, 16, tzinfo=UTC)
+    # Synthetic time: local database incident timestamps are not test data.
+    started_at = datetime(2030, 1, 15, 0, 0, tzinfo=UTC)
     source_time = started_at - timedelta(days=3)
     fact_digest = "5" * 64
     stop = {

@@ -228,7 +228,10 @@ class PostgreSQLPlanningRepository:
                         **(
                             {
                                 "decision_context": (
-                                    decision_context.model_dump(mode="json")
+                                    decision_context.model_dump(
+                                        mode="json",
+                                        exclude_none=True,
+                                    )
                                 )
                             }
                             if decision_context is not None

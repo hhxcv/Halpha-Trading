@@ -73,6 +73,8 @@ class AccountFactRepository(Protocol):
 
 
 class FuturesAccountReadApi(Protocol):
+    async def query_futures_account_info(self, **kwargs: object) -> object: ...
+
     async def query_futures_position_risk(self, **kwargs: object) -> object: ...
 
     async def query_open_orders(self, **kwargs: object) -> object: ...
@@ -116,6 +118,48 @@ def _canonical_optional_decimal(
     if value is None or str(value).strip() == "":
         return None
     return canonical_decimal(_decimal(value, code=code))
+
+
+def _normalize_account_summary(account_info: object) -> dict[str, object]:
+    can_trade = _value(account_info, "canTrade", required=False)
+    if type(can_trade) is not bool:
+        raise AccountObservationError("ACCOUNT_SUMMARY_CAN_TRADE_INVALID")
+    decimal_fields = {
+        "wallet_balance": ("totalWalletBalance", True),
+        "unrealized_pnl": ("totalUnrealizedProfit", False),
+        "margin_balance": ("totalMarginBalance", True),
+        "available_balance": ("availableBalance", False),
+        "initial_margin": ("totalInitialMargin", True),
+        "maintenance_margin": ("totalMaintMargin", True),
+        "position_initial_margin": ("totalPositionInitialMargin", True),
+        "open_order_initial_margin": ("totalOpenOrderInitialMargin", True),
+        "cross_wallet_balance": ("totalCrossWalletBalance", False),
+        "cross_unrealized_pnl": ("totalCrossUnPnl", False),
+    }
+    normalized: dict[str, object] = {"can_trade": can_trade}
+    for target, (source, non_negative) in decimal_fields.items():
+        raw = _value(account_info, source, required=False)
+        if raw is None:
+            raise AccountObservationError("ACCOUNT_SUMMARY_DECIMAL_INVALID")
+        value = _decimal(
+            raw,
+            code="ACCOUNT_SUMMARY_DECIMAL_INVALID",
+        )
+        if non_negative and value < 0:
+            raise AccountObservationError("ACCOUNT_SUMMARY_DECIMAL_INVALID")
+        normalized[target] = canonical_decimal(value)
+    update_time = _value(account_info, "updateTime", required=False)
+    if update_time is not None:
+        try:
+            update_time_ms = int(update_time)
+        except (TypeError, ValueError):
+            raise AccountObservationError("ACCOUNT_SUMMARY_UPDATE_TIME_INVALID") from None
+        if update_time_ms < 0:
+            raise AccountObservationError("ACCOUNT_SUMMARY_UPDATE_TIME_INVALID")
+        normalized["source_update_time_ms"] = update_time_ms
+    else:
+        normalized["source_update_time_ms"] = None
+    return normalized
 
 
 def _order_text(
@@ -502,6 +546,7 @@ def build_account_snapshot_fact(
     *,
     environment_id: str,
     account_ref: str,
+    account_info: object,
     positions: object,
     symbol_configs: object,
     open_orders: object,
@@ -521,6 +566,7 @@ def build_account_snapshot_fact(
         raise AccountObservationError("ACCOUNT_ORDER_RESPONSE_SCHEMA_MISMATCH")
     if not isinstance(open_algo_orders, (list, tuple)):
         raise AccountObservationError("ACCOUNT_ALGO_ORDER_RESPONSE_SCHEMA_MISMATCH")
+    normalized_account_summary = _normalize_account_summary(account_info)
     normalized_symbol_configs = _normalize_symbol_configs(symbol_configs)
     normalized_positions = tuple(
         normalized
@@ -572,6 +618,7 @@ def build_account_snapshot_fact(
             "snapshot_complete": True,
             "snapshot_started_at": started_at.astimezone(UTC).isoformat(),
             "management_authority": "NONE",
+            "account_summary": normalized_account_summary,
             "positions": list(normalized_positions),
             "open_position_count": len(normalized_positions),
             "ordinary_open_orders": list(normalized_ordinary_orders),
@@ -635,12 +682,16 @@ class ProductAccountObserver:
         started_at = datetime.now(UTC)
         try:
             (
+                account_info,
                 positions,
                 symbol_configs,
                 open_orders,
                 open_algo_orders,
             ) = await asyncio.wait_for(
                 asyncio.gather(
+                    self._account_api.query_futures_account_info(
+                        recv_window="5000"
+                    ),
                     self._account_api.query_futures_position_risk(
                         recv_window="5000"
                     ),
@@ -666,6 +717,7 @@ class ProductAccountObserver:
         fact = build_account_snapshot_fact(
             environment_id=self._environment_id,
             account_ref=self._account_ref,
+            account_info=account_info,
             positions=positions,
             symbol_configs=symbol_configs,
             open_orders=open_orders,

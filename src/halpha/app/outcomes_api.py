@@ -5,20 +5,36 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Literal
 
 import psycopg
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 from halpha.outcomes.repository import PostgreSQLOutcomeRepository
 from halpha.outcomes.models import ReviewClassification, StageReviewCreator
 from halpha.outcomes.account_reconciliation import account_result_role
 from halpha.outcomes.service import OutcomeApplicationService
 from halpha.outcomes.trade_result import summarize_trade_result
-from halpha.domain_values import canonical_decimal
+from halpha.outcomes.repeatability import assess_playbook_repeatability
+from halpha.domain_values import canonical_decimal, content_digest
+from halpha.planning.models import (
+    PLAYBOOK_REF_PATTERN,
+    PlanDecisionIntent,
+    PlanSetupFamily,
+)
+from halpha.planning.registry import (
+    DIRECT_EXECUTION_REF,
+    DecisionBasisKind,
+    Direction,
+    DraftDecisionBasis,
+)
 
 
 _EXECUTION_FEE_SAMPLE_LIMIT = 10
+_REPEATED_DECISION_SAMPLE_FLOOR = 10
+_DECISION_PERFORMANCE_CLASSIFICATIONS = frozenset(
+    {"USABLE_SAMPLE", "TRADE_DECISION_ISSUE", "AS_EXPECTED"}
+)
 
 
 class OutcomeApiModel(BaseModel):
@@ -42,6 +58,33 @@ class StageReviewCreatePayload(OutcomeApiModel):
     problem_analysis: str = Field(min_length=1, max_length=8000)
     improvement_plan: str = Field(min_length=1, max_length=8000)
     creator_kind: StageReviewCreator
+
+
+class DecisionEvidencePreviewPayload(OutcomeApiModel):
+    instrument_ref: str
+    direction: Direction
+    decision_basis: DraftDecisionBasis
+    intent: PlanDecisionIntent
+    setup_family: PlanSetupFamily
+    playbook_ref: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=96,
+        pattern=PLAYBOOK_REF_PATTERN,
+    )
+
+    @model_validator(mode="after")
+    def playbook_matches_decision_basis(self) -> DecisionEvidencePreviewPayload:
+        if self.decision_basis.kind is DecisionBasisKind.DIRECT_EXECUTION:
+            if self.playbook_ref is None:
+                raise ValueError("PLAN_DECISION_PLAYBOOK_REF_REQUIRED")
+        elif self.playbook_ref is not None:
+            raise ValueError("PLAN_DECISION_PLAYBOOK_REF_UNEXPECTED")
+        return self
+
+
+class PlaybookQualificationExportPayload(DecisionEvidencePreviewPayload):
+    target_venue_account_type: Literal["USDM_COPY_LEAD", "USDM_PERSONAL"]
 
 
 class OutcomesApiUnavailable(RuntimeError):
@@ -107,6 +150,29 @@ class PostgreSQLOutcomesApi:
                 sample_limit=_EXECUTION_FEE_SAMPLE_LIMIT,
             )
 
+    def decision_evidence(
+        self,
+        payload: DecisionEvidencePreviewPayload,
+        *,
+        decision_basis_ref: str,
+        parameter_digest: str,
+    ) -> dict[str, Any]:
+        with self._connect() as connection, connection.transaction():
+            reviews = OutcomeApplicationService(
+                connection, self._environment_id
+            ).list_reviews()
+            resolved_reviews = self._attach_trade_context(connection, reviews)
+            return summarize_decision_evidence(
+                resolved_reviews,
+                instrument_ref=payload.instrument_ref,
+                direction=payload.direction.value,
+                decision_basis_ref=decision_basis_ref,
+                parameter_digest=parameter_digest,
+                intent=payload.intent.value,
+                setup_family=payload.setup_family.value,
+                playbook_ref=payload.playbook_ref,
+            )
+
     def list_stage_reviews(self) -> list[dict[str, Any]]:
         with self._connect() as connection, connection.transaction():
             return OutcomeApplicationService(
@@ -167,7 +233,10 @@ class PostgreSQLOutcomesApi:
                    v.terms ->> 'created_at',
                    v.terms ->> 'creator_kind',
                    a.order_schedule_snapshot,
-                   a.position_alignment
+                   a.position_alignment,
+                   v.parameter_digest,
+                   v.terms -> 'decision_context',
+                   v.max_allowed_loss
             FROM halpha.plan_activation a
             LEFT JOIN halpha.trade_plan_version v
               ON v.environment_id = a.environment_id
@@ -198,6 +267,21 @@ class PostgreSQLOutcomesApi:
                 "position_alignment": (
                     dict(row[11])
                     if len(row) > 11 and row[11] is not None
+                    else None
+                ),
+                "parameter_digest": (
+                    str(row[12])
+                    if len(row) > 12 and row[12] is not None
+                    else None
+                ),
+                "decision_context": (
+                    dict(row[13])
+                    if len(row) > 13 and row[13] is not None
+                    else None
+                ),
+                "max_allowed_loss": (
+                    str(row[14])
+                    if len(row) > 14 and row[14] is not None
                     else None
                 ),
             }
@@ -377,6 +461,320 @@ class PostgreSQLOutcomesApi:
                 observed_at=datetime.now(UTC),
             )
             return {"review": review.model_dump(mode="json")}
+
+
+def summarize_decision_evidence(
+    reviews: Iterable[Mapping[str, Any]],
+    *,
+    instrument_ref: str,
+    direction: str,
+    decision_basis_ref: str,
+    parameter_digest: str,
+    intent: str,
+    setup_family: str,
+    playbook_ref: str | None,
+) -> dict[str, Any]:
+    """Summarize an exact, non-cherry-picked pre-trade comparison cohort."""
+
+    matched: list[Mapping[str, Any]] = []
+    comparable: list[
+        tuple[
+            datetime,
+            Decimal,
+            Decimal,
+            Decimal,
+            Decimal | None,
+            dict[str, Any] | None,
+        ]
+    ] = []
+    exclusions: dict[str, int] = {}
+    source_cutoffs: list[datetime] = []
+
+    def exclude(reason: str) -> None:
+        exclusions[reason] = exclusions.get(reason, 0) + 1
+
+    for review in reviews:
+        context = review.get("trade_context")
+        if not isinstance(context, Mapping):
+            continue
+        decision_context = context.get("decision_context")
+        if not isinstance(decision_context, Mapping):
+            continue
+        if (
+            str(context.get("instrument_ref", "")) != instrument_ref
+            or str(context.get("direction", "")) != direction
+            or str(context.get("decision_basis_ref", "")) != decision_basis_ref
+            or str(context.get("parameter_digest", "")) != parameter_digest
+            or str(decision_context.get("setup_family", "")) != setup_family
+            or (
+                decision_basis_ref == DIRECT_EXECUTION_REF
+                and decision_context.get("playbook_ref") != playbook_ref
+            )
+        ):
+            continue
+        matched.append(review)
+        cutoff = _decision_evidence_datetime(review.get("fact_cutoff"))
+        if cutoff is not None:
+            source_cutoffs.append(cutoff)
+
+        historical_intent = str(decision_context.get("intent", ""))
+        if historical_intent != PlanDecisionIntent.PROFIT_SEEKING.value:
+            exclude(
+                "VALIDATION_INTENT"
+                if historical_intent == PlanDecisionIntent.VALIDATION.value
+                else "MISSING_DECISION_INTENT"
+            )
+            continue
+        if str(review.get("status", "")) != "COMPLETE":
+            exclude("PENDING_REVIEW")
+            continue
+        evaluations = review.get("evaluations")
+        owner = (
+            evaluations.get("owner_conclusion")
+            if isinstance(evaluations, Mapping)
+            else None
+        )
+        classification = (
+            str(owner.get("result", "")) if isinstance(owner, Mapping) else ""
+        )
+        if classification not in _DECISION_PERFORMANCE_CLASSIFICATIONS:
+            exclude(classification or "MISSING_CLASSIFICATION")
+            continue
+        result = review.get("resolved_trade_result")
+        if not isinstance(result, Mapping):
+            exclude("UNRELIABLE_RESULT")
+            continue
+        net_pnl = _decision_evidence_decimal(result.get("net_pnl"))
+        commission = _decision_evidence_decimal(result.get("commission"))
+        entry_notional = _decision_evidence_decimal(result.get("entry_notional"))
+        max_allowed_loss = _decision_evidence_decimal(
+            context.get("max_allowed_loss")
+        )
+        if (
+            result.get("calculation_complete") is not True
+            or result.get("execution_cost_complete") is not True
+            or result.get("closed") is not True
+            or result.get("strategy_attribution_complete") is not True
+            or net_pnl is None
+            or commission is None
+            or commission < 0
+            or entry_notional is None
+            or entry_notional <= 0
+        ):
+            exclude("UNRELIABLE_RESULT")
+            continue
+        comparable.append(
+            (
+                cutoff or datetime.min.replace(tzinfo=UTC),
+                net_pnl,
+                commission,
+                entry_notional,
+                max_allowed_loss,
+                _decision_evidence_sample_ref(review, cutoff),
+            )
+        )
+
+    comparable.sort(key=lambda item: item[0])
+    pnl_values = [item[1] for item in comparable]
+    net_pnl = sum(pnl_values, Decimal(0))
+    commissions = sum((item[2] for item in comparable), Decimal(0))
+    entry_notional = sum((item[3] for item in comparable), Decimal(0))
+    gross_profit = sum((max(item, Decimal(0)) for item in pnl_values), Decimal(0))
+    gross_loss = sum((max(-item, Decimal(0)) for item in pnl_values), Decimal(0))
+    cumulative = Decimal(0)
+    peak = Decimal(0)
+    maximum_drawdown = Decimal(0)
+    for item in pnl_values:
+        cumulative += item
+        peak = max(peak, cumulative)
+        maximum_drawdown = max(maximum_drawdown, peak - cumulative)
+    worst_trade = min(pnl_values) if pnl_values else None
+    worst_loss = worst_trade if worst_trade is not None and worst_trade < 0 else None
+    best_trade = max(pnl_values) if pnl_values else None
+    best_win = best_trade if best_trade is not None and best_trade > 0 else None
+    trade_count = len(comparable)
+    sample_review_refs = [
+        item[5] for item in comparable if item[5] is not None
+    ]
+    sample_traceability_complete = len(sample_review_refs) == trade_count
+    sample_identity_digest = (
+        content_digest(sample_review_refs)
+        if sample_traceability_complete and sample_review_refs
+        else None
+    )
+    longest_winning_streak = 0
+    longest_losing_streak = 0
+    current_streak_kind: str | None = None
+    current_streak_count = 0
+    for item in pnl_values:
+        result_kind = "WIN" if item > 0 else "LOSS" if item < 0 else "FLAT"
+        if result_kind == current_streak_kind:
+            current_streak_count += 1
+        else:
+            current_streak_kind = result_kind
+            current_streak_count = 1
+        if result_kind == "WIN":
+            longest_winning_streak = max(
+                longest_winning_streak,
+                current_streak_count,
+            )
+        elif result_kind == "LOSS":
+            longest_losing_streak = max(
+                longest_losing_streak,
+                current_streak_count,
+            )
+    if intent == PlanDecisionIntent.VALIDATION.value:
+        evidence_grade = "VALIDATION_INTENT"
+    elif trade_count == 0:
+        evidence_grade = "NO_COMPARABLE_SAMPLE"
+    elif trade_count < _REPEATED_DECISION_SAMPLE_FLOOR:
+        evidence_grade = "SINGLE_DIGIT_ANECDOTAL"
+    else:
+        evidence_grade = "REPEATED_OBSERVATION_UNPROVEN"
+
+    metrics = {
+        "trade_count": trade_count,
+        "wins": sum(item > 0 for item in pnl_values),
+        "losses": sum(item < 0 for item in pnl_values),
+        "flat": sum(item == 0 for item in pnl_values),
+        "net_pnl": canonical_decimal(net_pnl),
+        "commission": canonical_decimal(commissions),
+        "average_net_pnl": (
+            canonical_decimal(net_pnl / trade_count) if trade_count else None
+        ),
+        "gross_profit": canonical_decimal(gross_profit),
+        "gross_loss": canonical_decimal(gross_loss),
+        "profit_factor": (
+            canonical_decimal(gross_profit / gross_loss)
+            if gross_loss > 0
+            else None
+        ),
+        "total_entry_notional": canonical_decimal(entry_notional),
+        "notional_return_percent": (
+            canonical_decimal(net_pnl / entry_notional * Decimal(100))
+            if entry_notional > 0
+            else None
+        ),
+        "maximum_drawdown": canonical_decimal(maximum_drawdown),
+        "worst_trade_net_pnl": (
+            canonical_decimal(worst_loss) if worst_loss is not None else None
+        ),
+        "net_pnl_without_worst_trade": (
+            canonical_decimal(net_pnl - worst_loss)
+            if worst_loss is not None
+            else None
+        ),
+        "largest_loss_share_percent": (
+            canonical_decimal((-worst_loss) / gross_loss * Decimal(100))
+            if worst_loss is not None and gross_loss > 0
+            else None
+        ),
+        "best_trade_net_pnl": (
+            canonical_decimal(best_win) if best_win is not None else None
+        ),
+        "net_pnl_without_best_trade": (
+            canonical_decimal(net_pnl - best_win)
+            if best_win is not None
+            else None
+        ),
+        "largest_win_share_percent": (
+            canonical_decimal(best_win / gross_profit * Decimal(100))
+            if best_win is not None and gross_profit > 0
+            else None
+        ),
+        "longest_winning_streak": longest_winning_streak,
+        "longest_losing_streak": longest_losing_streak,
+        "current_streak_kind": current_streak_kind,
+        "current_streak_count": current_streak_count,
+    }
+    return {
+        "instrument_ref": instrument_ref,
+        "direction": direction,
+        "decision_basis_ref": decision_basis_ref,
+        "parameter_digest": parameter_digest,
+        "intent": intent,
+        "setup_family": setup_family,
+        "playbook_ref": playbook_ref,
+        "source": "CURRENT_COMPLETED_REVIEWS",
+        "source_cutoff": (
+            max(source_cutoffs).isoformat() if source_cutoffs else None
+        ),
+        "matched_review_count": len(matched),
+        "comparable_trade_count": trade_count,
+        "excluded_review_count": len(matched) - trade_count,
+        "exclusions": dict(sorted(exclusions.items())),
+        "sample_review_refs": sample_review_refs,
+        "sample_traceability_complete": sample_traceability_complete,
+        "sample_identity_digest": sample_identity_digest,
+        "evidence_grade": evidence_grade,
+        "repeated_sample_floor": _REPEATED_DECISION_SAMPLE_FLOOR,
+        "metrics": metrics,
+        "repeatability": assess_playbook_repeatability(
+            intent=intent,
+            net_pnl_values=pnl_values,
+            max_allowed_losses=[item[4] for item in comparable],
+            gross_profit=gross_profit,
+            gross_loss=gross_loss,
+        ),
+        "capital_scaling_authority": False,
+        "limitations": [
+            "只比较同一环境、工具、方向、决策依据、参数摘要和交易形态；直接执行还必须使用同一交易剧本标识。",
+            "历史直接执行若缺少交易剧本标识会保持未知并排除，不能按计划名称、说明文字、盈亏或单次信号身份补猜。",
+            "交易决策需改进的盈利导向交易仍保留在样本中，不能事后删掉亏损判断。",
+            "剔除最大亏损后的结果仅是尾部敏感性，不是策略表现；只有预先固定的规则才能证明该亏损可避免。",
+            "可重复性筛查还会反向检查最佳单笔依赖、前后时间段和费用后 R 置信下界；通过也只表示值得进入下一步评估。",
+            "观察结果不证明独立同分布、未来稳定盈利或资金容量，也不授权扩大本金与风险。",
+        ],
+    }
+
+
+def _decision_evidence_sample_ref(
+    review: Mapping[str, Any],
+    cutoff: datetime | None,
+) -> dict[str, Any] | None:
+    review_id = review.get("review_id")
+    review_version = review.get("review_version")
+    review_digest = review.get("content_digest")
+    if (
+        not isinstance(review_id, str)
+        or not review_id
+        or isinstance(review_version, bool)
+        or not isinstance(review_version, int)
+        or review_version <= 0
+        or not isinstance(review_digest, str)
+        or len(review_digest) != 64
+        or any(character not in "0123456789abcdef" for character in review_digest)
+        or cutoff is None
+    ):
+        return None
+    return {
+        "review_id": review_id,
+        "review_version": review_version,
+        "review_content_digest": review_digest,
+        "fact_cutoff": cutoff.isoformat(),
+    }
+
+
+def _decision_evidence_decimal(value: object) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _decision_evidence_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.utcoffset() is not None else value.replace(tzinfo=UTC)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.utcoffset() is not None else parsed.replace(tzinfo=UTC)
 
 
 def _unresolved_trade_result(unresolved_refs: tuple[str, ...]) -> dict[str, Any]:

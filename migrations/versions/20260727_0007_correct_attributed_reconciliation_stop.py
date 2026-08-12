@@ -21,10 +21,8 @@ depends_on = None
 
 
 _DEMO_ENVIRONMENT_ID = "binance-demo-primary"
-_ATTRIBUTED_BATCH_STOP_ID = "1566b00c-92e9-486a-b43e-3116cd06e439"
-_EVIDENCE_DIGEST = (
-    "fcb86a6b6ebf19cd5faf9d7df279d8b768c5e78f23ff121e0afa923a667a8ed4"
-)
+_ATTRIBUTED_BATCH_STOP_ID = "00000000-0000-4000-8000-000000000007"
+_EVIDENCE_DIGEST = "0" * 64
 
 
 def _json_value(value: object) -> object:

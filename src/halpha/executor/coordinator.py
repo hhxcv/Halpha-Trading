@@ -18,6 +18,7 @@ from halpha.capital.models import (
     ActionCheckInput,
     AuthorityClass,
     EnvironmentKind,
+    NewRiskDisciplinePolicy,
     RiskClass,
 )
 from halpha.capital.service import CapitalApplicationService
@@ -374,6 +375,85 @@ def _submission_block_reason(
     return None
 
 
+def _is_frozen_planned_scale_in_action(
+    action: ExecutionAction,
+    activation: PlanActivation,
+) -> bool:
+    """Recognize only an original, multi-leg entry after this plan has entered.
+
+    The exception is intentionally reconstructed from the immutable activation
+    snapshot rather than trusted from an action flag.  Retried or repriced
+    entries, a one-time entry, and a plan without an earlier fill remain normal
+    new-risk attempts.
+    """
+
+    if (
+        action.action_kind is not ExecutionActionKind.ENTRY
+        or getattr(activation, "order_schedule_snapshot", None) is None
+        or not getattr(activation, "has_entry_fill", False)
+    ):
+        return False
+    rule_state = getattr(activation, "rule_state", None)
+    deadlines = rule_state.get("deadlines") if isinstance(rule_state, dict) else None
+    deadline_value = (
+        deadlines.get("entry_valid_until") if isinstance(deadlines, dict) else None
+    )
+    if not isinstance(deadline_value, str):
+        return False
+    try:
+        entry_valid_until = datetime.fromisoformat(deadline_value)
+    except ValueError:
+        return False
+    if entry_valid_until.utcoffset() is None:
+        return False
+    terms = action.action_terms
+    context = terms.get("execution_context")
+    schedule = context.get("order_schedule") if isinstance(context, dict) else None
+    if not isinstance(schedule, dict):
+        return False
+    leg_index = schedule.get("leg_index")
+    if (
+        not isinstance(leg_index, int)
+        or schedule.get("attempt_index", 0) != 0
+        or any(
+            key in schedule
+            for key in ("retry_reason", "replacement_price", "reprice_index")
+        )
+    ):
+        return False
+    try:
+        expected = next(
+            (
+                item
+                for item in materialize_direct_schedule(
+                    activation,
+                    entry_valid_until=entry_valid_until,
+                )
+                if item.leg.leg_index == leg_index
+            ),
+            None,
+        )
+    except (TypeError, ValueError):
+        return False
+    if expected is None or expected.leg.leg_count < 2:
+        return False
+    proposed = expected.proposed_action
+    return (
+        getattr(action, "execution_action_id", None) == expected.execution_action_id
+        and getattr(action, "source_identity", None) == expected.source_identity
+        and getattr(action, "client_order_id", None) == expected.client_order_id
+        and schedule == proposed.execution_context["order_schedule"]
+        and terms.get("instrument_ref") == proposed.instrument_ref
+        and terms.get("direction") == proposed.direction.value
+        and terms.get("action_profile") == proposed.action_profile
+        and terms.get("order_type") == proposed.order_type
+        and terms.get("price") == proposed.price
+        and terms.get("close_position") is proposed.close_position
+        and terms.get("reduce_only") is proposed.reduce_only
+        and terms.get("causation_ref") == proposed.causation_ref
+    )
+
+
 class HalphaCoordinator:
     """Compose TRADEPLAN -> CAP -> EXE with no direct cross-owner table writes."""
 
@@ -393,6 +473,7 @@ class HalphaCoordinator:
         live_write_submission_guard: Callable[[str], None] | None = None,
         live_write_risk_control_only: bool = False,
         unattributed_reconciliation_not_before: datetime | None = None,
+        new_risk_discipline_policy: NewRiskDisciplinePolicy | None = None,
     ) -> None:
         if environment_kind == "DEMO":
             if (
@@ -439,6 +520,9 @@ class HalphaCoordinator:
             unattributed_reconciliation_not_before.astimezone(UTC)
             if unattributed_reconciliation_not_before is not None
             else None
+        )
+        self._new_risk_discipline_policy = (
+            new_risk_discipline_policy or NewRiskDisciplinePolicy()
         )
         self._planning = PlanningApplicationService(connection, environment_id)
         self._capital = CapitalApplicationService(connection, environment_id)
@@ -1800,6 +1884,35 @@ class HalphaCoordinator:
                     venue_called=False,
                     reason_code=decision.reason_code,
                 )
+            if action.action_class is RiskClass.RISK_INCREASING:
+                discipline = self._capital.new_risk_discipline_status(
+                    account_ref=action.account_ref,
+                    policy=self._new_risk_discipline_policy,
+                    observed_at=observed_at,
+                    entry_instrument_ref=action.action_terms.get("instrument_ref"),
+                    entry_direction=action.action_terms.get("direction"),
+                    is_frozen_scale_in=_is_frozen_planned_scale_in_action(
+                        action,
+                        activation,
+                    ),
+                    lock=True,
+                )
+                if not discipline.new_risk_allowed:
+                    reason_code = (
+                        discipline.blocker_codes[0]
+                        if discipline.blocker_codes
+                        else "NEW_RISK_DISCIPLINE_UNKNOWN"
+                    )
+                    rejected = self._execution.record_definitely_not_submitted(
+                        execution_action_id,
+                        reason_code=reason_code,
+                        observed_at=observed_at,
+                    )
+                    return ProcessExecutionResult(
+                        rejected,
+                        venue_called=False,
+                        reason_code=reason_code,
+                    )
             prepared = self._execution.prepare_submission(
                 execution_action_id,
                 capital_decision=decision,

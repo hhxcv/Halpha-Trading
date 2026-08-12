@@ -210,7 +210,7 @@ def test_real_binance_trade_replaces_framework_reconciliation_placeholder(
         source_time=NOW,
         payload={
             **common,
-            "trade_id": "522671923",
+            "trade_id": "synthetic-authoritative-trade",
             "event_type": "BinanceUserTradeQuery",
         },
     )

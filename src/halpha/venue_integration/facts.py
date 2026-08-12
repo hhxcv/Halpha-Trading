@@ -445,6 +445,69 @@ def terminal_fills_accounted_for_exit(
     return persisted == cumulative
 
 
+def terminal_fills_accounted_for_user_takeover(
+    action: ExecutionAction,
+    facts: Iterable[VenueFact],
+) -> bool:
+    """Account for a venue-downsized terminal order after explicit takeover.
+
+    Binance can reduce a reduce-only conditional order to the remaining
+    position before filling it.  The immutable Halpha action keeps its original
+    requested quantity, so the normal exact-quantity closure proof deliberately
+    reports drift.  After user takeover, an account-level zero-position and
+    no-open-order proof may pair with this narrower fact proof: the venue must
+    report an explicit terminal cumulative quantity, every persisted fill must
+    sum to that quantity, and the venue quantity may only have decreased.
+
+    This helper does not itself prove account closure and must not be used for
+    an active Halpha-owned responsibility.
+    """
+
+    materialized = collapse_synthetic_reconciliation_fills(facts)
+    terminal_status = terminal_order_status(materialized)
+    if terminal_status is None:
+        return False
+    try:
+        requested = Decimal(str(action.action_terms["quantity"]))
+    except (InvalidOperation, KeyError, TypeError, ValueError):
+        return False
+    if not requested.is_finite() or requested <= 0:
+        return False
+
+    persisted = Decimal(0)
+    for fact in materialized:
+        if fact.kind is not VenueFactKind.FILL:
+            continue
+        try:
+            quantity = Decimal(str(fact.payload["last_quantity"]))
+        except (InvalidOperation, KeyError, TypeError, ValueError):
+            return False
+        if not quantity.is_finite() or quantity <= 0:
+            return False
+        persisted += quantity
+
+    for terminal_fact in materialized:
+        if terminal_order_status((terminal_fact,)) != terminal_status:
+            continue
+        cumulative_raw = terminal_fact.payload.get("cumulative_filled_quantity")
+        if cumulative_raw is None:
+            continue
+        try:
+            cumulative = Decimal(str(cumulative_raw))
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+        if (
+            not cumulative.is_finite()
+            or cumulative < 0
+            or cumulative > requested
+            or persisted != cumulative
+            or (terminal_status == "REJECTED" and cumulative != 0)
+        ):
+            continue
+        return True
+    return False
+
+
 def action_quantity_conflict(
     action: ExecutionAction,
     facts: Iterable[VenueFact],

@@ -72,6 +72,7 @@ from halpha.venue_integration.rejections import (
 )
 
 from .coordinator import OrderScheduleCapRejected
+from .direct_protection import direct_time_exit_at
 
 
 class DirectScheduleCoordinator(Protocol):
@@ -2321,7 +2322,7 @@ def _entry_management_decision(
         ),
         None,
     )
-    direct_time_exit = _direct_time_exit_at(activation)
+    direct_time_exit = direct_time_exit_at(activation)
     expire_rule_reached = (
         expire_rule is not None
         and expire_anchor is not None
@@ -2589,7 +2590,7 @@ def _entry_management_expiry_at(
     candidates = [remaining_valid_until]
     if remaining_expiry_at is not None:
         candidates.append(remaining_expiry_at)
-    direct_time_exit = _direct_time_exit_at(activation)
+    direct_time_exit = direct_time_exit_at(activation)
     if direct_time_exit is not None:
         candidates.append(direct_time_exit)
     if any(value.utcoffset() is None for value in candidates):
@@ -2653,35 +2654,6 @@ def _completed_time_slice_expiry_at(
 
 def _management_uuid(environment_id: str, kind: str, identity: str) -> str:
     return str(uuid5(NAMESPACE_URL, f"urn:halpha:{environment_id}:{kind}:{identity}"))
-
-
-def _direct_time_exit_at(activation: PlanActivation) -> datetime | None:
-    state = activation.rule_state.get("direct_protection")
-    if not isinstance(state, dict):
-        return None
-    anchor_ref = state.get("anchor_fill_ref")
-    fills = state.get("fills")
-    if not isinstance(anchor_ref, str) or not isinstance(fills, dict):
-        return None
-    anchor = fills.get(anchor_ref)
-    if not isinstance(anchor, dict):
-        return None
-    policy = anchor.get("protection_policy")
-    fill_time_value = anchor.get("fill_time")
-    if not isinstance(policy, dict) or not isinstance(fill_time_value, str):
-        return None
-    seconds = policy.get("time_exit_seconds")
-    if seconds is None:
-        return None
-    if not isinstance(seconds, int) or seconds <= 0:
-        raise ValueError("DIRECT_TIME_EXIT_INVALID")
-    try:
-        fill_time = datetime.fromisoformat(fill_time_value)
-    except ValueError:
-        raise ValueError("DIRECT_TIME_EXIT_INVALID") from None
-    if fill_time.utcoffset() is None:
-        raise ValueError("DIRECT_TIME_EXIT_INVALID")
-    return fill_time.astimezone(UTC) + timedelta(seconds=seconds)
 
 
 def _materialized_schedule_attempt(

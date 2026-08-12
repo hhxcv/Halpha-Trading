@@ -30,6 +30,7 @@ from halpha.venue_integration.facts import (
     collapse_synthetic_reconciliation_fills,
     order_is_working,
     terminal_fills_accounted_for_exit,
+    terminal_fills_accounted_for_user_takeover,
     terminal_fills_complete,
     terminal_order_status,
 )
@@ -49,6 +50,8 @@ from halpha.venue_integration.rejections import (
     VenueRejectionDisposition,
     venue_rejection_disposition,
 )
+
+from .direct_protection import direct_time_exit_at
 
 
 PROTECTION_UNKNOWN_EXIT_DELAY = timedelta(seconds=15)
@@ -96,6 +99,14 @@ class ProductResponsibilityCoordinator(Protocol):
 
     def reconcile_execution_action(
         self, execution_action_id: str, **kwargs: Any
+    ) -> ExecutionAction: ...
+
+    def reconcile_cancel_from_target_fact(
+        self,
+        execution_action_id: str,
+        *,
+        target_fact: VenueFact,
+        observed_at: datetime,
     ) -> ExecutionAction: ...
 
     def query_unknown_action_if_due(
@@ -855,7 +866,7 @@ class ProductResponsibilityBoundary:
         if activation.lifecycle is not PlanLifecycle.RUNNING:
             self._clear_direct_time_exit_wake(activation_id)
             return
-        deadline = _direct_time_exit_at(activation)
+        deadline = direct_time_exit_at(activation)
         if deadline is None:
             return
         if self._direct_time_exit_woken.get(activation_id) == deadline:
@@ -1639,6 +1650,15 @@ class ProductResponsibilityBoundary:
             return
         state = activation.rule_state.get("direct_protection")
         fills = state.get("fills") if isinstance(state, dict) else None
+        if not activation.has_entry_fill and (
+            state is None or (isinstance(fills, dict) and not fills)
+        ):
+            # Aggregate targets are derived only after the first confirmed
+            # direct-entry fill.  A working entry order therefore has no
+            # protection aggregate to manage yet and is not an invariant
+            # violation.  Once any fill is recorded, malformed or missing
+            # aggregate state must continue to fail closed below.
+            return
         target_state = state.get("aggregate_target") if isinstance(state, dict) else None
         revision = state.get("aggregate_revision") if isinstance(state, dict) else None
         target_price = (
@@ -1819,6 +1839,13 @@ class ProductResponsibilityBoundary:
             return
         state = activation.rule_state.get("direct_protection")
         fills = state.get("fills") if isinstance(state, dict) else None
+        if not activation.has_entry_fill and (
+            state is None or (isinstance(fills, dict) and not fills)
+        ):
+            # Take-profit aggregates have the same first-fill boundary as the
+            # protective stop aggregate.  Before that fill there is nothing to
+            # reconcile; after it, incomplete aggregate state remains fatal.
+            return
         target_state = state.get("aggregate_target") if isinstance(state, dict) else None
         targets = (
             target_state.get("take_profit_prices")
@@ -2658,6 +2685,7 @@ class ProductResponsibilityBoundary:
             return
 
         closure_fact_refs = {position_fact.venue_fact_id}
+        user_takeover = activation.lifecycle is PlanLifecycle.USER_TAKEOVER
         for action in actions:
             if action.state in {
                 ExecutionActionState.CLOSED,
@@ -2674,7 +2702,13 @@ class ProductResponsibilityBoundary:
             terminal_status = terminal_order_status(action_facts)
             if terminal_status is None:
                 return
-            fills_complete = terminal_fills_complete(action, action_facts)
+            exact_fills_complete = terminal_fills_complete(action, action_facts)
+            takeover_fills_accounted = (
+                user_takeover
+                and not exact_fills_complete
+                and terminal_fills_accounted_for_user_takeover(action, action_facts)
+            )
+            fills_complete = exact_fills_complete or takeover_fills_accounted
             fees_complete = _fills_have_commissions(action_facts)
             if not fills_complete or not fees_complete:
                 return
@@ -2688,6 +2722,9 @@ class ProductResponsibilityBoundary:
                     "fees_complete": fees_complete,
                     "position_effect_known": True,
                     "position_fact_ref": position_fact.venue_fact_id,
+                    "user_takeover_downsized_terminal_accounted": (
+                        takeover_fills_accounted
+                    ),
                 },
                 venue_fact_refs=fact_refs,
                 observed_at=facts.checked_at,
@@ -2704,7 +2741,6 @@ class ProductResponsibilityBoundary:
             for action in refreshed
         ):
             return
-        user_takeover = activation.lifecycle is PlanLifecycle.USER_TAKEOVER
         takeover_scope = activation.takeover_scope or {}
         handover_command_ref = takeover_scope.get("command_ref")
         if user_takeover and not isinstance(handover_command_ref, str):
@@ -2867,41 +2903,12 @@ def _direct_time_exit_due(
     *,
     observed_at: datetime,
 ) -> bool:
-    deadline = _direct_time_exit_at(activation)
+    deadline = direct_time_exit_at(activation)
     if deadline is None:
         return False
     if observed_at.utcoffset() is None:
         raise ValueError("DIRECT_TIME_EXIT_INVALID")
     return observed_at >= deadline
-
-
-def _direct_time_exit_at(activation: PlanActivation) -> datetime | None:
-    state = activation.rule_state.get("direct_protection")
-    if not isinstance(state, dict):
-        return None
-    anchor_ref = state.get("anchor_fill_ref")
-    fills = state.get("fills")
-    if not isinstance(anchor_ref, str) or not isinstance(fills, dict):
-        return None
-    anchor = fills.get(anchor_ref)
-    if not isinstance(anchor, dict):
-        return None
-    policy = anchor.get("protection_policy")
-    fill_time_value = anchor.get("fill_time")
-    if not isinstance(policy, dict) or not isinstance(fill_time_value, str):
-        return None
-    seconds = policy.get("time_exit_seconds")
-    if seconds is None:
-        return None
-    if not isinstance(seconds, int) or seconds <= 0:
-        raise ValueError("DIRECT_TIME_EXIT_INVALID")
-    try:
-        fill_time = datetime.fromisoformat(fill_time_value)
-    except ValueError:
-        raise ValueError("DIRECT_TIME_EXIT_INVALID") from None
-    if fill_time.utcoffset() is None:
-        raise ValueError("DIRECT_TIME_EXIT_INVALID")
-    return fill_time.astimezone(UTC) + timedelta(seconds=seconds)
 
 
 def _fills_have_commissions(facts: tuple[VenueFact, ...]) -> bool:
