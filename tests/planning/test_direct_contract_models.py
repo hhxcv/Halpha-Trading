@@ -6,7 +6,11 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-from halpha.capital.models import AuthorityClass, EnvironmentKind
+from halpha.capital.models import (
+    AuthorityClass,
+    EnvironmentKind,
+    NewRiskDisciplinePolicy,
+)
 from halpha.domain_values import content_digest
 from halpha.planning.models import (
     PERSISTED_HISTORY_CONTEXT_KEY,
@@ -15,6 +19,7 @@ from halpha.planning.models import (
     PlanLifecycle,
     RequestedLimits,
     TradePlanContent,
+    TradePlanDraft,
     TradePlanVersion,
 )
 from halpha.planning.service import PlanningApplicationService
@@ -50,10 +55,58 @@ def test_plan_decision_context_normalizes_readable_text() -> None:
         rationale="  current setup is favorable  ",
         evidence="venue facts\r\nand fixed parameters",
         limitations="future path remains unknown",
+        intent="PROFIT_SEEKING",
+        setup_family="BREAKOUT_CONTINUATION",
+        playbook_ref="  BTC_BREAKOUT_V1  ",
+        invalidation="  fixed boundary fails  ",
+        evidence_cutoff=NOW,
     )
 
     assert context.rationale == "current setup is favorable"
     assert context.evidence == "venue facts\nand fixed parameters"
+    assert context.invalidation == "fixed boundary fails"
+    assert context.playbook_ref == "BTC_BREAKOUT_V1"
+    assert context.experiment_complete is True
+
+
+def test_plan_decision_context_rejects_a_naive_evidence_cutoff() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="PLAN_DECISION_EVIDENCE_CUTOFF_INVALID",
+    ):
+        PlanDecisionContext(
+            rationale="bounded reason",
+            evidence="bounded evidence",
+            limitations="bounded limitations",
+            intent="PROFIT_SEEKING",
+            setup_family="BREAKOUT_CONTINUATION",
+            invalidation="bounded invalidation",
+            evidence_cutoff=datetime(2026, 7, 23),
+        )
+
+
+@pytest.mark.parametrize(
+    "playbook_ref",
+    (
+        "BTC BREAKOUT V1",
+        "逐笔信号",
+        "-leading-separator",
+        "A" + "x" * 96,
+    ),
+)
+def test_plan_decision_context_rejects_an_unstable_playbook_ref(
+    playbook_ref: str,
+) -> None:
+    with pytest.raises(
+        ValidationError,
+        match="PLAN_DECISION_PLAYBOOK_REF_INVALID",
+    ):
+        PlanDecisionContext(
+            rationale="bounded reason",
+            evidence="bounded evidence",
+            limitations="bounded limitations",
+            playbook_ref=playbook_ref,
+        )
 
 
 @pytest.mark.parametrize("field", ("rationale", "evidence", "limitations"))
@@ -187,6 +240,16 @@ def _fixed_version(*, allowed_actions: frozenset[str]) -> TradePlanVersion:
         plan_name="direct contract",
         created_at=NOW,
         creator_kind="AI",
+        decision_context=PlanDecisionContext(
+            rationale="The fixed direct setup has a bounded market hypothesis.",
+            evidence="Current venue facts and the fixed order schedule.",
+            limitations="Future price, fills, fees, and funding remain uncertain.",
+            intent="PROFIT_SEEKING",
+            setup_family="OTHER",
+            playbook_ref="DIRECT_RULE_V1",
+            invalidation="Do not enter once the fixed invalidation boundary fails.",
+            evidence_cutoff=NOW,
+        ),
         decision_basis=FixedDirectExecutionBasis(
             parameter_digest=content_digest({}),
             product_build_id="a" * 64,
@@ -210,6 +273,121 @@ def _fixed_version(*, allowed_actions: frozenset[str]) -> TradePlanVersion:
     )
 
 
+def test_new_risk_activation_rejects_a_historical_incomplete_decision_record() -> None:
+    version = _fixed_version(
+        allowed_actions=direct_allowed_action_profiles(_spec()),
+    ).model_copy(update={"decision_context": None})
+    inserted: list[PlanActivation] = []
+    service = object.__new__(PlanningApplicationService)
+    service._environment_id = "demo"
+    service._planning = SimpleNamespace(
+        get_version=lambda _plan_version_id: version,
+        lock_and_list_open_instrument_activations=lambda **_scope: (),
+        insert_activation=inserted.append,
+    )
+
+    with pytest.raises(ValueError, match="PLAN_DECISION_EXPERIMENT_INCOMPLETE"):
+        service.activate_version(
+            plan_version_id="plan-version-direct",
+            activation_id="activation-incomplete-decision",
+            environment_kind=EnvironmentKind.DEMO,
+            authority_class=AuthorityClass.DEMO_VALIDATION,
+            observed_at=NOW + timedelta(minutes=1),
+            order_schedule_snapshot=_snapshot(),
+        )
+
+    assert inserted == []
+
+
+def test_new_direct_risk_rejects_history_without_a_playbook_identity() -> None:
+    current = _fixed_version(
+        allowed_actions=direct_allowed_action_profiles(_spec()),
+    )
+    assert current.decision_context is not None
+    version = current.model_copy(
+        update={
+            "decision_context": current.decision_context.model_copy(
+                update={"playbook_ref": None},
+            )
+        }
+    )
+    inserted: list[PlanActivation] = []
+    service = object.__new__(PlanningApplicationService)
+    service._environment_id = "demo"
+    service._planning = SimpleNamespace(
+        get_version=lambda _plan_version_id: version,
+        lock_and_list_open_instrument_activations=lambda **_scope: (),
+        insert_activation=inserted.append,
+    )
+
+    with pytest.raises(ValueError, match="PLAN_DECISION_PLAYBOOK_REF_REQUIRED"):
+        service.activate_version(
+            plan_version_id="plan-version-direct",
+            activation_id="activation-missing-playbook",
+            environment_kind=EnvironmentKind.DEMO,
+            authority_class=AuthorityClass.DEMO_VALIDATION,
+            observed_at=NOW + timedelta(minutes=1),
+            order_schedule_snapshot=_snapshot(),
+        )
+
+    assert inserted == []
+
+
+def test_fix_rejects_a_persisted_strategy_draft_with_unqualified_profit_intent() -> None:
+    content_values = _draft_content(
+        allowed_actions=direct_allowed_action_profiles(_spec()),
+    ).model_dump(mode="python")
+    content_values.update(
+        {
+            "decision_context": {
+                "rationale": "A breakout should continue after confirmation.",
+                "evidence": "Current closed bars and venue facts.",
+                "limitations": "The strategy has no positive-expectancy evidence.",
+                "intent": "PROFIT_SEEKING",
+                "setup_family": "BREAKOUT_CONTINUATION",
+                "invalidation": "Reject if the fixed breakout boundary fails.",
+                "evidence_cutoff": NOW,
+            },
+            "decision_basis": {
+                "kind": "STRATEGY_SIGNAL",
+                "decision_basis_ref": "ONE_SHOT_DONCHIAN_ATR_BREAKOUT",
+                "parameters": {"direction": "LONG"},
+            },
+            "order_schedule_spec": None,
+        }
+    )
+    content = TradePlanContent.model_validate(content_values)
+    draft = TradePlanDraft(
+        plan_id="plan-unqualified-profit",
+        environment_id="demo",
+        draft_version=1,
+        content=content,
+        content_digest="c" * 64,
+        updated_at=NOW,
+    )
+    inserted: list[TradePlanVersion] = []
+    service = object.__new__(PlanningApplicationService)
+    service._environment_id = "demo"
+    service._planning = SimpleNamespace(
+        get_draft=lambda _plan_id, **_kwargs: draft,
+        insert_version=inserted.append,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="STRATEGY_DECISION_INTENT_NOT_QUALIFIED",
+    ):
+        service.fix_draft(
+            plan_id=draft.plan_id,
+            expected_draft_version=1,
+            plan_version_id="version-unqualified-profit",
+            product_build_id="a" * 64,
+            fixed_at=NOW,
+        )
+
+    assert inserted == []
+
+
 def _activation_service_with_scope(
     existing_scope: tuple[object, ...],
 ) -> tuple[PlanningApplicationService, list[PlanActivation]]:
@@ -227,6 +405,27 @@ def _activation_service_with_scope(
         insert_activation=inserted.append,
     )
     return service, inserted
+
+
+def test_new_risk_activation_fails_before_insertion_when_account_discipline_blocks() -> None:
+    service, inserted = _activation_service_with_scope(())
+    service.new_risk_discipline_status = lambda **_kwargs: SimpleNamespace(
+        new_risk_allowed=False,
+        blocker_codes=("NEW_RISK_DAILY_ATTEMPT_LIMIT_REACHED",),
+    )
+
+    with pytest.raises(ValueError, match="NEW_RISK_DAILY_ATTEMPT_LIMIT_REACHED"):
+        service.activate_version(
+            plan_version_id="plan-version-direct",
+            activation_id="activation-blocked",
+            environment_kind=EnvironmentKind.DEMO,
+            authority_class=AuthorityClass.DEMO_VALIDATION,
+            observed_at=NOW + timedelta(minutes=1),
+            order_schedule_snapshot=_snapshot(),
+            new_risk_discipline_policy=NewRiskDisciplinePolicy(),
+        )
+
+    assert inserted == []
 
 
 def test_same_direction_activations_share_one_account_instrument_scope() -> None:

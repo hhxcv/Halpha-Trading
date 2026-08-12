@@ -20,32 +20,47 @@ from halpha.venue_integration.models import (
 
 
 POSITION = {
-    "symbol": "SOLUSDT",
+    "symbol": "TESTUSDT",
     "positionAmt": "-2.5",
-    "entryPrice": "152.25",
-    "breakEvenPrice": "152.31",
-    "markPrice": "154.00",
-    "unRealizedProfit": "-4.375",
-    "liquidationPrice": "271.8",
-    "leverage": "3",
+    "entryPrice": "100",
+    "breakEvenPrice": "100.1",
+    "markPrice": "105",
+    "unRealizedProfit": "-12.5",
+    "liquidationPrice": "200",
+    "leverage": "2",
     "marginType": "cross",
-    "notional": "-385",
+    "notional": "-262.5",
     "isolatedMargin": "0",
     "positionSide": "BOTH",
-    "updateTime": 1785661200000,
+    "updateTime": 1894680000000,
 }
 
 SYMBOL_CONFIG = {
-    "symbol": "SOLUSDT",
+    "symbol": "TESTUSDT",
     "marginType": "CROSSED",
-    "leverage": 3,
+    "leverage": 2,
+}
+
+ACCOUNT_INFO = {
+    "canTrade": True,
+    "totalWalletBalance": "1000",
+    "totalUnrealizedProfit": "-12.5",
+    "totalMarginBalance": "987.5",
+    "availableBalance": "800",
+    "totalInitialMargin": "187.5",
+    "totalMaintMargin": "25",
+    "totalPositionInitialMargin": "150",
+    "totalOpenOrderInitialMargin": "37.5",
+    "totalCrossWalletBalance": "1000",
+    "totalCrossUnPnl": "-12.5",
+    "updateTime": 1894680004000,
 }
 
 ORDINARY_ORDER = {
-    "symbol": "SOLUSDT",
+    "symbol": "TESTUSDT",
     "orderId": 1234,
     "clientOrderId": "external-order",
-    "price": "150.5",
+    "price": "98",
     "origQty": "1.25",
     "executedQty": "0",
     "status": "NEW",
@@ -53,8 +68,8 @@ ORDINARY_ORDER = {
     "type": "LIMIT",
     "side": "BUY",
     "stopPrice": "0",
-    "time": 1785661200000,
-    "updateTime": 1785661201000,
+    "time": 1894680000000,
+    "updateTime": 1894680001000,
     "reduceOnly": False,
     "positionSide": "SHORT",
     "closePosition": False,
@@ -65,28 +80,29 @@ ALGO_ORDER = {
     "clientAlgoId": "external-algo",
     "algoType": "CONDITIONAL",
     "orderType": "STOP_MARKET",
-    "symbol": "SOLUSDT",
+    "symbol": "TESTUSDT",
     "side": "BUY",
     "positionSide": "SHORT",
     "timeInForce": "GTC",
     "quantity": "2.5",
     "algoStatus": "NEW",
-    "triggerPrice": "160",
+    "triggerPrice": "110",
     "price": "0",
     "closePosition": False,
     "reduceOnly": True,
-    "createTime": 1785661202000,
-    "updateTime": 1785661203000,
+    "createTime": 1894680002000,
+    "updateTime": 1894680003000,
 }
 
 
 def test_complete_account_snapshot_keeps_external_origin_unattributed() -> None:
-    started_at = datetime(2026, 8, 2, 4, 0, tzinfo=UTC)
-    checked_at = datetime(2026, 8, 2, 4, 0, 1, tzinfo=UTC)
+    started_at = datetime(2030, 1, 15, 4, 0, tzinfo=UTC)
+    checked_at = datetime(2030, 1, 15, 4, 0, 1, tzinfo=UTC)
 
     fact = build_account_snapshot_fact(
         environment_id="binance-live-copy-primary",
         account_ref="binance-usdm-copy-lead-primary",
+        account_info=ACCOUNT_INFO,
         positions=[
             POSITION,
             {**POSITION, "symbol": "BTCUSDT", "positionAmt": "0"},
@@ -104,16 +120,30 @@ def test_complete_account_snapshot_keeps_external_origin_unattributed() -> None:
     assert fact.action_ref is None
     assert fact.attribution_class is None
     assert fact.payload["snapshot_complete"] is True
-    assert fact.payload["query_paths"][0] == "/fapi/v3/positionRisk"
+    assert fact.payload["query_paths"][0] == "/fapi/v3/account"
     assert fact.payload["management_authority"] == "NONE"
+    assert fact.payload["account_summary"] == {
+        "can_trade": True,
+        "wallet_balance": "1000",
+        "unrealized_pnl": "-12.5",
+        "margin_balance": "987.5",
+        "available_balance": "800",
+        "initial_margin": "187.5",
+        "maintenance_margin": "25",
+        "position_initial_margin": "150",
+        "open_order_initial_margin": "37.5",
+        "cross_wallet_balance": "1000",
+        "cross_unrealized_pnl": "-12.5",
+        "source_update_time_ms": 1894680004000,
+    }
     assert fact.payload["open_position_count"] == 1
     assert fact.payload["ordinary_open_order_count"] == 1
     assert fact.payload["algo_open_order_count"] == 1
     assert fact.payload["ordinary_open_orders"] == [
         {
             "kind": "ORDINARY",
-            "instrument_ref": "SOLUSDT-PERP",
-            "symbol": "SOLUSDT",
+            "instrument_ref": "TESTUSDT-PERP",
+            "symbol": "TESTUSDT",
             "order_id": "1234",
             "client_order_id": "external-order",
             "side": "BUY",
@@ -121,21 +151,21 @@ def test_complete_account_snapshot_keeps_external_origin_unattributed() -> None:
             "order_type": "LIMIT",
             "status": "NEW",
             "time_in_force": "GTC",
-            "price": "150.5",
+            "price": "98",
             "trigger_price": "0",
             "quantity": "1.25",
             "executed_quantity": "0",
             "reduce_only": False,
             "close_position": False,
-            "source_create_time_ms": 1785661200000,
-            "source_update_time_ms": 1785661201000,
+            "source_create_time_ms": 1894680000000,
+            "source_update_time_ms": 1894680001000,
         }
     ]
     assert fact.payload["algo_open_orders"] == [
         {
             "kind": "ALGO",
-            "instrument_ref": "SOLUSDT-PERP",
-            "symbol": "SOLUSDT",
+            "instrument_ref": "TESTUSDT-PERP",
+            "symbol": "TESTUSDT",
             "order_id": "5678",
             "client_order_id": "external-algo",
             "side": "BUY",
@@ -144,33 +174,33 @@ def test_complete_account_snapshot_keeps_external_origin_unattributed() -> None:
             "status": "NEW",
             "time_in_force": "GTC",
             "price": "0",
-            "trigger_price": "160",
+            "trigger_price": "110",
             "quantity": "2.5",
             "executed_quantity": None,
             "reduce_only": True,
             "close_position": False,
-            "source_create_time_ms": 1785661202000,
-            "source_update_time_ms": 1785661203000,
+            "source_create_time_ms": 1894680002000,
+            "source_update_time_ms": 1894680003000,
         }
     ]
     assert fact.payload["positions"] == [
         {
-            "instrument_ref": "SOLUSDT-PERP",
-            "symbol": "SOLUSDT",
+            "instrument_ref": "TESTUSDT-PERP",
+            "symbol": "TESTUSDT",
             "direction": "SHORT",
             "position_side": "BOTH",
             "quantity": "-2.5",
             "absolute_quantity": "2.5",
-            "entry_price": "152.25",
-            "break_even_price": "152.31",
-            "mark_price": "154",
-            "unrealized_pnl": "-4.375",
-            "liquidation_price": "271.8",
-            "leverage": 3,
+            "entry_price": "100",
+            "break_even_price": "100.1",
+            "mark_price": "105",
+            "unrealized_pnl": "-12.5",
+            "liquidation_price": "200",
+            "leverage": 2,
             "margin_mode": "CROSS",
-            "notional": "-385",
+            "notional": "-262.5",
             "isolated_margin": "0",
-            "source_update_time_ms": 1785661200000,
+            "source_update_time_ms": 1894680000000,
         }
     ]
 
@@ -179,21 +209,22 @@ def test_hedge_mode_keeps_long_and_short_account_sides_distinct() -> None:
     fact = build_account_snapshot_fact(
         environment_id="binance-live-copy-primary",
         account_ref="binance-usdm-copy-lead-primary",
+        account_info=ACCOUNT_INFO,
         positions=[
             {
                 **POSITION,
                 "positionAmt": "2.5",
                 "positionSide": "LONG",
                 "unRealizedProfit": "3.25",
-                "notional": "385",
+                "notional": "262.5",
             },
             {**POSITION, "positionSide": "SHORT"},
         ],
         symbol_configs=[SYMBOL_CONFIG],
         open_orders=[],
         open_algo_orders=[],
-        started_at=datetime(2026, 8, 2, 4, 0, tzinfo=UTC),
-        checked_at=datetime(2026, 8, 2, 4, 0, 1, tzinfo=UTC),
+        started_at=datetime(2030, 1, 15, 4, 0, tzinfo=UTC),
+        checked_at=datetime(2030, 1, 15, 4, 0, 1, tzinfo=UTC),
     )
 
     assert fact.payload["open_position_count"] == 2
@@ -221,12 +252,13 @@ def test_invalid_nonzero_position_rejects_the_whole_snapshot(
         build_account_snapshot_fact(
             environment_id="binance-live-copy-primary",
             account_ref="binance-usdm-copy-lead-primary",
+            account_info=ACCOUNT_INFO,
             positions=[{**POSITION, **change}],
             symbol_configs=[SYMBOL_CONFIG],
             open_orders=[],
             open_algo_orders=[],
-            started_at=datetime(2026, 8, 2, 4, 0, tzinfo=UTC),
-            checked_at=datetime(2026, 8, 2, 4, 0, 1, tzinfo=UTC),
+            started_at=datetime(2030, 1, 15, 4, 0, tzinfo=UTC),
+            checked_at=datetime(2030, 1, 15, 4, 0, 1, tzinfo=UTC),
         )
 
 
@@ -235,12 +267,28 @@ def test_missing_or_invalid_symbol_configuration_rejects_the_snapshot() -> None:
         build_account_snapshot_fact(
             environment_id="binance-live-copy-primary",
             account_ref="binance-usdm-copy-lead-primary",
+            account_info=ACCOUNT_INFO,
             positions=[POSITION],
             symbol_configs=[{**SYMBOL_CONFIG, "marginType": "unknown"}],
             open_orders=[],
             open_algo_orders=[],
-            started_at=datetime(2026, 8, 2, 4, 0, tzinfo=UTC),
-            checked_at=datetime(2026, 8, 2, 4, 0, 1, tzinfo=UTC),
+            started_at=datetime(2030, 1, 15, 4, 0, tzinfo=UTC),
+            checked_at=datetime(2030, 1, 15, 4, 0, 1, tzinfo=UTC),
+        )
+
+
+def test_missing_account_equity_rejects_the_whole_snapshot() -> None:
+    with pytest.raises(AccountObservationError, match="ACCOUNT_SUMMARY_DECIMAL_INVALID"):
+        build_account_snapshot_fact(
+            environment_id="binance-live-copy-primary",
+            account_ref="binance-usdm-copy-lead-primary",
+            account_info={**ACCOUNT_INFO, "totalMarginBalance": None},
+            positions=[],
+            symbol_configs=[],
+            open_orders=[],
+            open_algo_orders=[],
+            started_at=datetime(2030, 1, 15, 4, 0, tzinfo=UTC),
+            checked_at=datetime(2030, 1, 15, 4, 0, 1, tzinfo=UTC),
         )
 
 
@@ -248,6 +296,10 @@ def test_observer_queries_only_read_surfaces_and_persists_one_complete_fact() ->
     calls: list[str] = []
 
     class AccountApi:
+        async def query_futures_account_info(self, **kwargs: object):
+            calls.append(f"account:{kwargs['recv_window']}")
+            return ACCOUNT_INFO
+
         async def query_futures_position_risk(self, **kwargs: object):
             calls.append(f"positions:{kwargs['recv_window']}")
             return [POSITION]
@@ -286,13 +338,14 @@ def test_observer_queries_only_read_surfaces_and_persists_one_complete_fact() ->
     fact = asyncio.run(observer.observe())
 
     assert sorted(calls) == [
+        "account:5000",
         "algo:5000",
         "config:5000",
         "orders:5000",
         "positions:5000",
     ]
     assert repository.facts == [fact]
-    assert fact.payload["positions"][0]["instrument_ref"] == "SOLUSDT-PERP"
+    assert fact.payload["positions"][0]["instrument_ref"] == "TESTUSDT-PERP"
 
 
 def test_account_observer_reuses_the_same_read_path_in_live_write() -> None:
@@ -358,6 +411,9 @@ def test_observer_failure_is_sanitized_and_never_persists_a_partial_snapshot() -
     secret = "secret-must-not-escape"
 
     class AccountApi:
+        async def query_futures_account_info(self, **_kwargs: object):
+            return ACCOUNT_INFO
+
         async def query_futures_position_risk(self, **_kwargs: object):
             raise OSError(secret)
 
@@ -399,6 +455,9 @@ def test_observer_preserves_binance_retry_after_without_leaking_response() -> No
         headers = {"Retry-After": "90"}
 
     class AccountApi:
+        async def query_futures_account_info(self, **_kwargs: object):
+            return ACCOUNT_INFO
+
         async def query_futures_position_risk(self, **_kwargs: object):
             raise RateLimitedError("private response")
 

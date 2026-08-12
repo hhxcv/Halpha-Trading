@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
@@ -19,8 +20,10 @@ from pydantic import (
 )
 
 from halpha.binance_contracts import (
+    BINANCE_USDM_ACCOUNT_POSITION_ORDER_QUERY_PATHS,
     BINANCE_USDM_ACCOUNT_SNAPSHOT_QUERY_PATHS,
     BINANCE_USDM_ACCOUNT_SNAPSHOT_SCHEMA,
+    parse_complete_binance_usdm_account_snapshot,
 )
 from halpha.capital.models import (
     ACCOUNT_SYSTEM_STOP_RELEASE_EVIDENCE_MAX_AGE,
@@ -28,6 +31,7 @@ from halpha.capital.models import (
     AccountSystemStopSource,
     AuthorityClass,
     EnvironmentKind,
+    NewRiskDisciplinePolicy,
     StopCategory,
     StopStateVersion,
 )
@@ -49,9 +53,12 @@ from halpha.planning.models import (
     POSITION_ALIGNMENT_ALLOWED_ACTIONS,
     PlanCreatorKind,
     PlanDecisionContext,
+    PlanDecisionIntent,
     PositionAlignmentSpec,
     RequestedLimits,
     TradePlanContent,
+    TradePlanVersion,
+    new_risk_decision_context_incompatibility,
 )
 from halpha.planning.order_schedule import (
     OrderSchedulePreview,
@@ -59,6 +66,11 @@ from halpha.planning.order_schedule import (
     direct_allowed_action_profiles,
     validate_current_order_schedule_support,
     validate_new_direct_execution_schedule,
+)
+from halpha.planning.live_profit_qualification import (
+    LiveProfitQualificationStatus,
+    evaluate_live_profit_qualification,
+    require_live_profit_qualification,
 )
 from halpha.planning.control_service import ActivationControlService
 from halpha.planning.registry import (
@@ -69,6 +81,7 @@ from halpha.planning.registry import (
     describe_strategy,
     list_strategies,
     strategy_parameter_schema,
+    strategy_decision_intent_incompatibility,
 )
 from halpha.planning.repository import (
     PlanningConflict,
@@ -84,6 +97,10 @@ from halpha.user_workbench.commands import build_command
 
 
 _FIXED_DECISION_BASIS_ADAPTER = TypeAdapter(FixedDecisionBasis)
+LiveProfitQualificationProvider = Callable[
+    [TradePlanVersion, datetime],
+    LiveProfitQualificationStatus,
+]
 
 
 class ApiModel(BaseModel):
@@ -137,6 +154,33 @@ class PlanDraftPayload(ApiModel):
             ):
                 raise ValueError("POSITION_ALIGNMENT_PLAN_SHAPE_INVALID")
             return self
+        context_incompatibility = new_risk_decision_context_incompatibility(
+            decision_basis_kind=self.decision_basis.kind,
+            decision_context=self.decision_context,
+        )
+        if context_incompatibility is not None:
+            raise ValueError(context_incompatibility)
+        if (
+            self.decision_basis.kind is DecisionBasisKind.STRATEGY_SIGNAL
+            and self.decision_basis.parameters.get("demo_immediate_entry") is True
+            and self.decision_context.intent is not PlanDecisionIntent.VALIDATION
+        ):
+            raise ValueError("DEMO_FLOW_CHECK_REQUIRES_VALIDATION_INTENT")
+        if self.decision_basis.kind is DecisionBasisKind.STRATEGY_SIGNAL:
+            try:
+                definition = describe_strategy(self.decision_basis.decision_basis_ref)
+            except KeyError:
+                raise ValueError("STRATEGY_UNAVAILABLE") from None
+            intent_incompatibility = strategy_decision_intent_incompatibility(
+                definition.economic_scope,
+                (
+                    self.decision_context.intent.value
+                    if self.decision_context.intent is not None
+                    else None
+                ),
+            )
+            if intent_incompatibility is not None:
+                raise ValueError(intent_incompatibility)
         validate_current_order_schedule_support(
             self.decision_basis.kind,
             self.order_schedule_spec,
@@ -354,7 +398,12 @@ class PostgreSQLPlanningApi:
         account_ref: str,
         product_build_id: str,
         profile: str | None = None,
+        new_risk_discipline_policy: NewRiskDisciplinePolicy | None = None,
         gate_status_provider: GateStatusProvider | None = None,
+        venue_account_type: str | None = None,
+        live_profit_qualification_provider: (
+            LiveProfitQualificationProvider | None
+        ) = None,
     ) -> None:
         self._database_name = database_name
         self._database_role_name = database_role_name
@@ -373,6 +422,17 @@ class PostgreSQLPlanningApi:
                 else "BINANCE_LIVE_READ_ONLY"
             )
         )
+        self._new_risk_discipline_policy = (
+            new_risk_discipline_policy or NewRiskDisciplinePolicy()
+        )
+        self._venue_account_type = venue_account_type or (
+            "USDM_DEMO"
+            if self._environment_kind is EnvironmentKind.DEMO
+            else "USDM_COPY_LEAD"
+        )
+        self._live_profit_qualification_provider = (
+            live_profit_qualification_provider
+        )
         self._gate_status_provider = (
             gate_status_provider or closed_live_write_gate_status
         )
@@ -382,6 +442,30 @@ class PostgreSQLPlanningApi:
             return self._gate_status_provider()
         except Exception:
             return closed_live_write_gate_status()
+
+    def _live_profit_qualification(
+        self,
+        version: TradePlanVersion,
+        observed_at: datetime,
+    ) -> LiveProfitQualificationStatus:
+        if self._live_profit_qualification_provider is not None:
+            return self._live_profit_qualification_provider(version, observed_at)
+        return evaluate_live_profit_qualification(
+            version,
+            environment_kind=self._environment_kind,
+            target_venue_account_type=self._venue_account_type,
+            references=(),
+            observed_at=observed_at,
+        )
+
+    def _require_live_profit_qualification_snapshot(
+        self,
+        version: TradePlanVersion,
+        observed_at: datetime,
+    ) -> dict[str, Any]:
+        status = self._live_profit_qualification(version, observed_at)
+        require_live_profit_qualification(status)
+        return status.model_dump(mode="json")
 
     def _connect(self) -> psycopg.Connection[Any]:
         try:
@@ -448,7 +532,7 @@ class PostgreSQLPlanningApi:
                        v.product_build_id, v.terms ->> 'valid_until',
                        v.fixed_decision_basis, v.order_schedule_spec,
                        v.order_schedule_spec_digest, v.terms -> 'allowed_actions',
-                       v.position_alignment
+                       v.position_alignment, v.terms -> 'decision_context'
                 FROM halpha.trade_plan_draft d
                 LEFT JOIN LATERAL (
                     SELECT plan_version_id, fixed_at, content_digest,
@@ -479,6 +563,11 @@ class PostgreSQLPlanningApi:
                     runtime_incompatibility = plan_runtime_incompatibility(
                         decision_basis=_FIXED_DECISION_BASIS_ADAPTER.validate_python(
                             row[10]
+                        ),
+                        decision_context=(
+                            PlanDecisionContext.model_validate(row[15])
+                            if row[15] is not None
+                            else None
                         ),
                         order_schedule_spec=fixed_schedule_spec,
                         allowed_actions=frozenset(
@@ -742,6 +831,7 @@ class PostgreSQLPlanningApi:
         return version.model_dump(mode="json")
 
     def activation_preview(self, plan_version_id: str) -> dict[str, Any]:
+        previewed_at = datetime.now(UTC)
         with self._connect() as connection, connection.transaction():
             version = PostgreSQLPlanningRepository(
                 connection, self._environment_id
@@ -755,10 +845,32 @@ class PostgreSQLPlanningApi:
                         self._environment_id,
                     ).require_current_position_alignment(
                         version,
-                        observed_at=datetime.now(UTC),
+                        observed_at=previewed_at,
                     )
                 except ValueError as exc:
                     position_alignment_blocker = str(exc)
+            new_risk_discipline = (
+                None
+                if position_alignment is not None
+                else PlanningApplicationService(
+                    connection,
+                    self._environment_id,
+                ).new_risk_discipline_status(
+                    account_ref=version.account_ref,
+                    policy=self._new_risk_discipline_policy,
+                    observed_at=previewed_at,
+                    proposed_max_allowed_loss=(
+                        version.requested_limits.max_allowed_loss
+                    ),
+                    proposed_max_notional=version.requested_limits.max_notional,
+                    proposed_instrument_ref=version.instrument_ref,
+                    proposed_direction=version.direction.value,
+                )
+            )
+        live_profit_qualification = self._live_profit_qualification(
+            version,
+            previewed_at,
+        )
         basis = _fixed_decision_basis_projection(version)
         gate_status = self._gate_status()
         product_build_consistent = (
@@ -766,6 +878,7 @@ class PostgreSQLPlanningApi:
         )
         runtime_incompatibility = plan_runtime_incompatibility(
             decision_basis=version.decision_basis,
+            decision_context=getattr(version, "decision_context", None),
             order_schedule_spec=version.order_schedule_spec,
             allowed_actions=version.allowed_actions,
             position_alignment=position_alignment,
@@ -832,6 +945,14 @@ class PostgreSQLPlanningApi:
                 else position_alignment_blocker is None
             ),
             "position_alignment_blocker": position_alignment_blocker,
+            "new_risk_discipline": (
+                new_risk_discipline.model_dump(mode="json")
+                if new_risk_discipline is not None
+                else None
+            ),
+            "live_profit_qualification": (
+                live_profit_qualification.model_dump(mode="json")
+            ),
             "configured_runtime_real_write_gate": (
                 gate_status.configured_runtime_real_write_gate
             ),
@@ -840,6 +961,11 @@ class PostgreSQLPlanningApi:
                 self._profile == "BINANCE_LIVE_WRITE"
                 and runtime_compatible
                 and position_alignment_blocker is None
+                and (
+                    new_risk_discipline is None
+                    or new_risk_discipline.new_risk_allowed
+                )
+                and live_profit_qualification.admission_satisfied
                 and gate_status.product_build_consistent is True
                 and not gate_status.violations
                 and gate_status.configured_runtime_real_write_gate == "CLOSED"
@@ -890,6 +1016,17 @@ class PostgreSQLPlanningApi:
                         authority_class=self._authority_class,
                         observed_at=observed_at,
                         order_schedule_snapshot=order_schedule_snapshot,
+                        new_risk_discipline_policy=(
+                            self._new_risk_discipline_policy
+                        ),
+                        live_profit_qualification_checker=(
+                            lambda version: (
+                                self._require_live_profit_qualification_snapshot(
+                                    version,
+                                    observed_at,
+                                )
+                            )
+                        ),
                     )
             except psycopg.errors.UniqueViolation:
                 connection.rollback()
@@ -1456,7 +1593,8 @@ class PostgreSQLPlanningApi:
             event_rows = connection.execute(
                 """
                 SELECT plan_event_id, rule_id, source_identity, source_cutoff,
-                       reason_code, no_action_reason, capital_decision, created_at
+                       reason_code, no_action_reason, capital_decision,
+                       proposed_action, created_at
                 FROM halpha.plan_event
                 WHERE environment_id = %s AND activation_id = %s
                 ORDER BY created_at, plan_event_id
@@ -1517,7 +1655,7 @@ class PostgreSQLPlanningApi:
                 "source": "PLAN_EVENT",
                 "source_ref": str(row[0]),
                 "stage_order": 1,
-                "at": row[7].isoformat(),
+                "at": row[8].isoformat(),
                 "status": str(row[4]),
                 "detail": {
                     "rule_id": str(row[1]),
@@ -1525,6 +1663,26 @@ class PostgreSQLPlanningApi:
                     "source_cutoff": row[3].isoformat(),
                     "no_action_reason": str(row[5]) if row[5] is not None else None,
                     "capital_decision": dict(row[6]),
+                    "entry_risk_context": (
+                        dict(entry_risk_context)
+                        if isinstance(
+                            proposed_action := row[7],
+                            dict,
+                        )
+                        and isinstance(
+                            execution_context := proposed_action.get(
+                                "execution_context"
+                            ),
+                            dict,
+                        )
+                        and isinstance(
+                            entry_risk_context := execution_context.get(
+                                "entry_risk_context"
+                            ),
+                            dict,
+                        )
+                        else None
+                    ),
                 },
             }
             for row in event_rows
@@ -1693,33 +1851,28 @@ class PostgreSQLPlanningApi:
         account_fact_id = str(account_row[0])
         received_at = account_row[1]
         cutoff = account_row[2]
-        payload = dict(account_row[3])
+        snapshot = parse_complete_binance_usdm_account_snapshot(account_row[3])
         account_content_digest = str(account_row[4])
-        query_paths = payload.get("query_paths")
-        positions = payload.get("positions")
-        ordinary_orders = payload.get("ordinary_open_orders")
-        algo_orders = payload.get("algo_open_orders")
-        required_query_paths = set(BINANCE_USDM_ACCOUNT_SNAPSHOT_QUERY_PATHS)
+        query_paths = snapshot.get("query_paths") if snapshot is not None else None
+        positions = snapshot["positions"] if snapshot is not None else None
+        ordinary_orders = (
+            snapshot["ordinary_open_orders"] if snapshot is not None else None
+        )
+        algo_orders = snapshot["algo_open_orders"] if snapshot is not None else None
+        snapshot_schema = snapshot["schema"] if snapshot is not None else None
+        required_query_paths = set(
+            BINANCE_USDM_ACCOUNT_SNAPSHOT_QUERY_PATHS
+            if snapshot_schema == BINANCE_USDM_ACCOUNT_SNAPSHOT_SCHEMA
+            else BINANCE_USDM_ACCOUNT_POSITION_ORDER_QUERY_PATHS
+        )
         snapshot_shape_valid = (
-            payload.get("schema") == BINANCE_USDM_ACCOUNT_SNAPSHOT_SCHEMA
-            and payload.get("read_only") is True
-            and payload.get("snapshot_complete") is True
-            and payload.get("management_authority") == "NONE"
+            snapshot is not None
             and isinstance(query_paths, list)
             and all(isinstance(item, str) for item in query_paths)
             and required_query_paths.issubset(query_paths)
             and isinstance(positions, list)
-            and all(isinstance(item, dict) for item in positions)
             and isinstance(ordinary_orders, list)
-            and all(isinstance(item, dict) for item in ordinary_orders)
             and isinstance(algo_orders, list)
-            and all(isinstance(item, dict) for item in algo_orders)
-            and type(payload.get("open_position_count")) is int
-            and payload["open_position_count"] == len(positions)
-            and type(payload.get("ordinary_open_order_count")) is int
-            and payload["ordinary_open_order_count"] == len(ordinary_orders)
-            and type(payload.get("algo_open_order_count")) is int
-            and payload["algo_open_order_count"] == len(algo_orders)
             and received_at == cutoff
         )
         if not snapshot_shape_valid:

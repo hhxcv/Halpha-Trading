@@ -81,6 +81,8 @@ import {
   getOverview,
   getPlans,
   getReview,
+  getReviewPricePathEvidence,
+  getReviewSequenceEvidence,
   getReviews,
   getSettingsStatus,
   getStrategies,
@@ -103,11 +105,15 @@ import {
   type PlanCreatePayload,
   type Overview,
   type ReviewCompletionPayload,
+  type ReviewPricePathInterval,
   type SettingsStatus,
 } from "./api/client";
 import { submitActivationControlWithFreshRiskReducingRetry } from "./api/controlSubmission";
 import PageHeader from "./components/PageHeader";
 import FactGrid from "./components/FactGrid";
+import TradingDisciplineStrip from "./components/TradingDisciplineStrip";
+import ReviewEntrySetupEvidencePanel from "./components/ReviewEntrySetupEvidencePanel";
+import ReviewPricePathEvidencePanel from "./components/ReviewPricePathEvidencePanel";
 import type { OrderChartPriceAnnotation } from "./components/orderScheduleChartModel";
 import {
   tradingAccountLabel,
@@ -136,6 +142,12 @@ import {
   planWorkbenchSections,
 } from "./planListModel";
 import { buildPlanPnlTrend } from "./planPnlTrend";
+import {
+  liveProfitQualificationBlockerLabels,
+  liveProfitQualificationPresentation,
+  liveProfitQualificationSatisfied,
+  qualificationFractionPercent,
+} from "./liveProfitQualification";
 import {
   basisPoints,
   closedBarBreakoutGapPercent,
@@ -256,6 +268,7 @@ const OrderScheduleChart = lazy(() => import("./components/OrderScheduleChart"))
 const ReviewPriceChart = lazy(() => import("./components/ReviewCharts").then((module) => ({ default: module.ReviewPriceChart })));
 const PlanPnlChart = lazy(() => import("./components/ReviewCharts").then((module) => ({ default: module.PlanPnlChart })));
 const ReviewPerformanceOverview = lazy(() => import("./components/ReviewPerformanceOverview"));
+const ReviewSequenceEvidencePanel = lazy(() => import("./components/ReviewSequenceEvidencePanel"));
 const StageReviewPanel = lazy(() => import("./components/StageReviewPanel"));
 const visuallyHiddenSx = {
   position: "absolute",
@@ -1114,6 +1127,20 @@ const evaluationResultLabels: Record<string, string> = {
   ISSUE_FOUND: "旧分类：问题未分类",
   UNKNOWN: "证据不足（历史结论）",
   NOT_APPLICABLE: "旧分类：不适用",
+};
+
+const planDecisionIntentLabels: Record<string, string> = {
+  PROFIT_SEEKING: "盈利导向交易",
+  VALIDATION: "机制 / 软件验证",
+};
+
+const planSetupFamilyLabels: Record<string, string> = {
+  BREAKOUT_CONTINUATION: "突破延续",
+  PULLBACK_CONTINUATION: "回调延续",
+  RANGE_MEAN_REVERSION: "区间均值回归",
+  REVERSAL: "趋势反转",
+  EVENT_DRIVEN: "事件驱动",
+  OTHER: "其他",
 };
 
 type ReviewClassificationValue = ReviewCompletionPayload["conclusion"];
@@ -2252,6 +2279,23 @@ const positionAlignmentReadinessLabels: Record<string, string> = {
   POSITION_ALIGNMENT_SCOPE_CONFLICT: "同一账户与合约已有运行中的计划责任",
 };
 
+const newRiskDisciplineBlockerLabels: Record<string, string> = {
+  ACCOUNT_EQUITY_SNAPSHOT_UNAVAILABLE: "账户权益事实不可用",
+  ACCOUNT_EQUITY_SNAPSHOT_STALE: "账户权益事实已过期",
+  ACCOUNT_EQUITY_SNAPSHOT_TIME_INVALID: "账户权益事实时间异常",
+  ACCOUNT_RISK_EQUITY_NOT_POSITIVE: "风险权益不为正数",
+  ACCOUNT_TRADING_DISABLED: "交易所账户当前不允许交易",
+  NEW_RISK_PROPOSED_LOSS_INVALID: "计划最大允许损失不可读",
+  NEW_RISK_PLAN_LOSS_LIMIT_EXCEEDED: "本计划最大允许损失超过单计划上限",
+  NEW_RISK_PROPOSED_DIRECTION_INVALID: "计划交易方向不可读",
+  NEW_RISK_ENTRY_DIRECTION_INVALID: "待提交入场方向不可读",
+  NEW_RISK_LOSING_POSITION_ADD_PROHIBITED: "同品种同向持仓浮亏，禁止追加仓位",
+  NEW_RISK_DAILY_BUDGET_EXCEEDED: "本计划将超过当日风险尝试额度",
+  NEW_RISK_WEEKLY_BUDGET_EXCEEDED: "本计划将超过本周风险尝试额度",
+  NEW_RISK_DAILY_ATTEMPT_LIMIT_REACHED: "当日新增风险尝试次数已到上限",
+  NEW_RISK_CONCURRENT_ACTIVATION_LIMIT_REACHED: "已有新增风险计划尚未闭合",
+};
+
 function AccountPositionOperationDialog({
   position,
   status,
@@ -2697,6 +2741,7 @@ function OverviewPage() {
       )}
       {data && !environmentContextMismatch && (
         <>
+          <TradingDisciplineStrip overview={data} />
           <Stack
             component="section"
             direction={{ xs: "column", sm: "row" }}
@@ -3254,14 +3299,42 @@ function OverviewPage() {
 
 function SettingsPage() {
   const { status, marketColorScheme, setMarketColorScheme } = useOutletContext<FrameContext>();
+  const queryClient = useQueryClient();
+  const [runtimeRecoveryCopyState, setRuntimeRecoveryCopyState] = useState<"IDLE" | "COPIED" | "FAILED">("IDLE");
   const buildConsistency = status.app_executor_product_build_consistent === null
     ? "未核对"
     : status.app_executor_product_build_consistent ? "一致" : "不一致";
-  const productVersionMismatch = status.executor_status === "PRODUCT_BUILD_MISMATCH"
+  const productVersionMismatch = status.executor_status === "BUILD_MISMATCH"
     || status.app_executor_product_build_consistent === false;
+  const runtimeNeedsRecovery = productVersionMismatch
+    || (status.executor_status !== "READY" && status.profile !== "BINANCE_LIVE_READ_ONLY");
+  const runtimeConfigPath = status.venue_account_type === "USDM_DEMO"
+    ? "config\\halpha.toml"
+    : status.venue_account_type === "USDM_COPY_LEAD"
+      ? status.profile === "BINANCE_LIVE_READ_ONLY"
+        ? "config\\halpha.live-copy-read-only.toml"
+        : "config\\halpha.live-copy-write.toml"
+      : status.profile === "BINANCE_LIVE_READ_ONLY"
+        ? "config\\halpha.live-personal-read-only.toml"
+        : "config\\halpha.live-personal-write.toml";
+  const runtimeRecoveryCommands = [
+    `.\\.venv\\Scripts\\halpha-control.exe stop product --config ${runtimeConfigPath}`,
+    `.\\.venv\\Scripts\\halpha-control.exe start product --config ${runtimeConfigPath} --timeout-seconds 60`,
+  ].join("\n");
   const emailMutation = useMutation({
     mutationFn: sendTestEmail,
   });
+  const copyRuntimeRecoveryCommands = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(runtimeRecoveryCommands);
+      setRuntimeRecoveryCopyState("COPIED");
+    } catch {
+      setRuntimeRecoveryCopyState("FAILED");
+    }
+  }, [runtimeRecoveryCommands]);
+  const refreshRuntimeStatus = useCallback(async () => {
+    await queryClient.refetchQueries({ queryKey: STATUS_QUERY_KEY, exact: true });
+  }, [queryClient]);
   return (
     <Box sx={{ width: "min(1120px, calc(100% - clamp(32px, 4vw, 48px)))", mx: "auto", py: { xs: 2.5, sm: 3 } }}>
       <PageHeader
@@ -3273,13 +3346,34 @@ function SettingsPage() {
       {!status.database_available && <Alert severity="error" variant="outlined" sx={{ mb: 3 }}>数据库不可用；事实截止点未知。读取失败时不得向交易所提交变更请求。</Alert>}
       {productVersionMismatch && (
         <Alert severity="warning" variant="outlined" sx={{ mb: 3 }}>
-          App 与 Executor 产品版本不一致。只能查看已有事实和记录控制意图；不能依赖 Halpha 立即执行交易所退出。若有持仓或挂单，请在 Binance 官方入口接管。
+          App 与执行器仍在运行不同版本的代码。通常是更新后只重启了其中一项；为避免新旧逻辑混用，Halpha 不会把新的控制请求视为已在交易所执行。
         </Alert>
       )}
       {!productVersionMismatch && status.executor_status !== "READY" && status.profile !== "BINANCE_LIVE_READ_ONLY" && (
         <Alert severity="warning" variant="outlined" sx={{ mb: 3 }}>
           执行器当前{translatedLabel(executorStatusLabels, status.executor_status)}。控制命令只能先持久化，不能视为已在交易所执行；若有持仓或挂单，请在 Binance 官方入口核对和接管。
         </Alert>
+      )}
+      {runtimeNeedsRecovery && (
+        <Box component="section" sx={{ ...surfaceFrameSx, p: 2, mb: 3 }}>
+          <Typography sx={{ fontWeight: 750 }}>恢复运行服务</Typography>
+          <Typography variant="body2" color="text.secondary" sx={{ mt: .5 }}>
+            在本机仓库目录打开 PowerShell，依次运行下面两条命令。停止期间若有持仓或挂单，请同时在 Binance 官方入口核对；启动完成后返回此页重新检查。
+          </Typography>
+          <Box
+            component="pre"
+            className="mono"
+            sx={{ m: 0, mt: 1.5, p: 1.5, overflowX: "auto", bgcolor: "action.hover", borderRadius: 1, fontSize: 13 }}
+          >
+            {runtimeRecoveryCommands}
+          </Box>
+          <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ mt: 1.5 }}>
+            <Button variant="outlined" onClick={() => void copyRuntimeRecoveryCommands()}>
+              {runtimeRecoveryCopyState === "COPIED" ? "已复制" : runtimeRecoveryCopyState === "FAILED" ? "复制失败" : "复制重启命令"}
+            </Button>
+            <Button variant="outlined" onClick={() => void refreshRuntimeStatus()}>重新检查</Button>
+          </Stack>
+        </Box>
       )}
       <FactGrid facts={[
         { label: "本机监听", value: `${status.bind}:${status.port}` },
@@ -3666,7 +3760,9 @@ function PlansPage() {
     const planName = plan.plan_name?.trim() || `未命名计划 · ${shortDigest(plan.plan_id)}`;
     const creatorLabel = plan.creator_kind === "AI"
       ? "AI 创建"
-      : plan.creator_kind === "HUMAN" ? "人工创建" : "创建来源未知";
+      : plan.creator_kind === "HUMAN"
+        ? "人工创建"
+        : plan.creator_kind === "MONITOR" ? "Monitor 创建" : "创建来源未知";
     const creationTime = plan.created_at
       ? `创建于 ${formatUserVisibleTime(plan.created_at)}`
       : "创建时间未知";
@@ -3953,6 +4049,30 @@ function PlanActivationRoute() {
     preview.data,
     "position_alignment_blocker",
   );
+  const newRiskDiscipline = recordOf(preview.data?.new_risk_discipline);
+  const newRiskDisciplineAllowed = positionDisposition
+    || newRiskDiscipline.new_risk_allowed === true;
+  const newRiskDisciplineBlockers = Array.isArray(newRiskDiscipline.blocker_codes)
+    ? newRiskDiscipline.blocker_codes.map(String)
+    : [];
+  const liveProfitQualification = preview.data?.live_profit_qualification;
+  const liveProfitQualificationRequired = (
+    liveProfitQualification?.required === true
+  );
+  const liveProfitQualificationReady = status.environment_kind === "DEMO"
+    || liveProfitQualificationSatisfied(liveProfitQualification);
+  const liveProfitQualificationBlockers = (
+    liveProfitQualification?.blocker_codes ?? []
+  );
+  const liveProfitPresentation = liveProfitQualification
+    ? liveProfitQualificationPresentation(liveProfitQualification)
+    : null;
+  const riskDisciplineAmount = (key: string): string => {
+    const raw = newRiskDiscipline[key];
+    return raw === null || raw === undefined
+      ? "未知"
+      : `${quoteAmount(String(raw))} USDT`;
+  };
   const orderInstrumentRules = recordOf(orderScheduleSnapshot.instrument_rules);
   const orderVenuePolicy = recordOf(orderScheduleSpec.venue_policy);
   const orderPriceTickSize = valueOf(orderInstrumentRules, "price_tick_size", "");
@@ -4037,6 +4157,8 @@ function PlanActivationRoute() {
     && directScheduleReady
     && compiledScheduleReady
     && positionAlignmentReady
+    && newRiskDisciplineAllowed
+    && liveProfitQualificationReady
     && (!liveWrite || realAccountReady),
   );
   const mutation = useMutation({
@@ -4147,6 +4269,35 @@ function PlanActivationRoute() {
             { label: "保护", value: `初始止损 ${valueOf(parameters, "initial_stop_atr_multiple")} ATR / 最大追价 ${valueOf(parameters, "max_entry_extension_atr")} ATR` },
             { label: "退出", value: `最大 ${valueOf(parameters, "max_hold_bars_15m")} × 15m / TP1 ${Number(valueOf(parameters, "take_profit_1_fraction")) * 100}% @ ${valueOf(parameters, "take_profit_1_r")}R / TP2 @ ${valueOf(parameters, "take_profit_2_r")}R` },
           ]),
+          ...(!positionDisposition ? [
+            { label: "单计划风险上限", value: riskDisciplineAmount("max_plan_loss"), note: `本计划申请 ${quoteAmount(valueOf(recordOf(preview.data?.limits), "max_allowed_loss", "0"))} USDT` },
+            { label: "组合风险容量", value: `${riskDisciplineAmount("open_risk_after_proposal")} / ${riskDisciplineAmount("open_risk_limit")}`, note: `已启用 ${valueOf(newRiskDiscipline, "open_new_risk_activation_count", "0")} 份新增风险计划；不按订单数限制` },
+            { label: "总敞口", value: `${riskDisciplineAmount("gross_exposure_after_proposal")} / ${riskDisciplineAmount("gross_exposure_limit")}`, note: `单品种 ${riskDisciplineAmount("instrument_exposure_after_proposal")} · 相关簇 ${riskDisciplineAmount("correlated_exposure_after_proposal")}` },
+            { label: "亏损与回撤停止", value: `日 ${riskDisciplineAmount("daily_loss_measure")} / ${riskDisciplineAmount("daily_loss_limit")}`, note: `周 ${riskDisciplineAmount("weekly_loss_measure")} / ${riskDisciplineAmount("weekly_loss_limit")} · 回撤 ${valueOf(newRiskDiscipline, "rolling_drawdown_fraction", "未知")}` },
+          ] : []),
+          ...(liveProfitQualificationRequired && liveProfitQualification ? [
+            {
+              label: "Demo 证据准入",
+              value: liveProfitPresentation?.label ?? liveProfitQualification.status,
+              note: liveProfitQualificationBlockers
+                .map((code) => liveProfitQualificationBlockerLabels[code] ?? code)
+                .join("；") || "匹配唯一、摘要一致且仍在新鲜度内",
+            },
+            {
+              label: "证据样本",
+              value: liveProfitQualification.comparable_trade_count === null
+                ? "不可用"
+                : `${liveProfitQualification.comparable_trade_count} 笔`,
+              note: liveProfitQualification.evidence_cutoff
+                ? `可比样本截止 ${formatUserVisibleTime(liveProfitQualification.evidence_cutoff)}`
+                : `最长有效 ${liveProfitQualification.maximum_evidence_age_days} 天`,
+            },
+            {
+              label: "账户组合风险上限",
+              value: `单笔 ${qualificationFractionPercent(liveProfitQualification.portfolio_max_plan_loss_fraction)}`,
+              note: `总风险 ${qualificationFractionPercent(liveProfitQualification.portfolio_max_open_risk_fraction)} · 总敞口 ${qualificationFractionPercent(liveProfitQualification.portfolio_max_gross_exposure_fraction)} · 日损失停止 ${qualificationFractionPercent(liveProfitQualification.portfolio_daily_loss_stop_fraction)}`,
+            },
+          ] : []),
           ...(Object.keys(decisionContext).length > 0 ? [
             { label: "交易理由", value: valueOf(decisionContext, "rationale") },
             { label: "依据与证据", value: valueOf(decisionContext, "evidence") },
@@ -4260,6 +4411,23 @@ function PlanActivationRoute() {
           持仓处置复核未通过：{positionAlignmentReadinessLabels[positionAlignmentBlocker] ?? positionAlignmentBlocker ?? "账户基线不可确认"}。请刷新账户事实并重新创建处置计划，不能沿用旧快照强制启动。
         </Alert>
       )}
+      {preview.data && !positionDisposition && !newRiskDisciplineAllowed && (
+        <Alert severity={valueOf(newRiskDiscipline, "status") === "UNKNOWN" ? "warning" : "error"} sx={{ mt: 2 }}>
+          新增风险纪律未通过：{newRiskDisciplineBlockers.map((code) => newRiskDisciplineBlockerLabels[code] ?? code).join("；") || "当前事实无法确认"}。已有计划的保护、撤单、减仓、退出和接管不受影响。
+        </Alert>
+      )}
+      {preview.data && liveProfitQualificationRequired && liveProfitQualification && (
+        <Alert
+          severity={liveProfitPresentation?.severity ?? "warning"}
+          variant="outlined"
+          sx={{ mt: 2 }}
+        >
+          <strong>{liveProfitPresentation?.label ?? liveProfitQualification.status}。</strong>{" "}
+          {liveProfitQualification.eligible_input
+            ? `已核对 ${liveProfitQualification.comparable_trade_count ?? 0} 笔 Demo 同类样本、完整冻结风险基准、目标账户与固定摘要。它只是盈利导向实盘激活的必要输入；仍不授权开闸、下单、加本金或提高风险。`
+            : `${liveProfitQualificationBlockers.map((code) => liveProfitQualificationBlockerLabels[code] ?? code).join("；") || "当前证据无法确认"}。请在 Demo 重新形成证据包，并由所有者固定仓库外绝对路径和摘要；不能在 Live 页面选择任意文件绕过。`}
+        </Alert>
+      )}
       {preview.data && directExecution && !positionDisposition && !directScheduleReady && <Alert severity="error" sx={{ mt: 2 }}>服务端订单计划预览无效或缺少完整摘要，当前不能启动。请返回计划编辑页修正后重新确认。</Alert>}
       {preview.data && !planNotExpired && <Alert severity="warning" sx={{ mt: 2 }}>计划有效期已经结束，不能再启动；请基于当前事实创建并确认新计划。</Alert>}
       {preview.data && !currentProductVersion && planRuntimeCompatible && <Alert severity="info" variant="outlined" sx={{ mt: 2 }}>
@@ -4276,7 +4444,7 @@ function PlanActivationRoute() {
             ? "此处只在个人 USDⓈ-M 合约上下文创建本地激活，不会立即向交易所提交请求。开闸并完成精确账户核对后，交易仅属于个人账户，不进入带单组合。"
             : "真实账户类型不可识别；当前不得启动。"}
       </Alert>}
-      {liveWrite && !realAccountReady && <Alert severity="warning" sx={{ mt: 2 }}>当前 App、Executor 或实盘变更门配置尚未一致；当前不能启动真实账户计划。</Alert>}
+      {liveWrite && !realAccountReady && <Alert severity="warning" sx={{ mt: 2 }}>当前 App、Executor、实盘变更门或必要证据输入尚未全部一致；当前不能启动真实账户计划。</Alert>}
       {mutation.isError && <Alert severity="error" sx={{ mt: 2 }}>
         {mutation.error instanceof ApiFailure && mutation.error.code === "ACTIVATION_PREVIEW_STALE"
           ? "启动复核已过期，页面正在刷新服务端订单快照与行情；刷新完成后请重新确认启动。"
@@ -4309,6 +4477,8 @@ function PlanActivationRoute() {
             ? "正在读取启动前行情…"
               : !positionDisposition && (market.isError || !currentMarket)
                 ? "行情不可用，不能启动"
+              : status.environment_kind === "LIVE" && !liveProfitQualificationReady
+                ? "Demo 证据准入未通过"
               : liveWrite
                 ? copyLeadAccount
                   ? "在带单账户启动实盘计划"
@@ -4394,10 +4564,17 @@ function ActivationRoute() {
   const plan = recordOf(query.data?.plan);
   const planId = valueOf(plan, "plan_id", "");
   const planDecisionContext = recordOf(plan.decision_context);
+  const planDecisionIntent = valueOf(planDecisionContext, "intent", "");
   const planDecisionContextRows = [
-    { label: "交易理由", value: valueOf(planDecisionContext, "rationale") },
-    { label: "依据与证据", value: valueOf(planDecisionContext, "evidence") },
+    { label: "本次目的", value: translatedLabel(planDecisionIntentLabels, planDecisionIntent) },
+    { label: "交易形态", value: translatedLabel(planSetupFamilyLabels, valueOf(planDecisionContext, "setup_family", "")) },
+    { label: "可证伪假设", value: valueOf(planDecisionContext, "rationale") },
+    { label: "入场前证据", value: valueOf(planDecisionContext, "evidence") },
+    { label: "失效与放弃条件", value: valueOf(planDecisionContext, "invalidation") },
     { label: "已知局限", value: valueOf(planDecisionContext, "limitations") },
+    { label: "证据截止", value: valueOf(planDecisionContext, "evidence_cutoff", "")
+      ? formatUserVisibleTime(valueOf(planDecisionContext, "evidence_cutoff"))
+      : "" },
   ].filter((item) => item.value.length > 0);
   const instrumentRef = valueOf(activation, "instrument_ref", "");
   const runtimeBaseAsset = instrumentRef.replace(/USDT-PERP$/, "") || instrumentRef;
@@ -5216,6 +5393,9 @@ function ActivationRoute() {
           </Box>)}
         </Box>
       </Box>}
+      {planDecisionIntent === "VALIDATION" && <Alert severity="info" variant="outlined" sx={{ mb: 2 }}>
+        本计划在交易前已记录为机制 / 软件验证。实际盈亏仍计入账户结果；若形成交易且工具问题未实质影响结果，复盘应归为“验证性交易”，不能因盈利改成策略可用样本。未成交则归为“未形成交易”。
+      </Alert>}
       {(query.isPending || timelineQuery.isPending) && <LinearProgress aria-label="正在读取激活与时间线" />}
       {(query.isError || timelineQuery.isError) && <Alert severity="error" sx={{ mb: 2 }}>当前服务器事实不可确认；页面不会把旧缓存冒充当前事实，也不会开放离线资本命令。</Alert>}
       {marketSourceMismatch && <Alert severity="error" variant="outlined" sx={{ mb: 2 }}>
@@ -6168,7 +6348,11 @@ function ActivationRoute() {
         )}
       </Box>
       {lifecycle === "COMPLETED" && resultRef && (
-        <ReviewDetails reviewId={resultRef} embedded />
+        <ReviewDetails
+          reviewId={resultRef}
+          embedded
+          pricePathInterval={runtimeChartInterval}
+        />
       )}
     </Box>
   );
@@ -6184,6 +6368,28 @@ function ReviewsPage() {
   const query = useQuery({ queryKey: ["reviews"], queryFn: getReviews, refetchInterval: 30_000 });
   const plansQuery = useQuery({ queryKey: ["plans"], queryFn: getPlans });
   const strategiesQuery = useQuery({ queryKey: ["strategies"], queryFn: getStrategies });
+  const accountSequenceQuery = useQuery({
+    queryKey: [
+      "review-sequence-evidence",
+      settingsStatus.environment_id,
+      "ACCOUNT_RESULTS",
+      "ALL",
+      "ALL",
+    ],
+    queryFn: () => getReviewSequenceEvidence({ scope: "ACCOUNT_RESULTS" }),
+    staleTime: 60_000,
+  });
+  const profitSeekingSequenceQuery = useQuery({
+    queryKey: [
+      "review-sequence-evidence",
+      settingsStatus.environment_id,
+      "PROFIT_SEEKING",
+      "ALL",
+      "ALL",
+    ],
+    queryFn: () => getReviewSequenceEvidence({ scope: "PROFIT_SEEKING" }),
+    staleTime: 60_000,
+  });
   const reviewPlansByVersion = useMemo(
     () => new Map(
       (plansQuery.data ?? []).flatMap((plan) => (
@@ -6207,27 +6413,25 @@ function ReviewsPage() {
   const strategyOptions = [...new Set(reviews.map((review) => reviewDecisionBasisKind(recordOf(review.trade_context))).filter(Boolean))].sort();
   const instrumentOptions = [...new Set(reviews.map((review) => valueOf(recordOf(review.trade_context), "instrument_ref", "")).filter(Boolean))].sort();
   const activeFilterCount = Object.values(listFilters).filter((value) => value !== "ALL").length;
-  const reliableTrades = tradedReviews.filter((review) => {
-    const result = tradeResultForReview(review);
-    const commission = finiteNumber(result.commission);
-    return (
-      result.calculation_complete === true
-      && result.closed === true
-      && finiteNumber(result.net_pnl) !== null
-      && commission !== null
-      && commission >= 0
-    );
-  });
-  const performanceTrades = [...reliableTrades].reverse().map((review) => {
-    const result = tradeResultForReview(review);
+  const profitSeekingRefs = new Set(
+    (profitSeekingSequenceQuery.data?.trades ?? []).map(
+      (trade) => `${trade.review_id}:${trade.review_version}`,
+    ),
+  );
+  const performanceTrades = (accountSequenceQuery.data?.trades ?? []).map((trade) => {
+    const entryNotional = finiteNumber(trade.entry_notional);
     return {
-      netPnl: finiteNumber(result.net_pnl) ?? Number.NaN,
-      commission: finiteNumber(result.commission) ?? Number.NaN,
-      entryNotional: finiteNumber(result.entry_notional),
-      classification: reviewConclusion(review),
-      closedAt: valueOf(result, "last_fill_time", valueOf(review, "fact_cutoff")),
+      netPnl: finiteNumber(trade.net_pnl) ?? Number.NaN,
+      commission: finiteNumber(trade.commission) ?? Number.NaN,
+      entryNotional,
+      classification: trade.classification ?? undefined,
+      profitSeekingEligible: profitSeekingRefs.has(
+        `${trade.review_id}:${trade.review_version}`,
+      ),
+      closedAt: trade.closed_at,
     };
   });
+  const latestReliableClosedAt = accountSequenceQuery.data?.trades.at(-1)?.closed_at ?? null;
   useEffect(() => {
     const intervalId = window.setInterval(() => setNowMs(Date.now()), 30_000);
     return () => window.clearInterval(intervalId);
@@ -6255,11 +6459,29 @@ function ReviewsPage() {
   return (
     <Box sx={{ width: "min(1320px, calc(100% - clamp(24px, 4vw, 48px)))", mx: "auto", py: { xs: 2, sm: 2.5 } }}>
       <Typography component="h1" sx={visuallyHiddenSx}>激活复盘</Typography>
-      <Suspense fallback={<LinearProgress aria-label="正在加载交易表现" sx={{ mb: 2 }} />}>
-        <ReviewPerformanceOverview
-          tradesInClosingOrder={performanceTrades}
-          marketColorScheme={marketColorScheme}
-          chartAttribution={<TradingViewAttribution />}
+      {(accountSequenceQuery.isPending || profitSeekingSequenceQuery.isPending) && (
+        <LinearProgress aria-label="正在加载交易表现" sx={{ mb: 2 }} />
+      )}
+      {(accountSequenceQuery.isError || profitSeekingSequenceQuery.isError) && (
+        <Alert severity="error" variant="outlined" sx={{ mb: 2 }}>
+          账户表现当前不可读；不会退回到近似筛选或把缺失结果显示为零。
+        </Alert>
+      )}
+      {accountSequenceQuery.data && profitSeekingSequenceQuery.data && (
+        <Suspense fallback={<LinearProgress aria-label="正在加载交易表现" sx={{ mb: 2 }} />}>
+          <ReviewPerformanceOverview
+            tradesInClosingOrder={performanceTrades}
+            marketColorScheme={marketColorScheme}
+            chartAttribution={<TradingViewAttribution />}
+          />
+        </Suspense>
+      )}
+
+      <Suspense fallback={<LinearProgress aria-label="正在加载连续交易证据" sx={{ mb: 2 }} />}>
+        <ReviewSequenceEvidencePanel
+          environmentId={settingsStatus.environment_id}
+          latestClosedAt={latestReliableClosedAt}
+          onOpenReview={(reviewId) => navigate(`/reviews/${reviewId}`)}
         />
       </Suspense>
 
@@ -6467,9 +6689,11 @@ function ReviewsPage() {
 function ReviewDetails({
   reviewId: reviewIdOverride,
   embedded = false,
+  pricePathInterval,
 }: {
   reviewId?: string;
   embedded?: boolean;
+  pricePathInterval?: ReviewPricePathInterval;
 } = {}) {
   const { reviewId: routeReviewId = "" } = useParams();
   const reviewId = reviewIdOverride ?? routeReviewId;
@@ -6584,6 +6808,7 @@ function ReviewDetails({
   const triggerEvent = acceptedTriggerEvents[0]
     ?? planEvents.find((item) => valueOf(item, "status") === "PROPOSAL_CREATED");
   const triggerDetail = recordOf(triggerEvent?.detail);
+  const triggerEntryRiskContext = recordOf(triggerDetail.entry_risk_context);
   const reviewPrimaryResult = valueOf(review, "primary_result");
   const openResponsibilities = recordOf(review.open_responsibilities);
   const unknownActionRefs = Array.isArray(openResponsibilities.unknown_action_refs) ? openResponsibilities.unknown_action_refs : [];
@@ -6607,6 +6832,7 @@ function ReviewDetails({
   const oneMinuteWindowAvailable = reviewWindowFitsInterval(baseStartMs, baseEndMs, "1m");
   const chartInterval = chartIntervalOverride
     ?? defaultReviewChartInterval(baseStartMs, baseEndMs);
+  const pricePathEvidenceInterval = pricePathInterval ?? chartInterval;
   const intervalMs = chartInterval === "1m" ? 60_000 : 15 * 60_000;
   const paddingBars = chartInterval === "1m" ? 24 : 12;
   const latestCompleteBarOpenMs = Math.floor(Date.now() / intervalMs) * intervalMs - intervalMs;
@@ -6653,6 +6879,29 @@ function ReviewDetails({
     && reviewTradeResult.execution_cost_complete === true;
   const tradeExpected = reviewPrimaryResult !== "NO_ACTION";
   const hasAttributedFills = fills.length > 0;
+  const pricePathQuery = useQuery({
+    queryKey: [
+      "review-price-path-evidence",
+      environmentScope,
+      expectedMarketSource,
+      reviewId,
+      Number(review.review_version ?? 0),
+      pricePathEvidenceInterval,
+    ],
+    queryFn: () => getReviewPricePathEvidence(
+      reviewId,
+      Number(review.review_version ?? 0),
+      pricePathEvidenceInterval,
+    ),
+    enabled: Boolean(
+      reviewId
+      && review.review_version
+      && tradeExpected
+      && !positionDisposition
+      && hasAttributedFills
+    ),
+    staleTime: 10 * 60_000,
+  });
   const averageEntryPrice = finiteNumber(reviewTradeResult.average_entry_price);
   const averageExitPrice = finiteNumber(reviewTradeResult.average_exit_price);
   const factIssueMessages = [
@@ -6792,6 +7041,19 @@ function ReviewDetails({
           </Typography>
           <TradingViewAttribution />
         </Box>}
+
+        {tradeExpected && !directExecution && !positionDisposition && <ReviewEntrySetupEvidencePanel
+          entryRiskContext={Object.keys(triggerEntryRiskContext).length > 0 ? triggerEntryRiskContext : null}
+          direction={direction}
+          averageEntryPrice={valueOf(reviewTradeResult, "average_entry_price", "") || null}
+          timelineFailed={timelineQuery.isError}
+        />}
+
+        {tradeExpected && !positionDisposition && hasAttributedFills && <ReviewPricePathEvidencePanel
+          evidence={pricePathQuery.data}
+          pending={pricePathQuery.isPending}
+          failed={pricePathQuery.isError}
+        />}
 
         {externalAccountResult && <Alert severity="warning" variant="outlined" sx={{ mb: 2 }}>
           出场由明确选定的 Binance 只减仓应急订单完成。以下盈亏是交易所成交与手续费形成的账户结果，不记作 Halpha 计划退出。

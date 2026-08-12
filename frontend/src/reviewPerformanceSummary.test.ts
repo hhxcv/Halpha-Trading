@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   isStrategyPerformanceClassification,
-  summarizeAccountAndStrategyPerformance,
+  summarizeAccountAndProfitSeekingPerformance,
   summarizeReviewPerformance,
 } from "./reviewPerformanceSummary";
 
@@ -115,12 +115,13 @@ describe("summarizeReviewPerformance", () => {
   });
 
   it("retains every reliable result in account totals while isolating strategy metrics", () => {
-    const summary = summarizeAccountAndStrategyPerformance([
+    const summary = summarizeAccountAndProfitSeekingPerformance([
       {
         netPnl: 3,
         commission: .1,
         entryNotional: 100,
         classification: "USABLE_SAMPLE",
+        profitSeekingEligible: true,
       },
       {
         netPnl: -4,
@@ -139,6 +140,7 @@ describe("summarizeReviewPerformance", () => {
         commission: .4,
         entryNotional: 100,
         classification: "TRADE_DECISION_ISSUE",
+        profitSeekingEligible: true,
       },
     ]);
 
@@ -149,7 +151,7 @@ describe("summarizeReviewPerformance", () => {
       totalEntryNotional: 700,
       notionalReturnPercent: -1,
     });
-    expect(summary.strategy).toMatchObject({
+    expect(summary.profitSeeking).toMatchObject({
       tradeCount: 2,
       netPnl: 2,
       commissions: .5,
@@ -158,5 +160,19 @@ describe("summarizeReviewPerformance", () => {
       currentStreakKind: "LOSS",
       currentStreakCount: 1,
     });
+  });
+
+  it("does not infer profit-seeking eligibility from a favorable classification", () => {
+    const summary = summarizeAccountAndProfitSeekingPerformance([
+      {
+        netPnl: 5,
+        commission: .1,
+        entryNotional: 100,
+        classification: "USABLE_SAMPLE",
+      },
+    ]);
+
+    expect(summary.account.tradeCount).toBe(1);
+    expect(summary.profitSeeking.tradeCount).toBe(0);
   });
 });

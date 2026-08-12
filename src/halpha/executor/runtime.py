@@ -1328,6 +1328,7 @@ class ProductExecutorRuntime:
                 live_write_activation_ids=tuple(sorted(self._live_write_activation_ids)),
                 live_write_submission_guard=self._live_write_submission_guard,
                 live_write_risk_control_only=self._live_write_risk_control_only,
+                new_risk_discipline_policy=self._settings.new_risk_discipline,
                 unattributed_reconciliation_not_before=(
                     datetime.now(UTC)
                     - timedelta(minutes=_RECONCILIATION_HISTORY_LOOKBACK_MINS)

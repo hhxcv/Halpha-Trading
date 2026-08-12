@@ -18,6 +18,8 @@ export type ControlPayload = components["schemas"]["ControlPayload"];
 export type SystemStopReleasePayload = components["schemas"]["SystemStopReleasePayload"];
 export type ReviewCompletionPayload = components["schemas"]["ReviewCompletionPayload"];
 export type StageReviewCreatePayload = components["schemas"]["StageReviewCreatePayload"];
+export type DecisionEvidencePreviewPayload = components["schemas"]["DecisionEvidencePreviewPayload"];
+export type PlaybookQualificationExportPayload = components["schemas"]["PlaybookQualificationExportPayload"];
 
 export type OrderScheduleDirection = components["schemas"]["Direction"];
 export type OrderScheduleEntryProgram = components["schemas"]["EntryProgram-Output"];
@@ -59,6 +61,13 @@ export type PlanVersion = components["schemas"]["TradePlanVersion"];
 export type Receipt = components["schemas"]["ReceiptResponse"];
 export type Review = components["schemas"]["ReviewResponse"];
 export type ExecutionFeeEvidence = components["schemas"]["ExecutionFeeEvidenceResponse"];
+export type DecisionEvidence = components["schemas"]["DecisionEvidenceResponse"];
+export type PlaybookQualificationExport = components["schemas"]["PlaybookQualificationExportResponse"];
+export type LiveProfitQualification = components["schemas"]["LiveProfitQualificationStatus"];
+export type ReviewPricePathEvidence = components["schemas"]["ReviewPricePathEvidenceResponse"];
+export type ReviewPricePathInterval = ReviewPricePathEvidence["interval"];
+export type ReviewSequenceEvidence = components["schemas"]["ReviewSequenceEvidenceResponse"];
+export type ReviewSequenceScope = ReviewSequenceEvidence["scope"];
 export type ReviewDocument = components["schemas"]["Review"];
 export type ReviewHistory = components["schemas"]["ReviewHistoryResponse"];
 export type ReviewCompletion = components["schemas"]["ReviewCompletionResponse"];
@@ -358,6 +367,43 @@ export async function getReviews(): Promise<Review[]> {
   return data;
 }
 
+export async function getReviewSequenceEvidence({
+  scope,
+  rangeStart,
+  rangeEnd,
+  includePricePath = false,
+  interval = "1m",
+}: {
+  scope: ReviewSequenceScope;
+  rangeStart?: string;
+  rangeEnd?: string;
+  includePricePath?: boolean;
+  interval?: ReviewPricePathInterval;
+}): Promise<ReviewSequenceEvidence> {
+  const { data, error, response } = await api.GET(
+    "/api/v1/review-sequence-evidence",
+    {
+      params: {
+        query: {
+          scope,
+          range_start: rangeStart,
+          range_end: rangeEnd,
+          include_price_path: includePricePath,
+          interval,
+        },
+      },
+    },
+  );
+  if (!data) {
+    throw new ApiFailure(
+      response.status,
+      errorCode(error, "REVIEW_SEQUENCE_EVIDENCE_FAILED"),
+      error,
+    );
+  }
+  return data;
+}
+
 export async function getExecutionFeeEvidence(
   instrumentRef: string,
 ): Promise<ExecutionFeeEvidence> {
@@ -366,6 +412,46 @@ export async function getExecutionFeeEvidence(
   });
   if (!data) {
     throw new ApiFailure(response.status, errorCode(error, "EXECUTION_FEE_EVIDENCE_FAILED"));
+  }
+  return data;
+}
+
+export async function previewDecisionEvidence(
+  payload: DecisionEvidencePreviewPayload,
+): Promise<DecisionEvidence> {
+  const { data, error, response } = await api.POST(
+    "/api/v1/decision-evidence/preview",
+    {
+      body: payload,
+      headers: csrfHeader(),
+    },
+  );
+  if (!data) {
+    throw new ApiFailure(
+      response.status,
+      errorCode(error, "DECISION_EVIDENCE_PREVIEW_FAILED"),
+      error,
+    );
+  }
+  return data;
+}
+
+export async function exportPlaybookQualification(
+  payload: PlaybookQualificationExportPayload,
+): Promise<PlaybookQualificationExport> {
+  const { data, error, response } = await api.POST(
+    "/api/v1/playbook-qualification/export",
+    {
+      body: payload,
+      headers: csrfHeader(),
+    },
+  );
+  if (!data) {
+    throw new ApiFailure(
+      response.status,
+      errorCode(error, "PLAYBOOK_QUALIFICATION_EXPORT_FAILED"),
+      error,
+    );
   }
   return data;
 }
@@ -394,6 +480,30 @@ export async function getReview(reviewId: string): Promise<ReviewHistory> {
     params: { path: { review_id: reviewId } },
   });
   if (!data) throw new ApiFailure(response.status, errorCode(error, "REVIEW_FAILED"));
+  return data;
+}
+
+export async function getReviewPricePathEvidence(
+  reviewId: string,
+  reviewVersion: number,
+  interval: ReviewPricePathInterval,
+): Promise<ReviewPricePathEvidence> {
+  const { data, error, response } = await api.GET(
+    "/api/v1/reviews/{review_id}/price-path-evidence",
+    {
+      params: {
+        path: { review_id: reviewId },
+        query: { review_version: reviewVersion, interval },
+      },
+    },
+  );
+  if (!data) {
+    throw new ApiFailure(
+      response.status,
+      errorCode(error, "REVIEW_PRICE_PATH_EVIDENCE_FAILED"),
+      error,
+    );
+  }
   return data;
 }
 

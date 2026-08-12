@@ -337,19 +337,19 @@ def test_commission_without_a_matching_fill_keeps_result_incomplete() -> None:
 @pytest.mark.parametrize(
     "placeholder_trade_id",
     (
-        "c3dbbc0b-8835-5ed6-a7bd-a93fc9be7912",
-        "S-18c897945fc371ff-d9fd8ca4",
+        "00000000-0000-4000-8000-000000000001",
+        "S-synthetic-placeholder",
     ),
 )
 def test_binance_trade_query_replaces_framework_reconciliation_placeholder(
     placeholder_trade_id: str,
 ) -> None:
-    source_time = datetime(2026, 7, 29, 15, 19, 4, tzinfo=UTC)
+    source_time = datetime(2030, 1, 15, 0, 5, tzinfo=UTC)
     common = {
         "client_order_id": "client-take-profit",
-        "venue_order_ref": "24785920409",
-        "last_price": "64095.4",
-        "last_quantity": "0.001",
+        "venue_order_ref": "synthetic-take-profit-order",
+        "last_price": "99",
+        "last_quantity": "1",
         "order_side": "BUY",
     }
     result = summarize_trade_result(
@@ -358,19 +358,19 @@ def test_binance_trade_query_replaces_framework_reconciliation_placeholder(
         facts=(
             _fact(
                 "FILL",
-                "522671883",
+                "synthetic-entry-trade",
                 "entry",
-                source_time=datetime(2026, 7, 29, 15, 17, 29, tzinfo=UTC),
-                last_price="64080.5",
-                last_quantity="0.001",
+                source_time=datetime(2030, 1, 15, 0, 0, tzinfo=UTC),
+                last_price="100",
+                last_quantity="1",
                 order_side="SELL",
                 liquidity_side="TAKER",
             ),
             _fact(
                 "COMMISSION",
-                "522671883",
+                "synthetic-entry-trade",
                 "entry",
-                amount="0.02563220 USDT",
+                amount="0.1 USDT",
                 currency="USDT",
             ),
             _fact(
@@ -392,7 +392,7 @@ def test_binance_trade_query_replaces_framework_reconciliation_placeholder(
             ),
             _fact(
                 "FILL",
-                "522671923",
+                "synthetic-exit-trade",
                 "take-profit",
                 source_time=source_time,
                 event_type="BinanceUserTradeQuery",
@@ -401,9 +401,9 @@ def test_binance_trade_query_replaces_framework_reconciliation_placeholder(
             ),
             _fact(
                 "COMMISSION",
-                "522671923",
+                "synthetic-exit-trade",
                 "take-profit",
-                amount="0.02563816 USDT",
+                amount="0.1 USDT",
                 currency="USDT",
             ),
         ),
@@ -412,11 +412,11 @@ def test_binance_trade_query_replaces_framework_reconciliation_placeholder(
     assert result["fill_count"] == 2
     assert result["position_quantity"] == "0"
     assert result["closed"] is True
-    assert result["commission"] == "0.05127036"
-    assert result["net_pnl"] == "-0.06617036"
+    assert result["commission"] == "0.2"
+    assert result["net_pnl"] == "0.8"
     assert [fill["trade_id"] for fill in result["fills"]] == [
-        "522671883",
-        "522671923",
+        "synthetic-entry-trade",
+        "synthetic-exit-trade",
     ]
 
 

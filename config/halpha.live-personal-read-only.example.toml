@@ -105,6 +105,18 @@ account = "scram_password"
 [email]
 delivery_enabled = false
 
+[new_risk_discipline]
+max_plan_loss_fraction = "0.0075"
+max_open_risk_fraction = "0.025"
+max_gross_exposure_fraction = "2"
+max_instrument_exposure_fraction = "1"
+max_correlated_exposure_fraction = "1.5"
+daily_loss_stop_fraction = "0.015"
+weekly_loss_stop_fraction = "0.04"
+rolling_drawdown_stop_fraction = "0.1"
+rolling_drawdown_lookback_days = 30
+account_snapshot_max_age_seconds = 65
+
 [windows]
 app_task_sid = "S-1-5-21-0-0-0-1301"
 executor_task_sid = "S-1-5-21-0-0-0-1302"

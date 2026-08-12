@@ -192,6 +192,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/decision-evidence/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Decision Evidence Preview */
+        post: operations["decision_evidence_preview_api_v1_decision_evidence_preview_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/execution-fee-evidence": {
         parameters: {
             query?: never;
@@ -365,6 +382,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/playbook-qualification/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Export Playbook Qualification */
+        post: operations["export_playbook_qualification_api_v1_playbook_qualification_export_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/receipts/{receipt_id}": {
         parameters: {
             query?: never;
@@ -374,6 +408,23 @@ export interface paths {
         };
         /** Receipt */
         get: operations["receipt_api_v1_receipts__receipt_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/review-sequence-evidence": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Review Sequence Evidence */
+        get: operations["review_sequence_evidence_api_v1_review_sequence_evidence_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -428,6 +479,23 @@ export interface paths {
         put?: never;
         /** Complete Review */
         post: operations["complete_review_api_v1_reviews__review_id__complete_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/reviews/{review_id}/price-path-evidence": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Review Price Path Evidence */
+        get: operations["review_price_path_evidence_api_v1_reviews__review_id__price_path_evidence_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -723,6 +791,37 @@ export interface components {
             /** Unrealized Pnl */
             unrealized_pnl: string;
         };
+        /** AccountSummaryResponse */
+        AccountSummaryResponse: {
+            /** Available Balance */
+            available_balance: string;
+            /** Can Trade */
+            can_trade: boolean;
+            /** Cross Unrealized Pnl */
+            cross_unrealized_pnl: string;
+            /** Cross Wallet Balance */
+            cross_wallet_balance: string;
+            /** Fact Cutoff */
+            fact_cutoff: string;
+            /** Initial Margin */
+            initial_margin: string;
+            /** Maintenance Margin */
+            maintenance_margin: string;
+            /** Margin Balance */
+            margin_balance: string;
+            /** Open Order Initial Margin */
+            open_order_initial_margin: string;
+            /** Position Initial Margin */
+            position_initial_margin: string;
+            /** Snapshot Ref */
+            snapshot_ref: string;
+            /** Source Update Time Ms */
+            source_update_time_ms: number | null;
+            /** Unrealized Pnl */
+            unrealized_pnl: string;
+            /** Wallet Balance */
+            wallet_balance: string;
+        };
         /** ActivationCreateResponse */
         ActivationCreateResponse: {
             activation: components["schemas"]["PlanActivation"];
@@ -806,7 +905,7 @@ export interface components {
             /** Created At */
             created_at: string | null;
             /** Creator Kind */
-            creator_kind: ("HUMAN" | "AI") | null;
+            creator_kind: ("HUMAN" | "AI" | "MONITOR") | null;
             /** Decision Basis */
             decision_basis: {
                 [key: string]: unknown;
@@ -814,7 +913,7 @@ export interface components {
             decision_basis_kind: components["schemas"]["DecisionBasisKind"];
             /** Decision Basis Ref */
             decision_basis_ref: string;
-            decision_context?: components["schemas"]["PlanDecisionContext"] | null;
+            decision_context?: components["schemas"]["PlanDecisionContext-Output"] | null;
             direction: components["schemas"]["Direction"];
             /** Environment Id */
             environment_id: string;
@@ -834,6 +933,8 @@ export interface components {
             };
             /** Live Activation Eligible */
             live_activation_eligible: boolean;
+            live_profit_qualification: components["schemas"]["LiveProfitQualificationStatus"];
+            new_risk_discipline?: components["schemas"]["NewRiskDisciplineResponse"] | null;
             order_schedule_snapshot: components["schemas"]["OrderSchedulePreview"] | null;
             order_schedule_spec: components["schemas"]["OrderScheduleSpec-Output"] | null;
             /** Parameter Digest */
@@ -1296,6 +1397,130 @@ export interface components {
              */
             kind: "DECISION_BASIS_READY";
         };
+        /** DecisionEvidenceMetricsResponse */
+        DecisionEvidenceMetricsResponse: {
+            /** Average Net Pnl */
+            average_net_pnl: string | null;
+            /** Best Trade Net Pnl */
+            best_trade_net_pnl: string | null;
+            /** Commission */
+            commission: string;
+            /** Current Streak Count */
+            current_streak_count: number;
+            /** Current Streak Kind */
+            current_streak_kind: ("WIN" | "LOSS" | "FLAT") | null;
+            /** Flat */
+            flat: number;
+            /** Gross Loss */
+            gross_loss: string;
+            /** Gross Profit */
+            gross_profit: string;
+            /** Largest Loss Share Percent */
+            largest_loss_share_percent: string | null;
+            /** Largest Win Share Percent */
+            largest_win_share_percent: string | null;
+            /** Longest Losing Streak */
+            longest_losing_streak: number;
+            /** Longest Winning Streak */
+            longest_winning_streak: number;
+            /** Losses */
+            losses: number;
+            /** Maximum Drawdown */
+            maximum_drawdown: string;
+            /** Net Pnl */
+            net_pnl: string;
+            /** Net Pnl Without Best Trade */
+            net_pnl_without_best_trade: string | null;
+            /** Net Pnl Without Worst Trade */
+            net_pnl_without_worst_trade: string | null;
+            /** Notional Return Percent */
+            notional_return_percent: string | null;
+            /** Profit Factor */
+            profit_factor: string | null;
+            /** Total Entry Notional */
+            total_entry_notional: string;
+            /** Trade Count */
+            trade_count: number;
+            /** Wins */
+            wins: number;
+            /** Worst Trade Net Pnl */
+            worst_trade_net_pnl: string | null;
+        };
+        /** DecisionEvidencePreviewPayload */
+        DecisionEvidencePreviewPayload: {
+            decision_basis: components["schemas"]["DraftDecisionBasis"];
+            direction: components["schemas"]["Direction"];
+            /** Instrument Ref */
+            instrument_ref: string;
+            intent: components["schemas"]["PlanDecisionIntent"];
+            /** Playbook Ref */
+            playbook_ref?: string | null;
+            setup_family: components["schemas"]["PlanSetupFamily"];
+        };
+        /** DecisionEvidenceResponse */
+        DecisionEvidenceResponse: {
+            /**
+             * Capital Scaling Authority
+             * @constant
+             */
+            capital_scaling_authority: false;
+            /** Comparable Trade Count */
+            comparable_trade_count: number;
+            /** Decision Basis Ref */
+            decision_basis_ref: string;
+            direction: components["schemas"]["Direction"];
+            /**
+             * Evidence Grade
+             * @enum {string}
+             */
+            evidence_grade: "VALIDATION_INTENT" | "NO_COMPARABLE_SAMPLE" | "SINGLE_DIGIT_ANECDOTAL" | "REPEATED_OBSERVATION_UNPROVEN";
+            /** Excluded Review Count */
+            excluded_review_count: number;
+            /** Exclusions */
+            exclusions: {
+                [key: string]: number;
+            };
+            /** Instrument Ref */
+            instrument_ref: string;
+            intent: components["schemas"]["PlanDecisionIntent"];
+            /** Limitations */
+            limitations: string[];
+            /** Matched Review Count */
+            matched_review_count: number;
+            metrics: components["schemas"]["DecisionEvidenceMetricsResponse"];
+            /** Parameter Digest */
+            parameter_digest: string;
+            /** Playbook Ref */
+            playbook_ref: string | null;
+            repeatability: components["schemas"]["PlaybookRepeatabilityResponse"];
+            /** Repeated Sample Floor */
+            repeated_sample_floor: number;
+            /** Sample Identity Digest */
+            sample_identity_digest: string | null;
+            /** Sample Review Refs */
+            sample_review_refs: components["schemas"]["DecisionEvidenceSampleRefResponse"][];
+            /** Sample Traceability Complete */
+            sample_traceability_complete: boolean;
+            setup_family: components["schemas"]["PlanSetupFamily"];
+            /**
+             * Source
+             * @constant
+             */
+            source: "CURRENT_COMPLETED_REVIEWS";
+            /** Source Cutoff */
+            source_cutoff: string | null;
+        };
+        /** DecisionEvidenceSampleRefResponse */
+        DecisionEvidenceSampleRefResponse: {
+            /** Fact Cutoff */
+            fact_cutoff: string;
+            /** Review Content Digest */
+            review_content_digest: string;
+            /** Review Id */
+            review_id: string;
+            /** Review Version */
+            review_version: number;
+        };
         /**
          * Direction
          * @enum {string}
@@ -1588,6 +1813,105 @@ export interface components {
             /** Source Cutoff */
             source_cutoff: string;
         };
+        /** LiveProfitQualificationStatus */
+        LiveProfitQualificationStatus: {
+            /** Artifact Content Digest */
+            artifact_content_digest?: string | null;
+            /** Blocker Codes */
+            blocker_codes: string[];
+            /**
+             * Capital Scaling Authority
+             * @default false
+             * @constant
+             */
+            capital_scaling_authority: false;
+            /** Comparable Trade Count */
+            comparable_trade_count?: number | null;
+            /** Eligible Input */
+            eligible_input: boolean;
+            /** Evidence Cutoff */
+            evidence_cutoff?: string | null;
+            /**
+             * Limitations
+             * @default [
+             *       "该结果只是盈利导向 Live 激活的必要证据输入，不是用户决定、写门或交易所动作授权。",
+             *       "Demo 证据不能替代 Live 账户事实、CAP、EXE、保护、退出和用户明确激活。",
+             *       "微型实盘结果仍须独立复盘；通过不能自动提高风险或增加本金。"
+             *     ]
+             */
+            limitations: string[];
+            /**
+             * Live Activation Authority
+             * @default false
+             * @constant
+             */
+            live_activation_authority: false;
+            /**
+             * Maximum Evidence Age Days
+             * @default 7
+             */
+            maximum_evidence_age_days: number;
+            /**
+             * Portfolio Daily Loss Stop Fraction
+             * @default 0.015
+             */
+            portfolio_daily_loss_stop_fraction: string;
+            /**
+             * Portfolio Max Correlated Exposure Fraction
+             * @default 1.5
+             */
+            portfolio_max_correlated_exposure_fraction: string;
+            /**
+             * Portfolio Max Gross Exposure Fraction
+             * @default 2
+             */
+            portfolio_max_gross_exposure_fraction: string;
+            /**
+             * Portfolio Max Instrument Exposure Fraction
+             * @default 1
+             */
+            portfolio_max_instrument_exposure_fraction: string;
+            /**
+             * Portfolio Max Open Risk Fraction
+             * @default 0.025
+             */
+            portfolio_max_open_risk_fraction: string;
+            /**
+             * Portfolio Max Plan Loss Fraction
+             * @default 0.0075
+             */
+            portfolio_max_plan_loss_fraction: string;
+            /**
+             * Portfolio Risk Policy Version
+             * @default ACCOUNT_PORTFOLIO_RISK@2
+             */
+            portfolio_risk_policy_version: string;
+            /**
+             * Portfolio Rolling Drawdown Stop Fraction
+             * @default 0.1
+             */
+            portfolio_rolling_drawdown_stop_fraction: string;
+            /**
+             * Portfolio Weekly Loss Stop Fraction
+             * @default 0.04
+             */
+            portfolio_weekly_loss_stop_fraction: string;
+            /** Repeatability Policy Version */
+            repeatability_policy_version?: string | null;
+            /** Required */
+            required: boolean;
+            /** Risk Basis Trade Count */
+            risk_basis_trade_count?: number | null;
+            /** Source Environment Id */
+            source_environment_id?: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "NOT_APPLICABLE_DEMO" | "NOT_APPLICABLE_VALIDATION" | "NOT_APPLICABLE_POSITION_DISPOSITION" | "NOT_CONFIGURED" | "INVALID" | "NOT_MATCHED" | "STALE" | "AMBIGUOUS" | "ELIGIBLE_INPUT";
+            /** Target Venue Account Type */
+            target_venue_account_type?: string | null;
+        };
         /** MarkPriceCondition */
         "MarkPriceCondition-Input": {
             /**
@@ -1765,6 +2089,80 @@ export interface components {
              */
             source_cutoff: string;
         };
+        /** NewRiskDisciplineResponse */
+        NewRiskDisciplineResponse: {
+            /** Account Snapshot Cutoff */
+            account_snapshot_cutoff: string | null;
+            /** Account Snapshot Ref */
+            account_snapshot_ref: string | null;
+            /** Blocker Codes */
+            blocker_codes: string[];
+            /** Correlated Exposure */
+            correlated_exposure: string | null;
+            /** Correlated Exposure After Proposal */
+            correlated_exposure_after_proposal: string | null;
+            /** Correlated Exposure Limit */
+            correlated_exposure_limit: string | null;
+            /** Correlation Cluster */
+            correlation_cluster: string | null;
+            /** Daily Loss Limit */
+            daily_loss_limit: string | null;
+            /** Daily Loss Measure */
+            daily_loss_measure: string | null;
+            /** Day Window Started At */
+            day_window_started_at: string;
+            /** Evaluated At */
+            evaluated_at: string;
+            /** Gross Exposure */
+            gross_exposure: string | null;
+            /** Gross Exposure After Proposal */
+            gross_exposure_after_proposal: string | null;
+            /** Gross Exposure Limit */
+            gross_exposure_limit: string | null;
+            /** Instrument Exposure */
+            instrument_exposure: string | null;
+            /** Instrument Exposure After Proposal */
+            instrument_exposure_after_proposal: string | null;
+            /** Instrument Exposure Limit */
+            instrument_exposure_limit: string | null;
+            /** Instrument Ref */
+            instrument_ref: string | null;
+            /** Max Plan Loss */
+            max_plan_loss: string | null;
+            /** New Risk Allowed */
+            new_risk_allowed: boolean;
+            /** Open New Risk Activation Count */
+            open_new_risk_activation_count: number;
+            /** Open Risk After Proposal */
+            open_risk_after_proposal: string | null;
+            /** Open Risk Committed */
+            open_risk_committed: string | null;
+            /** Open Risk Limit */
+            open_risk_limit: string | null;
+            /** Risk Equity */
+            risk_equity: string | null;
+            /** Rolling Drawdown */
+            rolling_drawdown: string | null;
+            /** Rolling Drawdown Fraction */
+            rolling_drawdown_fraction: string | null;
+            /** Rolling Drawdown Limit Fraction */
+            rolling_drawdown_limit_fraction: string;
+            /** Rolling Drawdown Lookback Days */
+            rolling_drawdown_lookback_days: number;
+            /** Rolling Peak Equity */
+            rolling_peak_equity: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "ALLOWED" | "BLOCKED" | "UNKNOWN";
+            /** Week Window Started At */
+            week_window_started_at: string;
+            /** Weekly Loss Limit */
+            weekly_loss_limit: string | null;
+            /** Weekly Loss Measure */
+            weekly_loss_measure: string | null;
+        };
         /**
          * NumericComparator
          * @enum {string}
@@ -1925,6 +2323,7 @@ export interface components {
              * @enum {string}
              */
             account_snapshot_status: "CURRENT" | "STALE" | "UNAVAILABLE" | "UNKNOWN";
+            account_summary: components["schemas"]["AccountSummaryResponse"] | null;
             /** Authority Class */
             authority_class: string;
             /** Database Name */
@@ -1933,6 +2332,7 @@ export interface components {
             environment_id: string;
             /** Environment Kind */
             environment_kind: string;
+            new_risk_discipline: components["schemas"]["NewRiskDisciplineResponse"];
             /** Open Activation Count */
             open_activation_count: number;
             /** Profile */
@@ -2032,7 +2432,7 @@ export interface components {
         PlanCreatePayload: {
             creator_kind: components["schemas"]["PlanCreatorKind"];
             decision_basis: components["schemas"]["DraftDecisionBasis"];
-            decision_context: components["schemas"]["PlanDecisionContext"];
+            decision_context: components["schemas"]["PlanDecisionContext-Input"];
             /** Direction */
             direction: string;
             /** Instrument Ref */
@@ -2062,19 +2462,53 @@ export interface components {
          * PlanCreatorKind
          * @enum {string}
          */
-        PlanCreatorKind: "HUMAN" | "AI";
+        PlanCreatorKind: "HUMAN" | "AI" | "MONITOR";
         /**
          * PlanDecisionContext
          * @description Human-readable decision record; never an executable trading condition.
          */
-        PlanDecisionContext: {
+        "PlanDecisionContext-Input": {
             /** Evidence */
             evidence: string;
+            /** Evidence Cutoff */
+            evidence_cutoff?: string | null;
+            intent?: components["schemas"]["PlanDecisionIntent"] | null;
+            /** Invalidation */
+            invalidation?: string | null;
             /** Limitations */
             limitations: string;
+            /** Playbook Ref */
+            playbook_ref?: string | null;
             /** Rationale */
             rationale: string;
+            setup_family?: components["schemas"]["PlanSetupFamily"] | null;
         };
+        /**
+         * PlanDecisionContext
+         * @description Human-readable decision record; never an executable trading condition.
+         */
+        "PlanDecisionContext-Output": {
+            /** Evidence */
+            evidence: string;
+            /** Evidence Cutoff */
+            evidence_cutoff: string | null;
+            intent: components["schemas"]["PlanDecisionIntent"] | null;
+            /** Invalidation */
+            invalidation: string | null;
+            /** Limitations */
+            limitations: string;
+            /** Playbook Ref */
+            playbook_ref: string | null;
+            /** Rationale */
+            rationale: string;
+            setup_family: components["schemas"]["PlanSetupFamily"] | null;
+        };
+        /**
+         * PlanDecisionIntent
+         * @description Why this plan is allowed to consume one risk attempt.
+         * @enum {string}
+         */
+        PlanDecisionIntent: "PROFIT_SEEKING" | "VALIDATION";
         /** PlanDeleteResponse */
         PlanDeleteResponse: {
             /** Deleted Draft Version */
@@ -2090,7 +2524,7 @@ export interface components {
         /** PlanDraftPayload */
         PlanDraftPayload: {
             decision_basis: components["schemas"]["DraftDecisionBasis"];
-            decision_context: components["schemas"]["PlanDecisionContext"];
+            decision_context: components["schemas"]["PlanDecisionContext-Input"];
             /** Direction */
             direction: string;
             /** Instrument Ref */
@@ -2141,17 +2575,23 @@ export interface components {
          * @enum {string}
          */
         PlanParameterDisplayFormat: "VALUE" | "PERCENT" | "BOOLEAN_LABEL";
+        /**
+         * PlanSetupFamily
+         * @description Small, stable comparison buckets; never executable conditions.
+         * @enum {string}
+         */
+        PlanSetupFamily: "BREAKOUT_CONTINUATION" | "PULLBACK_CONTINUATION" | "RANGE_MEAN_REVERSION" | "REVERSAL" | "EVENT_DRIVEN" | "OTHER";
         /** PlanSummaryResponse */
         PlanSummaryResponse: {
             /** Created At */
             created_at: string | null;
             /** Creator Kind */
-            creator_kind: ("HUMAN" | "AI") | null;
+            creator_kind: ("HUMAN" | "AI" | "MONITOR") | null;
             decision_basis: components["schemas"]["DraftDecisionBasis"];
             decision_basis_kind: components["schemas"]["DecisionBasisKind"];
             /** Decision Basis Ref */
             decision_basis_ref: string;
-            decision_context?: components["schemas"]["PlanDecisionContext"] | null;
+            decision_context?: components["schemas"]["PlanDecisionContext-Output"] | null;
             direction: components["schemas"]["Direction"];
             /** Draft Content Digest */
             draft_content_digest: string;
@@ -2195,6 +2635,214 @@ export interface components {
             valid_from: string;
             /** Valid Until */
             valid_until: string;
+        };
+        /** PlaybookQualificationArtifact */
+        PlaybookQualificationArtifact: {
+            /** Average R Multiple */
+            average_r_multiple: string;
+            /**
+             * Capital Scaling Authority
+             * @default false
+             * @constant
+             */
+            capital_scaling_authority: false;
+            cohort: components["schemas"]["PlaybookQualificationCohort"];
+            /** Comparable Trade Count */
+            comparable_trade_count: number;
+            /** Decision Evidence Digest */
+            decision_evidence_digest: string;
+            /** Early Segment Net R */
+            early_segment_net_r: string;
+            /**
+             * Evidence Cutoff
+             * Format: date-time
+             */
+            evidence_cutoff: string;
+            /** Gross Loss */
+            gross_loss: string;
+            /** Gross Profit */
+            gross_profit: string;
+            /**
+             * Issued At
+             * Format: date-time
+             */
+            issued_at: string;
+            /** Limitations */
+            limitations: string[];
+            /**
+             * Live Activation Authority
+             * @default false
+             * @constant
+             */
+            live_activation_authority: false;
+            /** Mean R Lower Confidence Bound */
+            mean_r_lower_confidence_bound: string;
+            /** Minimum Profit Factor */
+            minimum_profit_factor: string;
+            /** Minimum Trade Count */
+            minimum_trade_count: number;
+            /** Net R Multiple */
+            net_r_multiple: string;
+            /** Net R Without Best Trade */
+            net_r_without_best_trade: string;
+            /** Profit Factor */
+            profit_factor: string | null;
+            /** Recent Segment Net R */
+            recent_segment_net_r: string;
+            /** Repeatability Policy Version */
+            repeatability_policy_version: string;
+            /** Risk Basis Trade Count */
+            risk_basis_trade_count: number;
+            /** Sample Identity Digest */
+            sample_identity_digest: string;
+            /** Sample Review Refs */
+            sample_review_refs: components["schemas"]["PlaybookQualificationSampleRef"][];
+            /**
+             * Schema
+             * @default HALPHA_PLAYBOOK_QUALIFICATION@1
+             * @constant
+             */
+            schema: "HALPHA_PLAYBOOK_QUALIFICATION@1";
+            /**
+             * Screen Status
+             * @default EVIDENCE_CANDIDATE
+             * @constant
+             */
+            screen_status: "EVIDENCE_CANDIDATE";
+            /** Source Environment Id */
+            source_environment_id: string;
+            /**
+             * Source Environment Kind
+             * @default DEMO
+             * @constant
+             */
+            source_environment_kind: "DEMO";
+            /** Source Product Build Id */
+            source_product_build_id: string;
+            /**
+             * Target Venue Account Type
+             * @enum {string}
+             */
+            target_venue_account_type: "USDM_COPY_LEAD" | "USDM_PERSONAL";
+        };
+        /** PlaybookQualificationCohort */
+        PlaybookQualificationCohort: {
+            decision_basis_kind: components["schemas"]["DecisionBasisKind"];
+            /** Decision Basis Ref */
+            decision_basis_ref: string;
+            direction: components["schemas"]["Direction"];
+            /** Instrument Ref */
+            instrument_ref: string;
+            /**
+             * Intent
+             * @default PROFIT_SEEKING
+             * @constant
+             */
+            intent: "PROFIT_SEEKING";
+            /** Parameter Digest */
+            parameter_digest: string;
+            /** Playbook Ref */
+            playbook_ref?: string | null;
+            setup_family: components["schemas"]["PlanSetupFamily"];
+            /**
+             * Venue Ref
+             * @default BINANCE_USDM
+             * @constant
+             */
+            venue_ref: "BINANCE_USDM";
+        };
+        /** PlaybookQualificationExportPayload */
+        PlaybookQualificationExportPayload: {
+            decision_basis: components["schemas"]["DraftDecisionBasis"];
+            direction: components["schemas"]["Direction"];
+            /** Instrument Ref */
+            instrument_ref: string;
+            intent: components["schemas"]["PlanDecisionIntent"];
+            /** Playbook Ref */
+            playbook_ref?: string | null;
+            setup_family: components["schemas"]["PlanSetupFamily"];
+            /**
+             * Target Venue Account Type
+             * @enum {string}
+             */
+            target_venue_account_type: "USDM_COPY_LEAD" | "USDM_PERSONAL";
+        };
+        /** PlaybookQualificationExportResponse */
+        PlaybookQualificationExportResponse: {
+            artifact: components["schemas"]["PlaybookQualificationArtifact"];
+            /** Artifact Content Digest */
+            artifact_content_digest: string;
+            /**
+             * Save Outside Repository
+             * @constant
+             */
+            save_outside_repository: true;
+        };
+        /** PlaybookQualificationSampleRef */
+        PlaybookQualificationSampleRef: {
+            /**
+             * Fact Cutoff
+             * Format: date-time
+             */
+            fact_cutoff: string;
+            /** Review Content Digest */
+            review_content_digest: string;
+            /** Review Id */
+            review_id: string;
+            /** Review Version */
+            review_version: number;
+        };
+        /** PlaybookRepeatabilityResponse */
+        PlaybookRepeatabilityResponse: {
+            /** Average R Multiple */
+            average_r_multiple: string | null;
+            /** Bootstrap Block Length */
+            bootstrap_block_length: number | null;
+            /** Bootstrap Resamples */
+            bootstrap_resamples: number;
+            /**
+             * Capital Scaling Authority
+             * @constant
+             */
+            capital_scaling_authority: false;
+            /** Confidence Level Percent */
+            confidence_level_percent: string;
+            /** Early Segment Net R */
+            early_segment_net_r: string | null;
+            /** Early Segment Trade Count */
+            early_segment_trade_count: number;
+            /** Limitations */
+            limitations: string[];
+            /**
+             * Live Promotion Authority
+             * @constant
+             */
+            live_promotion_authority: false;
+            /** Mean R Lower Confidence Bound */
+            mean_r_lower_confidence_bound: string | null;
+            /** Minimum Profit Factor */
+            minimum_profit_factor: string;
+            /** Minimum Trade Count */
+            minimum_trade_count: number;
+            /** Net R Multiple */
+            net_r_multiple: string | null;
+            /** Net R Without Best Trade */
+            net_r_without_best_trade: string | null;
+            /** Policy Version */
+            policy_version: string;
+            /** Reason Codes */
+            reason_codes: ("MINIMUM_SAMPLE_NOT_MET" | "RISK_BASIS_INCOMPLETE" | "NET_EXPECTANCY_NOT_POSITIVE" | "PROFIT_FACTOR_MARGIN_NOT_MET" | "BEST_TRADE_DEPENDENCE" | "EARLY_SEGMENT_NOT_POSITIVE" | "RECENT_SEGMENT_NOT_POSITIVE" | "MEAN_R_CONFIDENCE_NOT_POSITIVE")[];
+            /** Recent Segment Net R */
+            recent_segment_net_r: string | null;
+            /** Recent Segment Trade Count */
+            recent_segment_trade_count: number;
+            /** Risk Basis Trade Count */
+            risk_basis_trade_count: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "NOT_APPLICABLE_VALIDATION" | "NOT_READY" | "EVIDENCE_CANDIDATE";
         };
         /**
          * PositionAlignmentOperation
@@ -2723,6 +3371,101 @@ export interface components {
             /** Versions */
             versions: components["schemas"]["ReviewResponse"][];
         };
+        /** ReviewPricePathEvidenceResponse */
+        ReviewPricePathEvidenceResponse: {
+            /** Analysis End At */
+            analysis_end_at: string | null;
+            /** Analysis Start At */
+            analysis_start_at: string | null;
+            /** Average Entry Price */
+            average_entry_price: string | null;
+            /** Best Directional Move Percent */
+            best_directional_move_percent: string | null;
+            /** Best Favorable Bar Open At */
+            best_favorable_bar_open_at: string | null;
+            /** Best Favorable Price */
+            best_favorable_price: string | null;
+            /**
+             * Calculation Version
+             * @constant
+             */
+            calculation_version: "REVIEW_PRICE_PATH_V1";
+            /**
+             * Capital Scaling Authority
+             * @constant
+             */
+            capital_scaling_authority: false;
+            /** Complete Bar Count */
+            complete_bar_count: number;
+            direction: components["schemas"]["Direction"] | null;
+            /** Ever Favorable On Complete Bars */
+            ever_favorable_on_complete_bars: boolean | null;
+            /**
+             * Evidence Status
+             * @enum {string}
+             */
+            evidence_status: "AVAILABLE" | "NOT_APPLICABLE" | "UNKNOWN";
+            /** First Complete Bar Close At */
+            first_complete_bar_close_at: string | null;
+            /** First Complete Bar Close Price */
+            first_complete_bar_close_price: string | null;
+            /** First Complete Bar Directional Return Percent */
+            first_complete_bar_directional_return_percent: string | null;
+            /** First Complete Bar Favorable */
+            first_complete_bar_favorable: boolean | null;
+            /** First Reduction Fill At */
+            first_reduction_fill_at: string | null;
+            /** Initial Stop Distance Bps */
+            initial_stop_distance_bps: string | null;
+            /** Instrument Ref */
+            instrument_ref: string | null;
+            /**
+             * Interval
+             * @enum {string}
+             */
+            interval: "1m" | "5m" | "15m" | "1h" | "4h" | "1d";
+            /** Last Entry Fill At */
+            last_entry_fill_at: string | null;
+            /** Limitations */
+            limitations: string[];
+            /** Market Source */
+            market_source: string | null;
+            /** Market Source Cutoff */
+            market_source_cutoff: string | null;
+            /** Maximum Adverse Excursion Percent */
+            maximum_adverse_excursion_percent: string | null;
+            /** Maximum Adverse Excursion R */
+            maximum_adverse_excursion_r: string | null;
+            /** Maximum Favorable Excursion Percent */
+            maximum_favorable_excursion_percent: string | null;
+            /** Maximum Favorable Excursion R */
+            maximum_favorable_excursion_r: string | null;
+            /** One R Touched */
+            one_r_touched: boolean | null;
+            /** Planned Stop Price */
+            planned_stop_price: string | null;
+            /** Planned Stop Touched */
+            planned_stop_touched: boolean | null;
+            /** Reason Codes */
+            reason_codes: ("EXTERNAL_POSITION_DISPOSITION" | "NO_ATTRIBUTED_ENTRY" | "TRADE_NOT_CLOSED" | "STRATEGY_ATTRIBUTION_INCOMPLETE" | "FILL_TIMES_INCOMPLETE" | "DIRECTION_UNKNOWN" | "AVERAGE_ENTRY_PRICE_UNKNOWN" | "FIRST_REDUCTION_UNKNOWN" | "FILL_SEQUENCE_INVALID" | "NO_COMPLETE_HOLDING_BAR" | "INTERVAL_TOO_FINE" | "INITIAL_RISK_UNKNOWN" | "MARKET_WINDOW_COVERAGE_MISMATCH" | "MARKET_WINDOW_NOT_CLOSED")[];
+            /** Review Id */
+            review_id: string;
+            /** Review Version */
+            review_version: number;
+            /**
+             * Threshold Sequence
+             * @enum {string}
+             */
+            threshold_sequence: "ONE_R_BEFORE_STOP" | "STOP_BEFORE_ONE_R" | "SAME_BAR_AMBIGUOUS" | "ONE_R_ONLY" | "STOP_ONLY" | "NEITHER" | "UNKNOWN";
+            /** Two R Touched */
+            two_r_touched: boolean | null;
+            /** Worst Adverse Bar Open At */
+            worst_adverse_bar_open_at: string | null;
+            /** Worst Adverse Price */
+            worst_adverse_price: string | null;
+            /** Worst Directional Move Percent */
+            worst_directional_move_percent: string | null;
+        };
         /** ReviewRefreshPayload */
         ReviewRefreshPayload: {
             /** Expected Version */
@@ -2790,6 +3533,300 @@ export interface components {
          * @enum {string}
          */
         ReviewRevisionReason: "INITIAL_DERIVATION" | "AUTHORITATIVE_FACTS_CHANGED" | "OWNER_EVALUATION_CHANGED";
+        /** ReviewSequenceEvidenceResponse */
+        ReviewSequenceEvidenceResponse: {
+            /**
+             * Capital Scaling Authority
+             * @constant
+             */
+            capital_scaling_authority: false;
+            /** Eligible Trade Count */
+            eligible_trade_count: number;
+            /** Excluded Review Count */
+            excluded_review_count: number;
+            /** Exclusions */
+            exclusions: {
+                [key: string]: number;
+            };
+            /** Limitations */
+            limitations: string[];
+            metrics: components["schemas"]["ReviewSequenceMetricsResponse"];
+            price_path: components["schemas"]["ReviewSequencePricePathSummaryResponse"] | null;
+            /** Range End */
+            range_end: string | null;
+            /** Range Start */
+            range_start: string | null;
+            /**
+             * Scope
+             * @enum {string}
+             */
+            scope: "ACCOUNT_RESULTS" | "PROFIT_SEEKING";
+            /** Segments */
+            segments: components["schemas"]["ReviewSequenceSegmentResponse"][];
+            /**
+             * Source
+             * @constant
+             */
+            source: "CURRENT_LATEST_REVIEWS";
+            /** Source Cutoff */
+            source_cutoff: string | null;
+            /** Source Review Count */
+            source_review_count: number;
+            /** Trades */
+            trades: components["schemas"]["ReviewSequenceTradeResponse"][];
+        };
+        /** ReviewSequenceMetricsResponse */
+        ReviewSequenceMetricsResponse: {
+            /** Best Win Segment Index */
+            best_win_segment_index: number | null;
+            /** Commission */
+            commission: string;
+            /** Current Segment Index */
+            current_segment_index: number | null;
+            /** Flat */
+            flat: number;
+            /** Gross Loss */
+            gross_loss: string;
+            /** Gross Profit */
+            gross_profit: string;
+            /** Largest Loss Share Percent */
+            largest_loss_share_percent: string | null;
+            /** Longest Loss Segment Index */
+            longest_loss_segment_index: number | null;
+            /** Longest Win Segment Index */
+            longest_win_segment_index: number | null;
+            /** Losses */
+            losses: number;
+            /** Maximum Drawdown */
+            maximum_drawdown: string;
+            /** Maximum Drawdown Peak At */
+            maximum_drawdown_peak_at: string | null;
+            /** Maximum Drawdown Peak Review Id */
+            maximum_drawdown_peak_review_id: string | null;
+            /** Maximum Drawdown Trough At */
+            maximum_drawdown_trough_at: string | null;
+            /** Maximum Drawdown Trough Review Id */
+            maximum_drawdown_trough_review_id: string | null;
+            /** Net Pnl */
+            net_pnl: string;
+            /** Net Pnl Without Top Losses */
+            net_pnl_without_top_losses: string | null;
+            /** Net Pnl Without Worst Trade */
+            net_pnl_without_worst_trade: string | null;
+            /** Notional Return Percent */
+            notional_return_percent: string | null;
+            /** Profit Factor */
+            profit_factor: string | null;
+            /** Top Loss Count */
+            top_loss_count: number;
+            /** Top Loss Share Percent */
+            top_loss_share_percent: string | null;
+            /** Top Loss Total */
+            top_loss_total: string | null;
+            /** Total Entry Notional */
+            total_entry_notional: string | null;
+            /** Trade Count */
+            trade_count: number;
+            /** Wins */
+            wins: number;
+            /** Worst Loss Segment Index */
+            worst_loss_segment_index: number | null;
+            /** Worst Trade Net Pnl */
+            worst_trade_net_pnl: string | null;
+            /** Worst Trade Review Id */
+            worst_trade_review_id: string | null;
+        };
+        /** ReviewSequencePricePathStatisticsResponse */
+        ReviewSequencePricePathStatisticsResponse: {
+            /** Available Count */
+            available_count: number;
+            /** Ever Favorable Count */
+            ever_favorable_count: number;
+            /** First Complete Bar Favorable Count */
+            first_complete_bar_favorable_count: number;
+            /**
+             * Interval
+             * @enum {string}
+             */
+            interval: "1m" | "5m" | "15m" | "1h" | "4h" | "1d";
+            /** Market Source Cutoff */
+            market_source_cutoff: string | null;
+            /** Median Mae Percent */
+            median_mae_percent: string | null;
+            /** Median Mae R */
+            median_mae_r: string | null;
+            /** Median Mfe Percent */
+            median_mfe_percent: string | null;
+            /** Median Mfe R */
+            median_mfe_r: string | null;
+            /** Never Favorable Count */
+            never_favorable_count: number;
+            /** Not Applicable Count */
+            not_applicable_count: number;
+            /** Reason Counts */
+            reason_counts: {
+                [key: string]: number;
+            };
+            /**
+             * Requested
+             * @constant
+             */
+            requested: true;
+            /** Threshold Counts */
+            threshold_counts: {
+                [key: string]: number;
+            };
+            /** Trade Count */
+            trade_count: number;
+            /** Unknown Count */
+            unknown_count: number;
+        };
+        /** ReviewSequencePricePathSummaryResponse */
+        ReviewSequencePricePathSummaryResponse: {
+            /** Available Count */
+            available_count: number;
+            /** By Result */
+            by_result: {
+                [key: string]: components["schemas"]["ReviewSequencePricePathStatisticsResponse"];
+            };
+            /** Ever Favorable Count */
+            ever_favorable_count: number;
+            /** First Complete Bar Favorable Count */
+            first_complete_bar_favorable_count: number;
+            /**
+             * Interval
+             * @enum {string}
+             */
+            interval: "1m" | "5m" | "15m" | "1h" | "4h" | "1d";
+            /** Market Source Cutoff */
+            market_source_cutoff: string | null;
+            /** Median Mae Percent */
+            median_mae_percent: string | null;
+            /** Median Mae R */
+            median_mae_r: string | null;
+            /** Median Mfe Percent */
+            median_mfe_percent: string | null;
+            /** Median Mfe R */
+            median_mfe_r: string | null;
+            /** Never Favorable Count */
+            never_favorable_count: number;
+            /** Not Applicable Count */
+            not_applicable_count: number;
+            /** Reason Counts */
+            reason_counts: {
+                [key: string]: number;
+            };
+            /**
+             * Requested
+             * @constant
+             */
+            requested: true;
+            /** Threshold Counts */
+            threshold_counts: {
+                [key: string]: number;
+            };
+            /** Trade Count */
+            trade_count: number;
+            /** Unknown Count */
+            unknown_count: number;
+        };
+        /** ReviewSequenceReviewRefResponse */
+        ReviewSequenceReviewRefResponse: {
+            /** Review Id */
+            review_id: string;
+            /** Review Version */
+            review_version: number;
+        };
+        /** ReviewSequenceSegmentResponse */
+        ReviewSequenceSegmentResponse: {
+            /** Commission */
+            commission: string;
+            /** End At */
+            end_at: string;
+            /** Net Pnl */
+            net_pnl: string;
+            /** Notional Return Percent */
+            notional_return_percent: string | null;
+            price_path: components["schemas"]["ReviewSequencePricePathStatisticsResponse"] | null;
+            /**
+             * Result Kind
+             * @enum {string}
+             */
+            result_kind: "WIN" | "LOSS" | "FLAT";
+            /** Review Refs */
+            review_refs: components["schemas"]["ReviewSequenceReviewRefResponse"][];
+            /** Segment Index */
+            segment_index: number;
+            /** Start At */
+            start_at: string;
+            /** Total Entry Notional */
+            total_entry_notional: string | null;
+            /** Trade Count */
+            trade_count: number;
+        };
+        /** ReviewSequenceTradePricePathResponse */
+        ReviewSequenceTradePricePathResponse: {
+            /** Ever Favorable On Complete Bars */
+            ever_favorable_on_complete_bars: boolean | null;
+            /**
+             * Evidence Status
+             * @enum {string}
+             */
+            evidence_status: "AVAILABLE" | "NOT_APPLICABLE" | "UNKNOWN";
+            /** First Complete Bar Favorable */
+            first_complete_bar_favorable: boolean | null;
+            /** Maximum Adverse Excursion Percent */
+            maximum_adverse_excursion_percent: string | null;
+            /** Maximum Adverse Excursion R */
+            maximum_adverse_excursion_r: string | null;
+            /** Maximum Favorable Excursion Percent */
+            maximum_favorable_excursion_percent: string | null;
+            /** Maximum Favorable Excursion R */
+            maximum_favorable_excursion_r: string | null;
+            /** Reason Codes */
+            reason_codes: string[];
+            /**
+             * Threshold Sequence
+             * @enum {string}
+             */
+            threshold_sequence: "ONE_R_BEFORE_STOP" | "STOP_BEFORE_ONE_R" | "SAME_BAR_AMBIGUOUS" | "ONE_R_ONLY" | "STOP_ONLY" | "NEITHER" | "UNKNOWN";
+        };
+        /** ReviewSequenceTradeResponse */
+        ReviewSequenceTradeResponse: {
+            /** Classification */
+            classification: string | null;
+            /** Closed At */
+            closed_at: string;
+            /** Commission */
+            commission: string;
+            /** Cumulative Net Pnl */
+            cumulative_net_pnl: string;
+            direction: components["schemas"]["Direction"] | null;
+            /** Drawdown From Peak */
+            drawdown_from_peak: string;
+            /** Entry Notional */
+            entry_notional: string | null;
+            /** Instrument Ref */
+            instrument_ref: string | null;
+            /** Intent */
+            intent: string | null;
+            /** Net Pnl */
+            net_pnl: string;
+            /** Notional Return Percent */
+            notional_return_percent: string | null;
+            price_path: components["schemas"]["ReviewSequenceTradePricePathResponse"] | null;
+            /**
+             * Result Kind
+             * @enum {string}
+             */
+            result_kind: "WIN" | "LOSS" | "FLAT";
+            /** Review Id */
+            review_id: string;
+            /** Review Version */
+            review_version: number;
+            /** Segment Index */
+            segment_index: number;
+        };
         /**
          * ReviewStatus
          * @enum {string}
@@ -3181,7 +4218,7 @@ export interface components {
             created_at: string | null;
             creator_kind: components["schemas"]["PlanCreatorKind"] | null;
             decision_basis: components["schemas"]["DraftDecisionBasis"];
-            decision_context: components["schemas"]["PlanDecisionContext"] | null;
+            decision_context: components["schemas"]["PlanDecisionContext-Output"] | null;
             direction: components["schemas"]["Direction"];
             /** Environment Id */
             environment_id: string;
@@ -3242,7 +4279,7 @@ export interface components {
             creator_kind: components["schemas"]["PlanCreatorKind"] | null;
             /** Decision Basis */
             decision_basis: components["schemas"]["FixedStrategyPlanBasis"] | components["schemas"]["FixedDirectExecutionBasis"];
-            decision_context: components["schemas"]["PlanDecisionContext"] | null;
+            decision_context: components["schemas"]["PlanDecisionContext-Output"] | null;
             direction: components["schemas"]["Direction"];
             /** Environment Id */
             environment_id: string;
@@ -3350,7 +4387,10 @@ export interface components {
         VenueTimeInForce: "GTC" | "GTD" | "IOC" | "FOK";
     };
     responses: never;
-    parameters: never;
+    parameters: {
+        /** @description Required with value MONITOR for a native loopback Monitor mutation; browser workbench requests use their local Origin and CSRF token instead. */
+        HalphaProgrammaticCaller: "MONITOR";
+    };
     requestBodies: never;
     headers: never;
     pathItems: never;
@@ -3360,7 +4400,10 @@ export interface operations {
     account_position_operation_preview_api_v1_account_position_operations_preview_post: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Required with value MONITOR for a native loopback Monitor mutation; browser workbench requests use their local Origin and CSRF token instead. */
+                "X-Halpha-Caller"?: components["parameters"]["HalphaProgrammaticCaller"];
+            };
             path?: never;
             cookie?: never;
         };
@@ -3415,6 +4458,8 @@ export interface operations {
             query?: never;
             header: {
                 "Idempotency-Key": string;
+                /** @description Required with value MONITOR for a native loopback Monitor mutation; browser workbench requests use their local Origin and CSRF token instead. */
+                "X-Halpha-Caller"?: components["parameters"]["HalphaProgrammaticCaller"];
             };
             path?: never;
             cookie?: never;
@@ -3756,6 +4801,39 @@ export interface operations {
             };
         };
     };
+    decision_evidence_preview_api_v1_decision_evidence_preview_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DecisionEvidencePreviewPayload"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DecisionEvidenceResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     execution_fee_evidence_api_v1_execution_fee_evidence_get: {
         parameters: {
             query?: {
@@ -3857,7 +4935,10 @@ export interface operations {
     order_schedule_preview_api_v1_order_schedules_preview_post: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Required with value MONITOR for a native loopback Monitor mutation; browser workbench requests use their local Origin and CSRF token instead. */
+                "X-Halpha-Caller"?: components["parameters"]["HalphaProgrammaticCaller"];
+            };
             path?: never;
             cookie?: never;
         };
@@ -3941,7 +5022,10 @@ export interface operations {
     activation_preview_api_v1_plan_versions__plan_version_id__activation_preview_post: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Required with value MONITOR for a native loopback Monitor mutation; browser workbench requests use their local Origin and CSRF token instead. */
+                "X-Halpha-Caller"?: components["parameters"]["HalphaProgrammaticCaller"];
+            };
             path: {
                 plan_version_id: string;
             };
@@ -3994,6 +5078,8 @@ export interface operations {
             query?: never;
             header: {
                 "Idempotency-Key": string;
+                /** @description Required with value MONITOR for a native loopback Monitor mutation; browser workbench requests use their local Origin and CSRF token instead. */
+                "X-Halpha-Caller"?: components["parameters"]["HalphaProgrammaticCaller"];
             };
             path?: never;
             cookie?: never;
@@ -4060,6 +5146,8 @@ export interface operations {
             query?: never;
             header: {
                 "If-Match": string;
+                /** @description Required with value MONITOR for a native loopback Monitor mutation; browser workbench requests use their local Origin and CSRF token instead. */
+                "X-Halpha-Caller"?: components["parameters"]["HalphaProgrammaticCaller"];
             };
             path: {
                 plan_id: string;
@@ -4097,6 +5185,8 @@ export interface operations {
             query?: never;
             header: {
                 "If-Match": string;
+                /** @description Required with value MONITOR for a native loopback Monitor mutation; browser workbench requests use their local Origin and CSRF token instead. */
+                "X-Halpha-Caller"?: components["parameters"]["HalphaProgrammaticCaller"];
             };
             path: {
                 plan_id: string;
@@ -4131,6 +5221,8 @@ export interface operations {
             header: {
                 "Idempotency-Key": string;
                 "If-Match": string;
+                /** @description Required with value MONITOR for a native loopback Monitor mutation; browser workbench requests use their local Origin and CSRF token instead. */
+                "X-Halpha-Caller"?: components["parameters"]["HalphaProgrammaticCaller"];
             };
             path: {
                 plan_id: string;
@@ -4146,6 +5238,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["TradePlanVersion"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    export_playbook_qualification_api_v1_playbook_qualification_export_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PlaybookQualificationExportPayload"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlaybookQualificationExportResponse"];
                 };
             };
             /** @description Validation Error */
@@ -4177,6 +5302,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ReceiptResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    review_sequence_evidence_api_v1_review_sequence_evidence_get: {
+        parameters: {
+            query?: {
+                scope?: "ACCOUNT_RESULTS" | "PROFIT_SEEKING";
+                range_start?: string | null;
+                range_end?: string | null;
+                include_price_path?: boolean;
+                interval?: "1m" | "5m" | "15m" | "1h" | "4h" | "1d";
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReviewSequenceEvidenceResponse"];
                 };
             };
             /** @description Validation Error */
@@ -4298,6 +5458,40 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ReviewCompletionResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    review_price_path_evidence_api_v1_reviews__review_id__price_path_evidence_get: {
+        parameters: {
+            query?: {
+                review_version?: number | null;
+                interval?: "1m" | "5m" | "15m" | "1h" | "4h" | "1d";
+            };
+            header?: never;
+            path: {
+                review_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReviewPricePathEvidenceResponse"];
                 };
             };
             /** @description Validation Error */

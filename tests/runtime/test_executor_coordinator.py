@@ -14,6 +14,7 @@ from halpha.executor.coordinator import (
     HalphaCoordinator,
     OrderScheduleCapRejected,
     _aggregate_protection_projection,
+    _is_frozen_planned_scale_in_action,
     _protection_projection_state,
     _submission_block_reason,
 )
@@ -1778,8 +1779,12 @@ def test_order_schedule_establishes_all_local_actions_in_one_transaction(
         list_for_activation=lambda _activation_id: ()
     )
     coordinator._capital = SimpleNamespace(
-        check_current_action=lambda _check: SimpleNamespace(accepted=True)
+        check_current_action=lambda _check: SimpleNamespace(accepted=True),
+        new_risk_discipline_status=lambda **_kwargs: SimpleNamespace(
+            new_risk_allowed=True
+        ),
     )
+    coordinator._new_risk_discipline_policy = object()
     coordinator._environment_id = activation.environment_id
     coordinator._environment_kind = activation.environment_kind.value
     coordinator._venue_ref = BINANCE_USDM_VENUE_REF
@@ -1850,8 +1855,12 @@ def test_market_schedule_persists_exact_runtime_quantity_adjustment() -> None:
         list_for_activation=lambda _activation_id: ()
     )
     coordinator._capital = SimpleNamespace(
-        check_current_action=lambda _check: SimpleNamespace(accepted=True)
+        check_current_action=lambda _check: SimpleNamespace(accepted=True),
+        new_risk_discipline_status=lambda **_kwargs: SimpleNamespace(
+            new_risk_allowed=True
+        ),
     )
+    coordinator._new_risk_discipline_policy = object()
     coordinator._environment_id = activation.environment_id
     coordinator._environment_kind = activation.environment_kind.value
     coordinator._venue_ref = BINANCE_USDM_VENUE_REF
@@ -3362,8 +3371,12 @@ def test_live_gate_closing_after_submitting_records_not_submitted_without_venue_
         )
     )
     coordinator._capital = SimpleNamespace(
-        check_current_action=lambda _check: SimpleNamespace(accepted=True)
+        check_current_action=lambda _check: SimpleNamespace(accepted=True),
+        new_risk_discipline_status=lambda **_kwargs: SimpleNamespace(
+            new_risk_allowed=True
+        ),
     )
+    coordinator._new_risk_discipline_policy = object()
     coordinator._execution = ExecutionService()
     coordinator._gate = SimpleNamespace(
         authorize_committed_submission=lambda *_args, **_kwargs: pytest.fail(
@@ -3387,6 +3400,170 @@ def test_live_gate_closing_after_submitting_records_not_submitted_without_venue_
     assert result.venue_called is False
     assert result.reason_code == "RUNTIME_REAL_WRITE_GATE_CLOSED"
     assert result.execution_action.state is ExecutionActionState.NOT_SUBMITTED
+
+
+def test_final_dispatch_rejects_risk_increase_when_account_discipline_changes() -> None:
+    observed_at = datetime(2026, 7, 18, 13, 6, tzinfo=UTC)
+    action = SimpleNamespace(
+        execution_action_id="action-discipline-blocked",
+        environment_id="demo-main",
+        environment_kind=EnvironmentKind.DEMO,
+        authority_class=AuthorityClass.DEMO_VALIDATION,
+        activation_id="activation-1",
+        account_ref="demo-owner",
+        action_kind=ExecutionActionKind.ENTRY,
+        action_class=RiskClass.RISK_INCREASING,
+        state=ExecutionActionState.READY,
+        action_terms={
+            "instrument_ref": "BTCUSDT-PERP",
+            "action_profile": "ENTRY_MARKET",
+            "quantity": "0.001",
+            "direction": "LONG",
+        },
+    )
+    action_check = SimpleNamespace(
+        environment_id="demo-main",
+        environment_kind=EnvironmentKind.DEMO,
+        authority_class=AuthorityClass.DEMO_VALIDATION,
+        activation_id="activation-1",
+        account_ref="demo-owner",
+        instrument_ref="BTCUSDT-PERP",
+        action_profile="ENTRY_MARKET",
+        risk_class=RiskClass.RISK_INCREASING,
+        quantized_quantity="0.001",
+    )
+    records: list[tuple[str, str]] = []
+    coordinator = object.__new__(HalphaCoordinator)
+    coordinator._environment_kind = "DEMO"
+    coordinator._connection = SimpleNamespace(transaction=lambda: nullcontext())
+    coordinator._action_repository = SimpleNamespace(get=lambda *_args, **_kwargs: action)
+    coordinator._planning = SimpleNamespace(
+        get_activation=lambda *_args, **_kwargs: SimpleNamespace(
+            activation_id="activation-1",
+            environment_id="demo-main",
+            account_ref="demo-owner",
+            instrument_ref="BTCUSDT-PERP",
+            direction=Direction.LONG,
+            lifecycle=PlanLifecycle.RUNNING,
+            run_state=RunState.ACTIVE,
+        )
+    )
+    coordinator._capital = SimpleNamespace(
+        check_current_action=lambda _check: SimpleNamespace(accepted=True),
+        new_risk_discipline_status=lambda **kwargs: (
+            assert_discipline_runtime_check(kwargs)
+        ),
+    )
+    coordinator._new_risk_discipline_policy = "same-policy"
+    coordinator._execution = SimpleNamespace(
+        record_definitely_not_submitted=lambda action_id, **kwargs: (
+            records.append((action_id, kwargs["reason_code"]))
+            or SimpleNamespace(
+                **{**vars(action), "state": ExecutionActionState.NOT_SUBMITTED}
+            )
+        ),
+        prepare_submission=lambda *_args, **_kwargs: pytest.fail(
+            "blocked account discipline must not prepare a venue submission"
+        ),
+    )
+    result = coordinator._process_execution_action_serialized(
+        action.execution_action_id,
+        action_check=action_check,
+        request_payload={},
+        observed_at=observed_at,
+    )
+
+    assert records == [(action.execution_action_id, "NEW_RISK_DAILY_LOSS_STOP_REACHED")]
+    assert result.venue_called is False
+    assert result.reason_code == "NEW_RISK_DAILY_LOSS_STOP_REACHED"
+
+
+def assert_discipline_runtime_check(kwargs: dict[str, object]) -> SimpleNamespace:
+    assert kwargs["account_ref"] == "demo-owner"
+    assert kwargs["policy"] == "same-policy"
+    assert kwargs["entry_instrument_ref"] == "BTCUSDT-PERP"
+    assert kwargs["entry_direction"] == "LONG"
+    assert kwargs["is_frozen_scale_in"] is False
+    assert kwargs["lock"] is True
+    return SimpleNamespace(
+        new_risk_allowed=False,
+        blocker_codes=("NEW_RISK_DAILY_LOSS_STOP_REACHED",),
+    )
+
+
+def test_frozen_multi_leg_scale_in_exception_requires_exact_original_action() -> None:
+    activation, legs, _entry_valid_until = _direct_schedule_fixture(level_count=2)
+    activation = activation.model_copy(update={"has_entry_fill": True})
+    original = legs[1]
+    action = SimpleNamespace(
+        execution_action_id=original.execution_action_id,
+        source_identity=original.source_identity,
+        client_order_id=original.client_order_id,
+        action_kind=ExecutionActionKind.ENTRY,
+        action_terms={
+            "instrument_ref": original.proposed_action.instrument_ref,
+            "direction": original.proposed_action.direction.value,
+            "action_profile": original.proposed_action.action_profile,
+            "order_type": original.proposed_action.order_type,
+            "price": original.proposed_action.price,
+            "close_position": original.proposed_action.close_position,
+            "reduce_only": original.proposed_action.reduce_only,
+            "causation_ref": original.proposed_action.causation_ref,
+            "execution_context": original.proposed_action.execution_context,
+        },
+    )
+    retry = materialize_direct_schedule_retry(
+        activation,
+        original,
+        attempt_index=1,
+    )
+    retry_action = SimpleNamespace(
+        execution_action_id=retry.execution_action_id,
+        source_identity=retry.source_identity,
+        client_order_id=retry.client_order_id,
+        action_kind=ExecutionActionKind.ENTRY,
+        action_terms={
+            "instrument_ref": retry.proposed_action.instrument_ref,
+            "direction": retry.proposed_action.direction.value,
+            "action_profile": retry.proposed_action.action_profile,
+            "order_type": retry.proposed_action.order_type,
+            "price": retry.proposed_action.price,
+            "close_position": retry.proposed_action.close_position,
+            "reduce_only": retry.proposed_action.reduce_only,
+            "causation_ref": retry.proposed_action.causation_ref,
+            "execution_context": retry.proposed_action.execution_context,
+        },
+    )
+
+    assert _is_frozen_planned_scale_in_action(action, activation) is True
+    assert _is_frozen_planned_scale_in_action(retry_action, activation) is False
+
+
+def test_single_leg_or_unfilled_schedule_cannot_use_scale_in_exception() -> None:
+    single_activation, single_legs, _entry_valid_until = _direct_schedule_fixture(
+        market=True,
+    )
+    single_activation = single_activation.model_copy(update={"has_entry_fill": True})
+    original = single_legs[0]
+    action = SimpleNamespace(
+        execution_action_id=original.execution_action_id,
+        source_identity=original.source_identity,
+        client_order_id=original.client_order_id,
+        action_kind=ExecutionActionKind.ENTRY,
+        action_terms={
+            "instrument_ref": original.proposed_action.instrument_ref,
+            "direction": original.proposed_action.direction.value,
+            "action_profile": original.proposed_action.action_profile,
+            "order_type": original.proposed_action.order_type,
+            "price": original.proposed_action.price,
+            "close_position": original.proposed_action.close_position,
+            "reduce_only": original.proposed_action.reduce_only,
+            "causation_ref": original.proposed_action.causation_ref,
+            "execution_context": original.proposed_action.execution_context,
+        },
+    )
+
+    assert _is_frozen_planned_scale_in_action(action, single_activation) is False
 
 
 @pytest.mark.parametrize(

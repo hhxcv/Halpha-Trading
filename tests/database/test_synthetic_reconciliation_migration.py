@@ -116,9 +116,9 @@ def test_exact_synthetic_order_and_matching_position_append_correction(
     monkeypatch,
 ) -> None:
     revision = _revision_module()
-    started_at = datetime(2026, 7, 26, 15, 49, 34, tzinfo=UTC)
-    client_order_id = "6d2a239b-b45c-4491-823c-566e9b86cb98"
-    venue_order_ref = "66a18321-d8e1-5163-8eb2-5fc4de2e85df"
+    started_at = datetime(2030, 1, 15, 0, 0, tzinfo=UTC)
+    client_order_id = "00000000-0000-4000-8000-000000000101"
+    venue_order_ref = "00000000-0000-4000-8000-000000000201"
     fact_digest = "1" * 64
     stop = {
         "stop_state_version_id": revision._SYNTHETIC_STOP_ID,
@@ -194,7 +194,7 @@ def test_non_uuid_venue_order_is_not_treated_as_framework_synthetic(
     monkeypatch,
 ) -> None:
     revision = _revision_module()
-    started_at = datetime(2026, 7, 26, 15, 49, 34, tzinfo=UTC)
+    started_at = datetime(2030, 1, 15, 0, 0, tzinfo=UTC)
     fact_digest = "1" * 64
     stop = {
         "stop_state_version_id": revision._SYNTHETIC_STOP_ID,
@@ -214,13 +214,13 @@ def test_non_uuid_venue_order_is_not_treated_as_framework_synthetic(
     }
     accepted = {
         "venue_fact_id": "11111111-1111-1111-1111-111111111111",
-        "source_object_id": "6d2a239b-b45c-4491-823c-566e9b86cb98",
+        "source_object_id": "00000000-0000-4000-8000-000000000101",
         "content_digest": fact_digest,
         "payload": {
             "event_type": "OrderAccepted",
             "status": "WORKING",
             "reconciliation": True,
-            "venue_order_ref": "24066272636",
+            "venue_order_ref": "synthetic-non-uuid-order",
         },
     }
     results = iter((_Result(one=stop), _Result(all_rows=(accepted,))))
@@ -238,7 +238,7 @@ def test_periodic_missing_fill_projection_appends_exact_correction(
     monkeypatch,
 ) -> None:
     revision = _missing_fill_revision_module()
-    started_at = datetime(2026, 7, 26, 15, 54, 40, tzinfo=UTC)
+    started_at = datetime(2030, 1, 15, 0, 5, tzinfo=UTC)
     evidence = {
         "stop_state_version_id": revision._SYNTHETIC_STOP_ID,
         "environment_id": revision._DEMO_ENVIRONMENT_ID,
@@ -252,7 +252,7 @@ def test_periodic_missing_fill_projection_appends_exact_correction(
         "content_digest": "3" * 64,
         "release_rules": {"NEW_RISK": {"user_releasable": False}},
         "accepted_fact_id": "11111111-1111-1111-1111-111111111111",
-        "client_order_id": "e956750a-7241-4f23-a898-12f4f906b16b",
+        "client_order_id": "00000000-0000-4000-8000-000000000102",
         "venue_order_ref": "22222222-2222-2222-2222-222222222222",
         "fill_fact_id": "33333333-3333-3333-3333-333333333333",
         "position_fact_id": "44444444-4444-4444-4444-444444444444",
@@ -295,18 +295,16 @@ def test_periodic_missing_fill_projection_keeps_stop_when_position_differs(
         "account_ref": "binance-usdm-demo-owner-primary",
         "version": 5,
         "stopped_categories": ["NEW_RISK"],
-        "started_at": datetime(2026, 7, 26, 15, 54, 40, tzinfo=UTC),
+        "started_at": datetime(2030, 1, 15, 0, 5, tzinfo=UTC),
         "loss_latch_digest": None,
         "content_digest": "3" * 64,
         "release_rules": {"NEW_RISK": {"user_releasable": False}},
         "accepted_fact_id": "11111111-1111-1111-1111-111111111111",
-        "client_order_id": "e956750a-7241-4f23-a898-12f4f906b16b",
+        "client_order_id": "00000000-0000-4000-8000-000000000102",
         "venue_order_ref": "22222222-2222-2222-2222-222222222222",
         "fill_fact_id": "33333333-3333-3333-3333-333333333333",
         "position_fact_id": "44444444-4444-4444-4444-444444444444",
-        "position_received_at": datetime(
-            2026, 7, 26, 15, 54, 41, tzinfo=UTC
-        ),
+        "position_received_at": datetime(2030, 1, 15, 0, 5, 1, tzinfo=UTC),
         "position_payload": {
             "position_quantity": "0.0020",
             "attributed_account_position_quantity": "0.0015",
@@ -332,7 +330,7 @@ def test_owned_fill_replay_appends_correction_only_after_exact_attribution(
     monkeypatch,
 ) -> None:
     revision = _owned_fill_replay_revision_module()
-    started_at = datetime(2026, 7, 26, 15, 54, 40, tzinfo=UTC)
+    started_at = datetime(2030, 1, 15, 0, 5, tzinfo=UTC)
     evidence = {
         "stop_state_version_id": revision._SYNTHETIC_STOP_ID,
         "environment_id": revision._DEMO_ENVIRONMENT_ID,
@@ -349,16 +347,16 @@ def test_owned_fill_replay_appends_correction_only_after_exact_attribution(
             "11111111-1111-1111-1111-111111111111"
         ),
         "synthetic_client_order_id": (
-            "e956750a-7241-4f23-a898-12f4f906b16b"
+            "00000000-0000-4000-8000-000000000102"
         ),
-        "venue_order_ref": "24066272636",
+        "venue_order_ref": "00000000-0000-4000-8000-000000000201",
         "synthetic_fill_fact_id": (
             "22222222-2222-2222-2222-222222222222"
         ),
         "owned_order_fact_id": (
             "33333333-3333-3333-3333-333333333333"
         ),
-        "owned_action_ref": "7ae942e7-a983-5942-bc0b-cf1650f2fc5c",
+        "owned_action_ref": "00000000-0000-4000-8000-000000000104",
         "owned_fill_fact_id": (
             "44444444-4444-4444-4444-444444444444"
         ),
@@ -403,7 +401,7 @@ def test_owned_order_replay_appends_correction_only_after_exact_attribution(
     monkeypatch,
 ) -> None:
     revision = _owned_order_replay_revision_module()
-    started_at = datetime(2026, 7, 26, 16, 24, 34, tzinfo=UTC)
+    started_at = datetime(2030, 1, 15, 0, 35, tzinfo=UTC)
     evidence = {
         "stop_state_version_id": revision._SYNTHETIC_STOP_ID,
         "environment_id": revision._DEMO_ENVIRONMENT_ID,
@@ -419,13 +417,13 @@ def test_owned_order_replay_appends_correction_only_after_exact_attribution(
             "11111111-1111-1111-1111-111111111111"
         ),
         "synthetic_client_order_id": (
-            "8e9296f7-e128-44b8-8a33-74c6a8f8b5d8"
+            "00000000-0000-4000-8000-000000000103"
         ),
-        "venue_order_ref": "24066272636",
+        "venue_order_ref": "00000000-0000-4000-8000-000000000201",
         "owned_order_fact_id": (
             "22222222-2222-2222-2222-222222222222"
         ),
-        "owned_action_ref": "7ae942e7-a983-5942-bc0b-cf1650f2fc5c",
+        "owned_action_ref": "00000000-0000-4000-8000-000000000104",
         "owned_fill_fact_id": (
             "33333333-3333-3333-3333-333333333333"
         ),

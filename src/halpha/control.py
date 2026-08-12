@@ -177,13 +177,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="explicitly start a LIVE_READ_ONLY Executor observation session",
     )
-    start.add_argument("--timeout-seconds", type=float, default=15.0)
+    start.add_argument("--timeout-seconds", type=float, default=60.0)
 
     stop = subparsers.add_parser("stop", help="stop a service")
     stop.add_argument("service", nargs="?", default="product")
     _add_common_arguments(stop)
     stop.add_argument("--force", action="store_true")
     stop.add_argument("--timeout-seconds", type=float, default=30.0)
+
+    autostart = subparsers.add_parser(
+        "autostart",
+        help="enable or disable task-triggered product startup without starting it now",
+    )
+    autostart.add_argument("service", choices=("app", "executor", "product"))
+    autostart.add_argument("setting", choices=("on", "off"))
+    _add_common_arguments(autostart)
     args = parser.parse_args(argv)
     try:
         root = repository_root()
@@ -199,6 +207,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.service,
                 observation_session=args.observation_session,
                 timeout_seconds=args.timeout_seconds,
+            )
+            exit_code = 0
+        elif args.command == "autostart":
+            report = controller.set_autostart(
+                args.service,
+                enabled=args.setting == "on",
             )
             exit_code = 0
         else:

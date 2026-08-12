@@ -827,6 +827,93 @@ def test_product_task_start_and_stop_use_one_controller_and_disable_restart(
     assert executor.Enabled is False
 
 
+def test_product_autostart_changes_task_eligibility_without_running_tasks() -> None:
+    settings = load_settings(EXAMPLE_CONFIG)
+    app = _FakeTask(DEMO_DEPLOYMENT.app_task, 3, enabled=False)
+    executor = _FakeTask(DEMO_DEPLOYMENT.executor_task, 3, enabled=False)
+    task_service = _FakeTaskService(
+        {
+            DEMO_DEPLOYMENT.app_task: app,
+            DEMO_DEPLOYMENT.executor_task: executor,
+        }
+    )
+    controller = RuntimeController(
+        ROOT,
+        settings,
+        EXAMPLE_CONFIG,
+        task_service_factory=lambda: task_service,
+    )
+
+    enabled = controller.set_autostart("product", enabled=True)
+    disabled = controller.set_autostart("product", enabled=False)
+
+    assert enabled["status"] == "AUTOSTART_ENABLED"
+    assert disabled["status"] == "AUTOSTART_DISABLED"
+    assert app.run_calls == executor.run_calls == 0
+    assert app.stop_calls == executor.stop_calls == 0
+    assert app.Enabled is executor.Enabled is False
+
+
+def test_read_only_product_autostart_never_enables_explicit_observation_executor() -> None:
+    settings = load_settings(LIVE_EXAMPLE_CONFIG)
+    app = _FakeTask(
+        LIVE_DEPLOYMENT.app_task,
+        3,
+        enabled=False,
+        config_path=LIVE_EXAMPLE_CONFIG,
+        principal_sid=settings.windows.app_task_sid,
+    )
+    executor = _FakeTask(
+        LIVE_DEPLOYMENT.executor_task,
+        3,
+        enabled=False,
+        config_path=LIVE_EXAMPLE_CONFIG,
+        principal_sid=settings.windows.executor_task_sid,
+    )
+    controller = RuntimeController(
+        ROOT,
+        settings,
+        LIVE_EXAMPLE_CONFIG,
+        task_service_factory=lambda: _FakeTaskService(
+            {
+                LIVE_DEPLOYMENT.app_task: app,
+                LIVE_DEPLOYMENT.executor_task: executor,
+            }
+        ),
+    )
+
+    result = controller.set_autostart("product", enabled=True)
+
+    assert app.Enabled is True
+    assert executor.Enabled is False
+    assert result["results"]["executor"] == {
+        "status": "EXPLICIT_OBSERVATION_SESSION_REQUIRED",
+        "service": "executor",
+        "enabled": False,
+    }
+
+
+def test_product_start_restores_executor_before_waiting_for_app(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings(ROOT / "config/halpha.example.toml")
+    controller = RuntimeController(ROOT, settings, EXAMPLE_CONFIG)
+    calls: list[str] = []
+
+    def start_task(service: str, *, timeout_seconds: float) -> dict[str, object]:
+        calls.append(service)
+        if service == "app":
+            raise RuntimeControlError("SERVICE_LISTENER_TIMEOUT service=app port=8765")
+        return {"status": "STARTED", "service": service}
+
+    monkeypatch.setattr(controller, "_start_task", start_task)
+
+    with pytest.raises(RuntimeControlError, match="SERVICE_LISTENER_TIMEOUT"):
+        controller.start("product", timeout_seconds=0.1)
+
+    assert calls == ["executor", "app"]
+
+
 def test_live_read_only_product_start_does_not_start_executor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

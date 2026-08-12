@@ -18,6 +18,8 @@ from halpha.planning.registry import (
     fixed_decision_basis_runtime_incompatibility,
     strategy_parameter_schema,
     render_strategy_registry,
+    strategy_allowed_plan_intents,
+    strategy_decision_intent_incompatibility,
     validate_parameters,
 )
 from halpha.planning.strategies.one_shot import (
@@ -71,6 +73,18 @@ def test_static_registry_and_schema_are_build_bound() -> None:
         definition.economic_scope["recommended_use"]
         == "EXECUTION_CHAIN_VALIDATION_ONLY"
     )
+    assert definition.economic_scope["allowed_plan_intents"] == ["VALIDATION"]
+    assert strategy_allowed_plan_intents(definition.economic_scope) == frozenset(
+        {"VALIDATION"}
+    )
+    assert strategy_decision_intent_incompatibility(
+        definition.economic_scope,
+        "VALIDATION",
+    ) is None
+    assert strategy_decision_intent_incompatibility(
+        definition.economic_scope,
+        "PROFIT_SEEKING",
+    ) == "STRATEGY_DECISION_INTENT_NOT_QUALIFIED"
     assert definition.economic_scope["evidence_limit"] == (
         "固定短周期规则在费用后的历史开发样本中未取得正期望；"
         "仅用于验证计划、成交、保护和退出链路，不应用于盈利目标。"
@@ -101,6 +115,21 @@ def test_static_registry_and_schema_are_build_bound() -> None:
     assert (ROOT / "src/halpha/planning/strategy_registry.json").read_text(
         encoding="utf-8"
     ) == render_strategy_registry()
+
+
+def test_strategy_definition_cannot_claim_profit_intent_without_positive_evidence() -> None:
+    definition = describe_strategy(ONE_SHOT_STRATEGY_ID)
+    values = definition.model_dump(mode="python")
+    values["economic_scope"] = {
+        **definition.economic_scope,
+        "allowed_plan_intents": ["PROFIT_SEEKING"],
+    }
+
+    with pytest.raises(
+        ValidationError,
+        match="STRATEGY_PROFIT_INTENT_NOT_EVIDENCE_QUALIFIED",
+    ):
+        type(definition).model_validate(values)
 
 
 def test_parameter_validation_is_authoritative_and_exact() -> None:
@@ -211,6 +240,10 @@ def test_one_shot_logic_is_deterministic_and_consumes_only_explicit_state() -> N
         decision_at=now,
         valid_until=now + timedelta(seconds=30),
         confirmation_closes=("121.5", "121.6"),
+        confirmation_close_times=(
+            now - timedelta(minutes=2),
+            now - timedelta(minutes=1),
+        ),
         indicators=snapshot,
         reference_price="121.7",
         reference_source="BACKTEST_LAST_BAR_PROXY",
@@ -240,6 +273,15 @@ def test_one_shot_logic_is_deterministic_and_consumes_only_explicit_state() -> N
     )
     assert first == replay
     assert first.proposal is not None
+    assert first.proposal.entry_risk_context is not None
+    setup = first.proposal.entry_risk_context.setup_evidence
+    assert setup is not None
+    assert setup.mode == "DONCHIAN_BREAKOUT"
+    assert setup.trigger_boundary == snapshot.upper
+    assert setup.confirmation_closes == ("121.5", "121.6")
+    assert setup.confirmation_close_times[-1] == evaluation.source_cutoff
+    assert setup.confirmation_all_beyond_boundary is True
+    assert setup.last_confirmation_within_max_extension is True
     assert first.proposal.proposal_digest == replay.proposal.proposal_digest
     assert consumed.proposal is None
     assert consumed.reason_code == "ENTRY_OPPORTUNITY_CONSUMED"
@@ -263,6 +305,7 @@ def test_demo_immediate_entry_uses_the_same_one_shot_proposal_path() -> None:
         decision_at=now,
         valid_until=now + timedelta(seconds=30),
         confirmation_closes=("110",),
+        confirmation_close_times=(now,),
         indicators=snapshot,
         reference_price="110",
         reference_source="BACKTEST_LAST_BAR_PROXY",
@@ -289,6 +332,12 @@ def test_demo_immediate_entry_uses_the_same_one_shot_proposal_path() -> None:
 
     assert result.proposal is not None
     assert result.proposal.rule_id == "DEMO_ORDER_FLOW_CHECK"
+    assert result.proposal.entry_risk_context is not None
+    assert result.proposal.entry_risk_context.setup_evidence is not None
+    assert (
+        result.proposal.entry_risk_context.setup_evidence.mode
+        == "DEMO_ORDER_FLOW_CHECK"
+    )
     assert result.proposal.reason_code == "DEMO_ORDER_FLOW_CHECK_REQUESTED"
     assert result.proposal.action_profile == "ENTRY_MARKET"
 

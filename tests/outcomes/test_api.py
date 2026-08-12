@@ -6,13 +6,16 @@ import pytest
 from pydantic import SecretStr, ValidationError
 
 from halpha.app.outcomes_api import (
+    DecisionEvidencePreviewPayload,
     OutcomesApiUnavailable,
     PostgreSQLOutcomesApi,
     ReviewCompletionPayload,
     ReviewRefreshPayload,
     StageReviewCreatePayload,
+    summarize_decision_evidence,
     summarize_execution_fee_evidence,
 )
+from halpha.domain_values import content_digest
 
 
 class _Rows:
@@ -31,11 +34,24 @@ class _Connection:
         exit_fact_digest: str = "exit-fill-digest",
         decision_basis_ref: str = "ONE_SHOT_DONCHIAN_ATR_BREAKOUT",
         order_schedule_snapshot: dict[str, object] | None = None,
+        parameter_digest: str = "parameter-digest",
+        decision_context: dict[str, object] | None = None,
     ) -> None:
         self._omit_exit_fact = omit_exit_fact
         self._exit_fact_digest = exit_fact_digest
         self._decision_basis_ref = decision_basis_ref
         self._order_schedule_snapshot = order_schedule_snapshot
+        self._parameter_digest = parameter_digest
+        self._decision_context = decision_context or {
+            "rationale": "A fixed hypothesis.",
+            "evidence": "Current market facts.",
+            "limitations": "Future path unknown.",
+            "intent": "PROFIT_SEEKING",
+            "setup_family": "BREAKOUT_CONTINUATION",
+            "playbook_ref": "BTC_BREAKOUT_V1",
+            "invalidation": "The fixed boundary is breached.",
+            "evidence_cutoff": "2026-07-20T00:00:00+00:00",
+        }
 
     def execute(self, query, parameters):
         if "FROM halpha.venue_fact" in query:
@@ -61,6 +77,10 @@ class _Connection:
                         "2026-07-20T00:30:00+00:00",
                         "AI",
                         self._order_schedule_snapshot,
+                        None,
+                        self._parameter_digest,
+                        self._decision_context,
+                        "30",
                     )
                 ]
             )
@@ -331,6 +351,18 @@ def test_review_projection_adds_compact_trade_context() -> None:
         "plan_creator_kind": "AI",
         "order_schedule_snapshot": None,
         "position_alignment": None,
+        "parameter_digest": "parameter-digest",
+        "decision_context": {
+            "rationale": "A fixed hypothesis.",
+            "evidence": "Current market facts.",
+            "limitations": "Future path unknown.",
+            "intent": "PROFIT_SEEKING",
+            "setup_family": "BREAKOUT_CONTINUATION",
+            "playbook_ref": "BTC_BREAKOUT_V1",
+            "invalidation": "The fixed boundary is breached.",
+            "evidence_cutoff": "2026-07-20T00:00:00+00:00",
+        },
+        "max_allowed_loss": "30",
     }
     assert result[0]["resolved_trade_result"] == {
         "fill_count": 2,
@@ -527,6 +559,240 @@ def test_execution_fee_evidence_rejects_an_empty_sample_window() -> None:
             [],
             instrument_ref="BTCUSDT-PERP",
             sample_limit=0,
+        )
+
+
+def _decision_review(
+    *,
+    review_id: str,
+    net_pnl: str,
+    classification: str = "USABLE_SAMPLE",
+    intent: str = "PROFIT_SEEKING",
+    setup_family: str = "BREAKOUT_CONTINUATION",
+    playbook_ref: str | None = "BTC_BREAKOUT_V1",
+    status: str = "COMPLETE",
+    reliable: bool = True,
+    max_allowed_loss: str | None = "10",
+    fact_cutoff: str = "2026-07-20T01:00:00+00:00",
+) -> dict[str, object]:
+    return {
+        "review_id": review_id,
+        "review_version": 1,
+        "content_digest": content_digest({"review_id": review_id}),
+        "status": status,
+        "fact_cutoff": fact_cutoff,
+        "evaluations": {
+            "owner_conclusion": {
+                "result": classification,
+                "reason": "",
+                "evidence_refs": [],
+            }
+        },
+        "trade_context": {
+            "instrument_ref": "BTCUSDT-PERP",
+            "direction": "LONG",
+            "decision_basis_ref": "DIRECT_EXECUTION@1",
+            "parameter_digest": "parameter-digest",
+            "decision_context": {
+                "intent": intent,
+                "setup_family": setup_family,
+                "playbook_ref": playbook_ref,
+            },
+            "max_allowed_loss": max_allowed_loss,
+        },
+        "resolved_trade_result": {
+            "calculation_complete": reliable,
+            "execution_cost_complete": reliable,
+            "closed": reliable,
+            "strategy_attribution_complete": reliable,
+            "net_pnl": net_pnl,
+            "commission": "2",
+            "entry_notional": "1000",
+        },
+    }
+
+
+def test_decision_evidence_keeps_decision_losses_and_excludes_validation() -> None:
+    result = summarize_decision_evidence(
+        [
+            _decision_review(
+                review_id="win",
+                net_pnl="10",
+                fact_cutoff="2026-07-20T01:00:00+00:00",
+            ),
+            _decision_review(
+                review_id="decision-loss",
+                net_pnl="-30",
+                classification="TRADE_DECISION_ISSUE",
+                fact_cutoff="2026-07-20T02:00:00+00:00",
+            ),
+            _decision_review(
+                review_id="validation-win",
+                net_pnl="100",
+                intent="VALIDATION",
+                classification="VALIDATION_TRADE",
+                fact_cutoff="2026-07-20T03:00:00+00:00",
+            ),
+            _decision_review(
+                review_id="tooling",
+                net_pnl="50",
+                classification="TOOLING_ISSUE",
+                fact_cutoff="2026-07-20T04:00:00+00:00",
+            ),
+        ],
+        instrument_ref="BTCUSDT-PERP",
+        direction="LONG",
+        decision_basis_ref="DIRECT_EXECUTION@1",
+        parameter_digest="parameter-digest",
+        intent="PROFIT_SEEKING",
+        setup_family="BREAKOUT_CONTINUATION",
+        playbook_ref="BTC_BREAKOUT_V1",
+    )
+
+    assert result["matched_review_count"] == 4
+    assert result["comparable_trade_count"] == 2
+    assert result["excluded_review_count"] == 2
+    assert result["exclusions"] == {
+        "TOOLING_ISSUE": 1,
+        "VALIDATION_INTENT": 1,
+    }
+    assert result["evidence_grade"] == "SINGLE_DIGIT_ANECDOTAL"
+    assert result["capital_scaling_authority"] is False
+    assert result["sample_traceability_complete"] is True
+    assert [
+        item["review_id"] for item in result["sample_review_refs"]
+    ] == ["win", "decision-loss"]
+    assert result["sample_identity_digest"] == content_digest(
+        result["sample_review_refs"]
+    )
+    assert result["source_cutoff"] == "2026-07-20T04:00:00+00:00"
+    assert result["metrics"] == {
+        "trade_count": 2,
+        "wins": 1,
+        "losses": 1,
+        "flat": 0,
+        "net_pnl": "-20",
+        "commission": "4",
+        "average_net_pnl": "-10",
+        "gross_profit": "10",
+        "gross_loss": "30",
+        "profit_factor": "0.3333333333333333333333333333",
+        "total_entry_notional": "2000",
+        "notional_return_percent": "-1",
+        "maximum_drawdown": "30",
+        "worst_trade_net_pnl": "-30",
+        "net_pnl_without_worst_trade": "10",
+        "largest_loss_share_percent": "100",
+        "best_trade_net_pnl": "10",
+        "net_pnl_without_best_trade": "-30",
+        "largest_win_share_percent": "100",
+        "longest_winning_streak": 1,
+        "longest_losing_streak": 1,
+        "current_streak_kind": "LOSS",
+        "current_streak_count": 1,
+    }
+    assert result["repeatability"] == {
+        "status": "NOT_READY",
+        "reason_codes": ["MINIMUM_SAMPLE_NOT_MET"],
+        "policy_version": "PLAYBOOK_REPEATABILITY_SCREEN@1",
+        "minimum_trade_count": 30,
+        "minimum_profit_factor": "1.2",
+        "confidence_level_percent": "95",
+        "bootstrap_resamples": 4000,
+        "bootstrap_block_length": 2,
+        "risk_basis_trade_count": 2,
+        "net_r_multiple": "-2",
+        "average_r_multiple": "-1",
+        "net_r_without_best_trade": "-3",
+        "early_segment_trade_count": 1,
+        "early_segment_net_r": "1",
+        "recent_segment_trade_count": 1,
+        "recent_segment_net_r": "-3",
+        "mean_r_lower_confidence_bound": "-1",
+        "live_promotion_authority": False,
+        "capital_scaling_authority": False,
+        "limitations": [
+            "筛查只消费交易前已固定为同一签名的费用后结果；规则身份填写错误会使结论失真。",
+            "移动区块自举只缓解短程连续性影响，不能证明未来市场分布、独立性或资金容量不变。",
+            "通过仅表示证据值得进入下一步评估，不自动允许实盘、加本金或提高单笔风险。",
+        ],
+    }
+
+
+def test_decision_evidence_requires_an_exact_signature_and_reliable_result() -> None:
+    wrong_setup = _decision_review(
+        review_id="wrong-setup",
+        net_pnl="10",
+        setup_family="REVERSAL",
+    )
+    wrong_playbook = _decision_review(
+        review_id="wrong-playbook",
+        net_pnl="10",
+        playbook_ref="BTC_BREAKOUT_V2",
+    )
+    unreliable = _decision_review(
+        review_id="unreliable",
+        net_pnl="10",
+        reliable=False,
+    )
+    result = summarize_decision_evidence(
+        [wrong_setup, wrong_playbook, unreliable],
+        instrument_ref="BTCUSDT-PERP",
+        direction="LONG",
+        decision_basis_ref="DIRECT_EXECUTION@1",
+        parameter_digest="parameter-digest",
+        intent="VALIDATION",
+        setup_family="BREAKOUT_CONTINUATION",
+        playbook_ref="BTC_BREAKOUT_V1",
+    )
+
+    assert result["matched_review_count"] == 1
+    assert result["comparable_trade_count"] == 0
+    assert result["exclusions"] == {"UNRELIABLE_RESULT": 1}
+    assert result["evidence_grade"] == "VALIDATION_INTENT"
+    assert result["metrics"]["net_pnl"] == "0"
+
+
+def test_direct_decision_evidence_excludes_history_without_playbook_identity() -> None:
+    result = summarize_decision_evidence(
+        [
+            _decision_review(
+                review_id="historical-unknown-rule",
+                net_pnl="25",
+                playbook_ref=None,
+            )
+        ],
+        instrument_ref="BTCUSDT-PERP",
+        direction="LONG",
+        decision_basis_ref="DIRECT_EXECUTION@1",
+        parameter_digest="parameter-digest",
+        intent="PROFIT_SEEKING",
+        setup_family="BREAKOUT_CONTINUATION",
+        playbook_ref="BTC_BREAKOUT_V1",
+    )
+
+    assert result["matched_review_count"] == 0
+    assert result["comparable_trade_count"] == 0
+    assert result["playbook_ref"] == "BTC_BREAKOUT_V1"
+
+
+def test_direct_decision_evidence_preview_requires_a_playbook_identity() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="PLAN_DECISION_PLAYBOOK_REF_REQUIRED",
+    ):
+        DecisionEvidencePreviewPayload.model_validate(
+            {
+                "instrument_ref": "BTCUSDT-PERP",
+                "direction": "LONG",
+                "decision_basis": {
+                    "kind": "DIRECT_EXECUTION",
+                    "decision_basis_ref": "DIRECT_EXECUTION@1",
+                    "parameters": {},
+                },
+                "intent": "PROFIT_SEEKING",
+                "setup_family": "BREAKOUT_CONTINUATION",
+            }
         )
 
 

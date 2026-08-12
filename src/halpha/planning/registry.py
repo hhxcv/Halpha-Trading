@@ -28,6 +28,32 @@ DIRECT_EXECUTION_ALLOWED_ACTION_PROFILES = (
     "CANCEL_ORDER",
     "REDUCE_OR_CLOSE_MARKET",
 )
+VALID_STRATEGY_PLAN_INTENTS = frozenset({"PROFIT_SEEKING", "VALIDATION"})
+
+
+def strategy_allowed_plan_intents(economic_scope: dict[str, Any]) -> frozenset[str]:
+    """Read an explicit, closed strategy-to-plan-intent qualification."""
+
+    raw = economic_scope.get("allowed_plan_intents")
+    if not isinstance(raw, (list, tuple)) or not raw:
+        return frozenset()
+    if any(not isinstance(item, str) for item in raw):
+        return frozenset()
+    values = frozenset(raw)
+    if len(values) != len(raw) or not values.issubset(VALID_STRATEGY_PLAN_INTENTS):
+        return frozenset()
+    return values
+
+
+def strategy_decision_intent_incompatibility(
+    economic_scope: dict[str, Any],
+    intent: str | None,
+) -> str | None:
+    """Fail closed unless a strategy explicitly qualifies the requested intent."""
+
+    if intent not in strategy_allowed_plan_intents(economic_scope):
+        return "STRATEGY_DECISION_INTENT_NOT_QUALIFIED"
+    return None
 
 
 class DecisionBasisKind(StrEnum):
@@ -168,6 +194,21 @@ class CodeStrategyDefinition(BaseModel):
             raise ValueError("PLAN_KEY_PARAMETER_DUPLICATED")
         if not set(parameter_keys).issubset(schema_keys):
             raise ValueError("PLAN_KEY_PARAMETER_UNKNOWN")
+        allowed_intents = strategy_allowed_plan_intents(self.economic_scope)
+        if not allowed_intents:
+            raise ValueError("STRATEGY_ALLOWED_PLAN_INTENTS_INVALID")
+        if (
+            "PROFIT_SEEKING" in allowed_intents
+            and self.economic_scope.get("profitability_evidence")
+            != "POSITIVE_EXPECTANCY_SUPPORTED"
+        ):
+            raise ValueError("STRATEGY_PROFIT_INTENT_NOT_EVIDENCE_QUALIFIED")
+        if (
+            self.economic_scope.get("recommended_use")
+            == "EXECUTION_CHAIN_VALIDATION_ONLY"
+            and "PROFIT_SEEKING" in allowed_intents
+        ):
+            raise ValueError("STRATEGY_VALIDATION_ONLY_SCOPE_CONFLICT")
         return self
 
 
@@ -363,6 +404,7 @@ def _definition() -> CodeStrategyDefinition:
             "funding_model": "NOT_MODELED_IN_BACKTEST",
             "profitability_evidence": "NO_POSITIVE_EXPECTANCY_EVIDENCE",
             "recommended_use": "EXECUTION_CHAIN_VALIDATION_ONLY",
+            "allowed_plan_intents": ["VALIDATION"],
             "evidence_limit": (
                 "固定短周期规则在费用后的历史开发样本中未取得正期望；"
                 "仅用于验证计划、成交、保护和退出链路，不应用于盈利目标。"

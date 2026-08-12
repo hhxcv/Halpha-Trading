@@ -77,13 +77,14 @@ def _account_payload() -> dict[str, object]:
         "snapshot_complete": True,
         "read_only": True,
         "management_authority": "NONE",
+        "open_position_count": 1,
         "ordinary_open_order_count": 2,
         "algo_open_order_count": 1,
         "ordinary_open_orders": [
             {
                 "kind": "ORDINARY",
-                "instrument_ref": "SOLUSDT-PERP",
-                "symbol": "SOLUSDT",
+                "instrument_ref": "TESTUSDT-PERP",
+                "symbol": "TESTUSDT",
                 "order_id": "1002",
                 "client_order_id": "external-order-2",
                 "side": "BUY",
@@ -91,14 +92,14 @@ def _account_payload() -> dict[str, object]:
                 "order_type": "LIMIT",
                 "status": "NEW",
                 "time_in_force": "GTC",
-                "price": "151",
+                "price": "98",
                 "trigger_price": "0",
                 "quantity": "1.25",
                 "executed_quantity": "0",
                 "reduce_only": True,
                 "close_position": False,
-                "source_create_time_ms": 1785661200000,
-                "source_update_time_ms": 1785661202000,
+                "source_create_time_ms": 1894680000000,
+                "source_update_time_ms": 1894680002000,
             },
             {
                 "kind": "ORDINARY",
@@ -117,15 +118,15 @@ def _account_payload() -> dict[str, object]:
                 "executed_quantity": "0",
                 "reduce_only": False,
                 "close_position": False,
-                "source_create_time_ms": 1785661190000,
-                "source_update_time_ms": 1785661191000,
+                "source_create_time_ms": 1894679990000,
+                "source_update_time_ms": 1894679991000,
             },
         ],
         "algo_open_orders": [
             {
                 "kind": "ALGO",
-                "instrument_ref": "SOLUSDT-PERP",
-                "symbol": "SOLUSDT",
+                "instrument_ref": "TESTUSDT-PERP",
+                "symbol": "TESTUSDT",
                 "order_id": "2001",
                 "client_order_id": "external-algo-1",
                 "side": "BUY",
@@ -134,39 +135,60 @@ def _account_payload() -> dict[str, object]:
                 "status": "NEW",
                 "time_in_force": "GTC",
                 "price": "0",
-                "trigger_price": "160",
+                "trigger_price": "110",
                 "quantity": "2.5",
                 "executed_quantity": None,
                 "reduce_only": True,
                 "close_position": False,
-                "source_create_time_ms": 1785661201000,
-                "source_update_time_ms": 1785661203000,
+                "source_create_time_ms": 1894680001000,
+                "source_update_time_ms": 1894680003000,
             }
         ],
         "positions": [
             {
-                "instrument_ref": "SOLUSDT-PERP",
-                "symbol": "SOLUSDT",
+                "instrument_ref": "TESTUSDT-PERP",
+                "symbol": "TESTUSDT",
                 "direction": "SHORT",
                 "position_side": "BOTH",
                 "quantity": "-2.5",
                 "absolute_quantity": "2.5",
-                "entry_price": "152.25",
-                "break_even_price": "152.31",
-                "mark_price": "154",
-                "unrealized_pnl": "-4.375",
-                "liquidation_price": "271.8",
-                "leverage": 3,
+                "entry_price": "100",
+                "break_even_price": "100.1",
+                "mark_price": "105",
+                "unrealized_pnl": "-12.5",
+                "liquidation_price": "200",
+                "leverage": 2,
                 "margin_mode": "CROSS",
-                "notional": "-385",
+                "notional": "-262.5",
                 "isolated_margin": "0",
             }
         ],
     }
 
 
+def _account_payload_v3() -> dict[str, object]:
+    return {
+        **_account_payload(),
+        "schema": "HALPHA_BINANCE_USDM_ACCOUNT_SNAPSHOT_V3",
+        "account_summary": {
+            "can_trade": True,
+            "wallet_balance": "1000",
+            "unrealized_pnl": "-12.5",
+            "margin_balance": "987.5",
+            "available_balance": "800",
+            "initial_margin": "187.5",
+            "maintenance_margin": "25",
+            "position_initial_margin": "150",
+            "open_order_initial_margin": "37.5",
+            "cross_wallet_balance": "1000",
+            "cross_unrealized_pnl": "-12.5",
+            "source_update_time_ms": 1894680004000,
+        },
+    }
+
+
 def test_current_account_snapshot_projects_external_position_without_claiming_it() -> None:
-    observed_at = datetime(2026, 8, 2, 4, 0, tzinfo=UTC)
+    observed_at = datetime(2030, 1, 15, 4, 0, tzinfo=UTC)
 
     projected = _project_account_snapshot(
         server_cutoff=observed_at + timedelta(seconds=30),
@@ -184,41 +206,69 @@ def test_current_account_snapshot_projects_external_position_without_claiming_it
         for order in projected["account_orders"]
     ] == [("ALGO", "2001"), ("ORDINARY", "1002"), ("ORDINARY", "1001")]
     assert projected["account_orders"][0]["fact_cutoff"] == (
-        "2026-08-02T04:00:00Z"
+        "2030-01-15T04:00:00Z"
     )
     assert projected["account_positions"] == [
         {
-            "instrument_ref": "SOLUSDT-PERP",
-            "symbol": "SOLUSDT",
+            "instrument_ref": "TESTUSDT-PERP",
+            "symbol": "TESTUSDT",
             "direction": "SHORT",
             "position_side": "BOTH",
             "quantity": "-2.5",
             "absolute_quantity": "2.5",
-            "entry_price": "152.25",
-            "break_even_price": "152.31",
-            "liquidation_price": "271.8",
+            "entry_price": "100",
+            "break_even_price": "100.1",
+            "liquidation_price": "200",
             "isolated_margin": "0",
-            "mark_price": "154",
-            "unrealized_pnl": "-4.375",
-            "leverage": 3,
+            "mark_price": "105",
+            "unrealized_pnl": "-12.5",
+            "leverage": 2,
             "margin_mode": "CROSS",
-            "notional": "-385",
-            "fact_cutoff": "2026-08-02T04:00:00Z",
+            "notional": "-262.5",
+            "fact_cutoff": "2030-01-15T04:00:00Z",
             "snapshot_ref": "snapshot-1",
             "origin": "EXTERNAL_UNMANAGED",
         }
     ]
 
 
+def test_current_v3_snapshot_projects_exchange_account_equity_without_deriving_it() -> None:
+    observed_at = datetime(2030, 1, 15, 4, 0, tzinfo=UTC)
+
+    projected = _project_account_snapshot(
+        server_cutoff=observed_at + timedelta(seconds=30),
+        fact_ref="snapshot-v3",
+        fact_cutoff=observed_at,
+        payload=_account_payload_v3(),
+    )
+
+    assert projected["account_summary"] == {
+        "can_trade": True,
+        "wallet_balance": "1000",
+        "margin_balance": "987.5",
+        "initial_margin": "187.5",
+        "maintenance_margin": "25",
+        "position_initial_margin": "150",
+        "open_order_initial_margin": "37.5",
+        "unrealized_pnl": "-12.5",
+        "available_balance": "800",
+        "cross_wallet_balance": "1000",
+        "cross_unrealized_pnl": "-12.5",
+        "source_update_time_ms": 1894680004000,
+        "fact_cutoff": "2030-01-15T04:00:00Z",
+        "snapshot_ref": "snapshot-v3",
+    }
+
+
 def test_snapshot_with_halpha_position_is_not_mislabelled_as_wholly_external() -> None:
-    observed_at = datetime(2026, 8, 2, 4, 0, tzinfo=UTC)
+    observed_at = datetime(2030, 1, 15, 4, 0, tzinfo=UTC)
 
     projected = _project_account_snapshot(
         server_cutoff=observed_at,
         fact_ref="snapshot-2",
         fact_cutoff=observed_at,
         payload=_account_payload(),
-        attributed_instruments=("SOLUSDT-PERP",),
+        attributed_instruments=("TESTUSDT-PERP",),
     )
 
     assert projected["account_positions"][0]["origin"] == (
@@ -227,7 +277,7 @@ def test_snapshot_with_halpha_position_is_not_mislabelled_as_wholly_external() -
 
 
 def test_stale_snapshot_remains_visible_but_is_not_current() -> None:
-    observed_at = datetime(2026, 8, 2, 4, 0, tzinfo=UTC)
+    observed_at = datetime(2030, 1, 15, 4, 0, tzinfo=UTC)
 
     projected = _project_account_snapshot(
         server_cutoff=observed_at + timedelta(seconds=91),
@@ -245,11 +295,11 @@ def test_stale_snapshot_remains_visible_but_is_not_current() -> None:
     (
         {**_account_payload(), "snapshot_complete": False},
         {**_account_payload(), "management_authority": "WRITE"},
-        {**_account_payload(), "positions": [{"symbol": "SOLUSDT"}]},
+        {**_account_payload(), "positions": [{"symbol": "TESTUSDT"}]},
     ),
 )
 def test_invalid_or_partial_snapshot_fails_closed(payload: dict[str, object]) -> None:
-    observed_at = datetime(2026, 8, 2, 4, 0, tzinfo=UTC)
+    observed_at = datetime(2030, 1, 15, 4, 0, tzinfo=UTC)
 
     projected = _project_account_snapshot(
         server_cutoff=observed_at,
@@ -265,6 +315,7 @@ def test_invalid_or_partial_snapshot_fails_closed(payload: dict[str, object]) ->
         "account_snapshot_age_seconds": None,
         "account_ordinary_open_order_count": None,
         "account_algo_open_order_count": None,
+        "account_summary": None,
         "account_positions": [],
         "account_orders": [],
     }

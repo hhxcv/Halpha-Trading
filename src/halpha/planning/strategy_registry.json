@@ -1,5 +1,5 @@
 {
-  "registry_digest": "44bdc02ec6c0c179944835cb84f94edf50519a8f19d5a085303f379bba428e0e",
+  "registry_digest": "2efcd44d0554bb6db63fd2978f9a456808f132c99ade0b0b1150837bd66be03b",
   "registry_kind": "STATIC_BUILD_ARTIFACT",
   "schema_version": 2,
   "strategies": [
@@ -15,6 +15,9 @@
       "applicable_scenarios": "适用于 Binance USDⓈ-M 的 BTCUSDT 永续合约出现明确 15 分钟通道突破、希望以单次多头或空头交易参与短周期趋势的场景；震荡行情可能产生假突破。",
       "display_name": "单次 Donchian 突破与 ATR 风险退出",
       "economic_scope": {
+        "allowed_plan_intents": [
+          "VALIDATION"
+        ],
         "evidence_limit": "固定短周期规则在费用后的历史开发样本中未取得正期望；仅用于验证计划、成交、保护和退出链路，不应用于盈利目标。",
         "funding_model": "NOT_MODELED_IN_BACKTEST",
         "one_entry_cycle": true,
@@ -24,7 +27,7 @@
         "venue": "BINANCE_USDM"
       },
       "execution_behavior": "激活后检查已闭合 15 分钟 K 线和配置数量的 1 分钟确认收盘；满足突破且未过度延伸时发起一次市价入场，成交后设置 ATR 止损和两档止盈，并记录最长持仓期限；每个激活最多入场一次。仅 Demo 流程检查开关会跳过自然突破等待。",
-      "implementation_digest": "b4bb68099c345336229d30d7a09ea1088b49e7ecf4e66e6818415ba05310e0b8",
+      "implementation_digest": "bdd205edce1cd0481df33ce4e7775e9f48b9d67869f88b4e3bb2d54b253897e6",
       "implementation_path": "halpha.planning.strategies.one_shot:OneShotDonchianAtrLogic",
       "native_indicators": [
         "nautilus_trader.indicators.DonchianChannel",

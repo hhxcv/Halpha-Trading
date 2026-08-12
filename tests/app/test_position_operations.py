@@ -10,19 +10,19 @@ def _summary(**updates: object) -> dict[str, object]:
     result: dict[str, object] = {
         "account_snapshot_status": "CURRENT",
         "account_snapshot_ref": "snapshot-1",
-        "account_snapshot_cutoff": "2026-08-02T04:00:00Z",
+        "account_snapshot_cutoff": "2030-01-15T04:00:00Z",
         "account_ordinary_open_order_count": 0,
         "account_algo_open_order_count": 0,
         "account_positions": [
             {
                 "snapshot_ref": "snapshot-1",
-                "fact_cutoff": "2026-08-02T04:00:00Z",
-                "instrument_ref": "SOLUSDT-PERP",
+                "fact_cutoff": "2030-01-15T04:00:00Z",
+                "instrument_ref": "TESTUSDT-PERP",
                 "position_side": "BOTH",
                 "direction": "SHORT",
                 "absolute_quantity": "2.5",
-                "entry_price": "152.25",
-                "mark_price": "154",
+                "entry_price": "100",
+                "mark_price": "105",
                 "origin": "EXTERNAL_UNMANAGED",
             }
         ],
@@ -35,8 +35,8 @@ def _payload(operation: str, **updates: object) -> AccountPositionOperationPrevi
     values: dict[str, object] = {
         "operation": operation,
         "snapshot_ref": "snapshot-1",
-        "fact_cutoff": "2026-08-02T04:00:00Z",
-        "instrument_ref": "SOLUSDT-PERP",
+        "fact_cutoff": "2030-01-15T04:00:00Z",
+        "instrument_ref": "TESTUSDT-PERP",
         "position_side": "BOTH",
         "expected_absolute_quantity": "2.5",
     }
@@ -55,7 +55,7 @@ def test_reduce_preview_binds_exact_external_baseline_without_entry_claim() -> N
     assert preview.activation_allowed is True
     assert preview.venue_action_created is False
     assert preview.plan_prefill.kind == "POSITION_DISPOSITION"
-    assert preview.plan_prefill.trade_amount == "77"
+    assert preview.plan_prefill.trade_amount == "52.5"
     assert preview.plan_prefill.target_quantity_after == "2"
     alignment = preview.plan_prefill.position_alignment
     assert alignment is not None
@@ -100,7 +100,7 @@ def test_read_only_hedge_disposition_keeps_side_and_exposes_real_blockers() -> N
     position["direction"] = "LONG"
     preview = preview_account_position_operation(
         _summary(
-            account_ordinary_open_order_count=8,
+            account_ordinary_open_order_count=2,
             account_positions=[position],
         ),
         _payload("CLOSE", position_side="LONG"),

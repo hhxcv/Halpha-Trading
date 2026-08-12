@@ -277,12 +277,16 @@ class NautilusBarEntryEvaluator:
             source_cutoff_ns=self._last_target_ts,
         )
         confirmation_closes = tuple(str(item.close) for item in self._confirmation_bars)
+        confirmation_close_times = tuple(
+            _datetime_from_ns(item.ts_event) for item in self._confirmation_bars
+        )
         input_payload = {
             "activation_id": self.activation_id,
             "instrument_id": f"{self.instrument_ref}.BINANCE",
             "target_cutoff_ns": self._last_target_ts,
             "source_cutoff_ns": bar.ts_event,
             "confirmation_closes": confirmation_closes,
+            "confirmation_close_times": confirmation_close_times,
             "indicators": indicators.model_dump(mode="json"),
             "sizing": sizing.model_dump(mode="json"),
         }
@@ -297,6 +301,7 @@ class NautilusBarEntryEvaluator:
             decision_at=decision_at,
             valid_until=self.valid_until,
             confirmation_closes=confirmation_closes,
+            confirmation_close_times=confirmation_close_times,
             indicators=indicators,
             reference_price=sizing.reference_price,
             reference_source=sizing.reference_source,

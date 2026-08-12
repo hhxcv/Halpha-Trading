@@ -7,13 +7,23 @@ from enum import StrEnum
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from halpha.domain_values import canonical_decimal, decimal_from_string
 
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 ACCOUNT_SYSTEM_STOP_RELEASE_EVIDENCE_MAX_AGE = timedelta(seconds=65)
+ACCOUNT_PORTFOLIO_RISK_POLICY_VERSION = "ACCOUNT_PORTFOLIO_RISK@2"
+MAX_PLAN_LOSS_FRACTION = "0.0075"
+MAX_OPEN_RISK_FRACTION = "0.025"
+MAX_GROSS_EXPOSURE_FRACTION = "2"
+MAX_INSTRUMENT_EXPOSURE_FRACTION = "1"
+MAX_CORRELATED_EXPOSURE_FRACTION = "1.5"
+DAILY_LOSS_STOP_FRACTION = "0.015"
+WEEKLY_LOSS_STOP_FRACTION = "0.04"
+ROLLING_DRAWDOWN_STOP_FRACTION = "0.1"
+ROLLING_DRAWDOWN_LOOKBACK_DAYS = 30
 
 
 class EnvironmentKind(StrEnum):
@@ -48,6 +58,259 @@ class AccountSystemStopSource(StrEnum):
 
 class CapModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class NewRiskDisciplinePolicy(CapModel):
+    """Configuration which can only narrow admission of new-risk plans."""
+
+    max_plan_loss_fraction: str = MAX_PLAN_LOSS_FRACTION
+    max_open_risk_fraction: str = MAX_OPEN_RISK_FRACTION
+    max_gross_exposure_fraction: str = MAX_GROSS_EXPOSURE_FRACTION
+    max_instrument_exposure_fraction: str = MAX_INSTRUMENT_EXPOSURE_FRACTION
+    max_correlated_exposure_fraction: str = MAX_CORRELATED_EXPOSURE_FRACTION
+    daily_loss_stop_fraction: str = DAILY_LOSS_STOP_FRACTION
+    weekly_loss_stop_fraction: str = WEEKLY_LOSS_STOP_FRACTION
+    rolling_drawdown_stop_fraction: str = ROLLING_DRAWDOWN_STOP_FRACTION
+    rolling_drawdown_lookback_days: int = Field(
+        default=ROLLING_DRAWDOWN_LOOKBACK_DAYS, ge=1, le=365
+    )
+    account_snapshot_max_age_seconds: int = Field(default=65, ge=5, le=300)
+
+    @field_validator(
+        "max_plan_loss_fraction",
+        "max_open_risk_fraction",
+        "daily_loss_stop_fraction",
+        "weekly_loss_stop_fraction",
+        "rolling_drawdown_stop_fraction",
+    )
+    @classmethod
+    def fractions_are_bounded(cls, value: str) -> str:
+        normalized = canonical_decimal(
+            decimal_from_string(
+                value,
+                code="NEW_RISK_DISCIPLINE_FRACTION_INVALID",
+                positive=True,
+            )
+        )
+        if (
+            decimal_from_string(
+                normalized,
+                code="NEW_RISK_DISCIPLINE_FRACTION_INVALID",
+            )
+            > 1
+        ):
+            raise ValueError("NEW_RISK_DISCIPLINE_FRACTION_INVALID")
+        return normalized
+
+    @field_validator(
+        "max_gross_exposure_fraction",
+        "max_instrument_exposure_fraction",
+        "max_correlated_exposure_fraction",
+    )
+    @classmethod
+    def exposure_fractions_are_bounded(cls, value: str) -> str:
+        normalized = canonical_decimal(
+            decimal_from_string(
+                value,
+                code="NEW_RISK_DISCIPLINE_EXPOSURE_FRACTION_INVALID",
+                positive=True,
+            )
+        )
+        if (
+            decimal_from_string(
+                normalized,
+                code="NEW_RISK_DISCIPLINE_EXPOSURE_FRACTION_INVALID",
+            )
+            > 20
+        ):
+            raise ValueError("NEW_RISK_DISCIPLINE_EXPOSURE_FRACTION_INVALID")
+        return normalized
+
+    @model_validator(mode="after")
+    def fractions_are_ordered(self) -> "NewRiskDisciplinePolicy":
+        plan = decimal_from_string(
+            self.max_plan_loss_fraction,
+            code="NEW_RISK_DISCIPLINE_FRACTION_INVALID",
+        )
+        open_risk = decimal_from_string(
+            self.max_open_risk_fraction,
+            code="NEW_RISK_DISCIPLINE_FRACTION_INVALID",
+        )
+        daily_loss = decimal_from_string(
+            self.daily_loss_stop_fraction,
+            code="NEW_RISK_DISCIPLINE_FRACTION_INVALID",
+        )
+        weekly_loss = decimal_from_string(
+            self.weekly_loss_stop_fraction,
+            code="NEW_RISK_DISCIPLINE_FRACTION_INVALID",
+        )
+        drawdown = decimal_from_string(
+            self.rolling_drawdown_stop_fraction,
+            code="NEW_RISK_DISCIPLINE_FRACTION_INVALID",
+        )
+        instrument = decimal_from_string(
+            self.max_instrument_exposure_fraction,
+            code="NEW_RISK_DISCIPLINE_EXPOSURE_FRACTION_INVALID",
+        )
+        correlated = decimal_from_string(
+            self.max_correlated_exposure_fraction,
+            code="NEW_RISK_DISCIPLINE_EXPOSURE_FRACTION_INVALID",
+        )
+        gross = decimal_from_string(
+            self.max_gross_exposure_fraction,
+            code="NEW_RISK_DISCIPLINE_EXPOSURE_FRACTION_INVALID",
+        )
+        if not plan <= open_risk:
+            raise ValueError("NEW_RISK_DISCIPLINE_FRACTIONS_UNORDERED")
+        if not daily_loss <= weekly_loss <= drawdown:
+            raise ValueError("NEW_RISK_DISCIPLINE_LOSS_STOPS_UNORDERED")
+        if not instrument <= correlated <= gross:
+            raise ValueError("NEW_RISK_DISCIPLINE_EXPOSURES_UNORDERED")
+        return self
+
+
+class AccountPositionRisk(CapModel):
+    """Risk-view position where direction carries sign and notional is a magnitude."""
+
+    instrument_ref: str
+    direction: Literal["LONG", "SHORT"]
+    notional: str
+    unrealized_pnl: str
+
+    @field_validator("notional")
+    @classmethod
+    def notional_is_risk_magnitude(cls, value: str) -> str:
+        return canonical_decimal(
+            abs(
+                decimal_from_string(
+                    value,
+                    code="ACCOUNT_POSITION_NOTIONAL_INVALID",
+                )
+            )
+        )
+
+    @field_validator("unrealized_pnl")
+    @classmethod
+    def unrealized_pnl_is_finite(cls, value: str) -> str:
+        return canonical_decimal(
+            decimal_from_string(value, code="ACCOUNT_POSITION_UNREALIZED_PNL_INVALID")
+        )
+
+
+class AccountEquitySnapshot(CapModel):
+    fact_ref: str
+    cutoff: datetime
+    can_trade: bool
+    wallet_balance: str
+    unrealized_pnl: str
+    margin_balance: str
+    available_balance: str
+    positions: tuple[AccountPositionRisk, ...] = ()
+
+    @field_validator(
+        "wallet_balance",
+        "unrealized_pnl",
+        "margin_balance",
+        "available_balance",
+    )
+    @classmethod
+    def balances_are_finite(cls, value: str) -> str:
+        return canonical_decimal(
+            decimal_from_string(value, code="ACCOUNT_EQUITY_INVALID")
+        )
+
+    @field_validator("cutoff")
+    @classmethod
+    def cutoff_is_aware(cls, value: datetime) -> datetime:
+        if value.utcoffset() is None:
+            raise ValueError("ACCOUNT_EQUITY_CUTOFF_INVALID")
+        return value
+
+
+class NewRiskAttempt(CapModel):
+    activation_id: str
+    instrument_ref: str
+    max_notional: str
+    max_allowed_loss: str
+    lifecycle: str
+    has_entry_fill: bool
+    created_at: datetime
+    first_entry_fill_at: datetime | None = None
+
+    @field_validator("max_notional", "max_allowed_loss")
+    @classmethod
+    def loss_is_positive(cls, value: str) -> str:
+        return canonical_decimal(
+            decimal_from_string(
+                value,
+                code="NEW_RISK_ATTEMPT_LOSS_INVALID",
+                positive=True,
+            )
+        )
+
+    @field_validator("created_at", "first_entry_fill_at")
+    @classmethod
+    def times_are_aware(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.utcoffset() is None:
+            raise ValueError("NEW_RISK_ATTEMPT_TIME_INVALID")
+        return value
+
+
+class NewRiskResult(CapModel):
+    activation_id: str
+    net_pnl: str
+    closed_at: datetime
+
+    @field_validator("net_pnl")
+    @classmethod
+    def pnl_is_finite(cls, value: str) -> str:
+        return canonical_decimal(
+            decimal_from_string(value, code="NEW_RISK_RESULT_PNL_INVALID")
+        )
+
+    @field_validator("closed_at")
+    @classmethod
+    def closed_at_is_aware(cls, value: datetime) -> datetime:
+        if value.utcoffset() is None:
+            raise ValueError("NEW_RISK_RESULT_TIME_INVALID")
+        return value
+
+
+class NewRiskDisciplineStatus(CapModel):
+    status: Literal["ALLOWED", "BLOCKED", "UNKNOWN"]
+    new_risk_allowed: bool
+    blocker_codes: tuple[str, ...]
+    account_snapshot_ref: str | None
+    account_snapshot_cutoff: datetime | None
+    risk_equity: str | None
+    max_plan_loss: str | None
+    open_risk_limit: str | None
+    open_risk_committed: str | None
+    open_risk_after_proposal: str | None
+    gross_exposure_limit: str | None
+    gross_exposure: str | None
+    gross_exposure_after_proposal: str | None
+    instrument_ref: str | None
+    instrument_exposure_limit: str | None
+    instrument_exposure: str | None
+    instrument_exposure_after_proposal: str | None
+    correlation_cluster: str | None
+    correlated_exposure_limit: str | None
+    correlated_exposure: str | None
+    correlated_exposure_after_proposal: str | None
+    daily_loss_limit: str | None
+    daily_loss_measure: str | None
+    weekly_loss_limit: str | None
+    weekly_loss_measure: str | None
+    rolling_peak_equity: str | None
+    rolling_drawdown: str | None
+    rolling_drawdown_fraction: str | None
+    rolling_drawdown_limit_fraction: str
+    rolling_drawdown_lookback_days: int
+    open_new_risk_activation_count: int
+    day_window_started_at: datetime
+    week_window_started_at: datetime
+    evaluated_at: datetime
 
 
 class EnvironmentAuthority(CapModel):
@@ -86,7 +349,9 @@ class ActivationCapitalBoundary(EnvironmentAuthority):
     @classmethod
     def amounts_are_non_negative(cls, value: str) -> str:
         return canonical_decimal(
-            decimal_from_string(value, code="PLAN_CAPITAL_BOUNDARY_INVALID", non_negative=True)
+            decimal_from_string(
+                value, code="PLAN_CAPITAL_BOUNDARY_INVALID", non_negative=True
+            )
         )
 
     @model_validator(mode="after")

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from halpha.capital.models import NewRiskDisciplinePolicy
 from halpha.configuration import (
     ConfigurationError,
     app_settings,
@@ -85,7 +86,7 @@ def test_public_market_proxy_is_non_secret_and_loopback_only() -> None:
 
     for invalid in (
         "https://proxy.example.test:7897",
-        "http://user:secret@127.0.0.1:7897",
+        "http://synthetic-user:synthetic-secret@127.0.0.1:7897",
         "http://127.0.0.1:7897/path",
     ):
         app["public_market_proxy_url"] = invalid
@@ -117,6 +118,79 @@ def test_email_delivery_is_disabled_until_complete_nonsecret_route_exists() -> N
     email["delivery_enabled"] = True
     with pytest.raises(ConfigurationError, match="CONFIGURATION_INVALID"):
         load_settings(EXAMPLE, constructor_values={"email": email})
+
+
+def test_new_risk_discipline_is_bounded() -> None:
+    settings = load_settings(EXAMPLE)
+    assert settings.new_risk_discipline.max_plan_loss_fraction == "0.0075"
+    assert settings.new_risk_discipline.max_open_risk_fraction == "0.025"
+    assert settings.new_risk_discipline.daily_loss_stop_fraction == "0.015"
+    assert settings.new_risk_discipline.weekly_loss_stop_fraction == "0.04"
+    policy = settings.new_risk_discipline.model_dump(mode="json")
+    policy["max_plan_loss_fraction"] = "0.01"
+    with pytest.raises(ConfigurationError, match="CONFIGURATION_INVALID"):
+        load_settings(
+            EXAMPLE,
+            constructor_values={"new_risk_discipline": policy},
+        )
+
+@pytest.mark.parametrize(
+    "context",
+    (EXAMPLE, LIVE_READ_ONLY, LIVE_WRITE, PERSONAL_READ_ONLY, PERSONAL_WRITE),
+)
+def test_every_trading_context_rejects_a_wider_portfolio_risk_policy(context: Path) -> None:
+    settings = load_settings(context)
+    assert settings.new_risk_discipline == NewRiskDisciplinePolicy()
+
+    policy = settings.new_risk_discipline.model_dump(mode="json")
+    policy.update(
+        max_plan_loss_fraction="0.01",
+        max_open_risk_fraction="0.03",
+        max_gross_exposure_fraction="3",
+        max_instrument_exposure_fraction="1.5",
+        max_correlated_exposure_fraction="2",
+        daily_loss_stop_fraction="0.02",
+        weekly_loss_stop_fraction="0.05",
+        rolling_drawdown_stop_fraction="0.12",
+    )
+    with pytest.raises(ConfigurationError, match="CONFIGURATION_INVALID"):
+        load_settings(
+            context,
+            constructor_values={"new_risk_discipline": policy},
+        )
+
+    shortened_window = settings.new_risk_discipline.model_dump(mode="json")
+    shortened_window["rolling_drawdown_lookback_days"] = 29
+    with pytest.raises(ConfigurationError, match="CONFIGURATION_INVALID"):
+        load_settings(
+            context,
+            constructor_values={"new_risk_discipline": shortened_window},
+        )
+
+    longer_window = settings.new_risk_discipline.model_dump(mode="json")
+    longer_window["rolling_drawdown_lookback_days"] = 31
+    assert (
+        load_settings(
+            context,
+            constructor_values={"new_risk_discipline": longer_window},
+        ).new_risk_discipline.rolling_drawdown_lookback_days
+        == 31
+    )
+
+
+def test_demo_rejects_a_live_profit_qualification_reference() -> None:
+    with pytest.raises(ConfigurationError, match="CONFIGURATION_INVALID"):
+        load_settings(
+            EXAMPLE,
+            constructor_values={
+                "live_profit_qualifications": [
+                    {
+                        "artifact_path": "C:/HalphaRuntime/evidence/playbook.json",
+                        "expected_content_digest": "a" * 64,
+                    }
+                ]
+            },
+        )
 
 
 def test_live_profile_cannot_reuse_demo_credential_reference() -> None:

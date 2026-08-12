@@ -14,7 +14,7 @@ python .githooks/check_local_privacy.py --self-test
 python .githooks/check_local_privacy.py --all
 ```
 
-提交门禁检查暂存快照，推送门禁还会检查即将新增到远端的提交历史与提交消息；命中时只报告类别与位置，不回显可疑内容。Git author/committer 邮箱使用所有者选择的身份，不作为本地隐私门禁项。不得使用 `--no-verify` 绕过。任何外网连接都会在传输层向目标端或代理暴露出口 IP；Halpha 禁止把本机或内网 IP、路径、身份、配置、日志或异常详情再作为请求数据主动附加。
+提交门禁检查暂存快照，推送门禁还会检查即将新增到远端的提交历史与提交消息；命中时只报告中性的拒绝类型与待处理位置，不回显或推断内容。Git author/committer 邮箱使用所有者选择的身份，不作为本地隐私门禁项。不得使用 `--no-verify` 绕过。任何外网连接都会在传输层向目标端或代理暴露出口 IP；Halpha 禁止把本机或内网 IP、路径、身份、配置、日志或异常详情再作为请求数据主动附加。
 
 ## 统一进程管控
 
@@ -46,9 +46,18 @@ python .githooks/check_local_privacy.py --all
 .venv\Scripts\halpha-control.exe stop all
 ```
 
+仅切换 Windows 任务的开机/看门狗触发资格、但不立即启动或停止当前进程时，使用：
+
+```powershell
+.venv\Scripts\halpha-control.exe autostart product on
+.venv\Scripts\halpha-control.exe autostart product off
+```
+
+`LIVE_READ_ONLY` 的显式观察 Executor 始终保持不自动启动；上述 `product on` 只启用 App。该命令不改变计划、交易权限或交易所状态。
+
 命令默认读取仓库内的 `config/halpha.toml`，日常操作不需要传配置。只有临时检查另一份配置时才追加 `--config <路径>`。CLI 主动生成的帮助、表头、状态、操作结果和错误前缀只使用 ASCII 英文，避免 Windows 终端编码问题；路径、外部错误和日志等被动内容保持来源原文。脚本需要机器读取时追加 `--json`，例如 `.venv\Scripts\halpha-control.exe status --json`。
 
-当前带单账户与个人账户均先以各自的 `LIVE_READ_ONLY` 配置完成隔离投影；例如 `--config config/halpha.live-copy-read-only.toml` 只启动带单账户 App。`LIVE_READ_ONLY` Executor 支持两种互斥组合：不带私有凭据的公开前向观察，或带当前账户只读 Key 与 Executor 数据库凭据的私有账户观察。后者只追加完整账户仓位/开放委托快照，结构上不装载执行客户端、动作 repository、Coordinator 或交易所写能力。当前受管 Executor 任务仍保持禁用，必须先按账户上下文完成 Vault 投影、数据库和任务资格验证后才能启用；私有只读观察不需要写门，也不代表外部仓位已被 Halpha 接管。真实交易权限和 `LIVE_WRITE` 写门仍须另行授权与投影。
+带单账户与个人账户使用各自的 `LIVE_READ_ONLY` 配置形状完成隔离投影；例如 `--config config/halpha.live-copy-read-only.toml` 只选择带单账户 App。`LIVE_READ_ONLY` Executor 支持两种互斥组合：不带私有凭据的公开前向观察，或带目标账户只读 Key 与 Executor 数据库凭据的私有账户观察。后者只追加账户仓位和开放委托快照，结构上不装载执行客户端、动作 repository、Coordinator 或交易所写能力。具体凭据、账户事实、受管任务状态和资格结果只存在于仓库外的本机运行边界，不在 Git 中记录；私有只读观察不需要写门，也不代表外部仓位已被 Halpha 接管。真实交易权限和 `LIVE_WRITE` 写门仍须另行授权与投影。
 
 进入 `LIVE_WRITE` 后，Executor 还会用写门指纹绑定的同一 Key 调用 Binance 签名 GET 验证账户类型：带单上下文要求当前为带单员且产品 symbol 位于带单白名单，个人上下文要求当前不是带单员。验证失败或超过短期缓存期限时拒绝新增风险；既有责任仍只能按只恢复边界处理。
 

@@ -13,7 +13,7 @@ import {
 } from "../marketColors";
 import {
   LOSS_STREAK_ALERT_THRESHOLD,
-  summarizeAccountAndStrategyPerformance,
+  summarizeAccountAndProfitSeekingPerformance,
   type ReviewPerformanceTrade,
 } from "../reviewPerformanceSummary";
 import { surfaceFrameSx } from "../theme";
@@ -76,22 +76,22 @@ export default function ReviewPerformanceOverview({
   marketColorScheme: MarketColorScheme;
   chartAttribution: ReactNode;
 }) {
-  const { account: accountSummary, strategy: strategySummary } =
-    summarizeAccountAndStrategyPerformance(tradesInClosingOrder);
+  const { account: accountSummary, profitSeeking: profitSeekingSummary } =
+    summarizeAccountAndProfitSeekingPerformance(tradesInClosingOrder);
   let cumulative = 0;
   const trendPoints = tradesInClosingOrder.map((trade) => {
     cumulative += trade.netPnl;
     return { at: trade.closedAt, value: cumulative };
   });
   const lossStreakAlert = (
-    strategySummary.currentStreakKind === "LOSS"
-    && strategySummary.currentStreakCount >= LOSS_STREAK_ALERT_THRESHOLD
+    profitSeekingSummary.currentStreakKind === "LOSS"
+    && profitSeekingSummary.currentStreakCount >= LOSS_STREAK_ALERT_THRESHOLD
   );
-  const streakLabel = strategySummary.currentStreakKind === "WIN"
-    ? "策略当前连盈"
-    : strategySummary.currentStreakKind === "LOSS"
-      ? "策略当前连亏"
-      : "策略连续结果";
+  const streakLabel = profitSeekingSummary.currentStreakKind === "WIN"
+    ? "盈利样本当前连盈"
+    : profitSeekingSummary.currentStreakKind === "LOSS"
+      ? "盈利样本当前连亏"
+      : "盈利样本连续结果";
 
   return (
     <Box sx={{ ...surfaceFrameSx, p: { xs: 1.5, sm: 2 }, mb: 2 }}>
@@ -134,25 +134,25 @@ export default function ReviewPerformanceOverview({
                 : `账户累计净盈亏 ÷ 全部可靠闭合交易的入场成交额合计；当前分母 ${unsignedUsdt(accountSummary.totalEntryNotional)}。保留验证性交易和工具问题造成的真实账户结果，但不是账户权益或保证金收益率。`,
             },
             {
-              label: "策略样本",
-              value: `${strategySummary.tradeCount} 笔`,
-              help: "只包含“可用交易样本”“交易决策需改进”和兼容的历史“符合预期”；验证性交易、工具问题影响、待评价和证据不足不进入策略统计。",
+              label: "盈利导向样本",
+              value: `${profitSeekingSummary.tradeCount} 笔`,
+              help: "要求交易前明确记录为盈利导向、复盘已完成、结果和费用可靠且归因完整，并只包含“可用交易样本”“交易决策需改进”和兼容历史分类。历史缺少交易前目的时不会补猜。不同决策仍不是完全同类策略证据。",
             },
             {
-              label: "策略单笔净期望",
-              value: signedUsdt(strategySummary.averageNetPnl),
-              tone: marketToneForSignedValue(strategySummary.averageNetPnl),
-              help: "合格策略样本累计净盈亏 ÷ 策略样本数；是费用后的历史平均结果，不是未来收益预测。",
+              label: "盈利样本单笔净结果",
+              value: signedUsdt(profitSeekingSummary.averageNetPnl),
+              tone: marketToneForSignedValue(profitSeekingSummary.averageNetPnl),
+              help: "盈利导向已评价样本累计净盈亏 ÷ 样本数；是费用后的异质历史平均结果，不是未来收益预测。",
             },
             {
-              label: "策略累计盈亏比",
-              value: profitLossRatio(strategySummary.grossProfit, strategySummary.grossLoss),
-              help: "合格策略样本累计盈利净额 ÷ 累计亏损净额绝对值。",
+              label: "盈利样本盈亏比",
+              value: profitLossRatio(profitSeekingSummary.grossProfit, profitSeekingSummary.grossLoss),
+              help: "盈利导向已评价样本累计盈利净额 ÷ 累计亏损净额绝对值。",
             },
             {
-              label: "策略胜率",
-              value: strategySummary.tradeCount
-                ? percent(strategySummary.wins / strategySummary.tradeCount * 100)
+              label: "盈利样本胜率",
+              value: profitSeekingSummary.tradeCount
+                ? percent(profitSeekingSummary.wins / profitSeekingSummary.tradeCount * 100)
                 : "未知",
             },
             {
@@ -163,12 +163,12 @@ export default function ReviewPerformanceOverview({
             },
             {
               label: streakLabel,
-              value: strategySummary.currentStreakCount > 0
-                ? `${strategySummary.currentStreakCount} 笔`
+              value: profitSeekingSummary.currentStreakCount > 0
+                ? `${profitSeekingSummary.currentStreakCount} 笔`
                 : "无",
-              tone: strategySummary.currentStreakKind === "LOSS"
+              tone: profitSeekingSummary.currentStreakKind === "LOSS"
                 ? marketToneForSignedValue(-1)
-                : strategySummary.currentStreakKind === "WIN"
+                : profitSeekingSummary.currentStreakKind === "WIN"
                   ? marketToneForSignedValue(1)
                   : undefined,
               help: "只按最近一段合格策略样本的净结果统计；方向改变或持平会结束当前连续结果。",
@@ -236,7 +236,7 @@ export default function ReviewPerformanceOverview({
               "& .MuiAlert-message": { py: 0.5 },
             }}
           >
-            合格策略样本连续亏损 {strategySummary.currentStreakCount} 笔，已触发连续亏损提醒；新的合格策略样本净结果大于或等于零时自动解除。
+            盈利导向已评价样本连续亏损 {profitSeekingSummary.currentStreakCount} 笔，已触发连续亏损提醒；新的合格样本净结果大于或等于零时自动解除。
           </Alert>
         )}
       </Box>

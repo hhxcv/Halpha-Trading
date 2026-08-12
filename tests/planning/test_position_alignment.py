@@ -20,7 +20,7 @@ from halpha.planning.registry import Direction, FixedDirectExecutionBasis
 from halpha.planning.service import PlanningApplicationService
 
 
-NOW = datetime(2026, 8, 2, 15, tzinfo=UTC)
+NOW = datetime(2030, 1, 15, 15, tzinfo=UTC)
 
 
 def _alignment(
@@ -34,14 +34,14 @@ def _alignment(
         fact_cutoff=NOW,
         account_ref="copy-lead-account",
         venue_ref="BINANCE_USDM",
-        instrument_ref="SOLUSDT-PERP",
+        instrument_ref="TESTUSDT-PERP",
         direction="LONG",
         position_side=position_side,
-        baseline_quantity="12.5",
-        requested_reduction_quantity=("12.5" if operation == "CLOSE" else "5"),
-        target_quantity_after=("0" if operation == "CLOSE" else "7.5"),
-        baseline_entry_price="150",
-        baseline_mark_price="154",
+        baseline_quantity="10",
+        requested_reduction_quantity=("10" if operation == "CLOSE" else "4"),
+        target_quantity_after=("0" if operation == "CLOSE" else "6"),
+        baseline_entry_price="100",
+        baseline_mark_price="105",
     )
 
 
@@ -51,7 +51,7 @@ def _version(alignment: PositionAlignmentSpec | None = None) -> TradePlanVersion
         plan_id="position-plan",
         environment_id="demo",
         fixed_at=NOW,
-        plan_name="SOLUSDT external reduction",
+        plan_name="TESTUSDT synthetic external reduction",
         created_at=NOW,
         creator_kind="AI",
         decision_basis=FixedDirectExecutionBasis(
@@ -61,13 +61,13 @@ def _version(alignment: PositionAlignmentSpec | None = None) -> TradePlanVersion
         position_alignment=alignment or _alignment(),
         account_ref="copy-lead-account",
         venue_ref="BINANCE_USDM",
-        instrument_ref="SOLUSDT-PERP",
+        instrument_ref="TESTUSDT-PERP",
         direction=Direction.LONG,
-        target_exposure="54.93",
+        target_exposure="50",
         requested_limits=RequestedLimits(
-            max_margin="54.93",
-            max_notional="54.93",
-            max_allowed_loss="54.93",
+            max_margin="50",
+            max_notional="50",
+            max_allowed_loss="50",
         ),
         valid_from=NOW,
         valid_until=NOW + timedelta(hours=1),
@@ -79,8 +79,8 @@ def _version(alignment: PositionAlignmentSpec | None = None) -> TradePlanVersion
 
 def _snapshot(
     *,
-    quantity: str = "12.5",
-    entry_price: str = "150",
+    quantity: str = "10",
+    entry_price: str = "100",
     ordinary_open_orders: int = 0,
     position_side: str = "BOTH",
 ) -> dict[str, object]:
@@ -89,11 +89,14 @@ def _snapshot(
         "snapshot_complete": True,
         "read_only": True,
         "management_authority": "NONE",
+        "open_position_count": 1,
         "ordinary_open_order_count": ordinary_open_orders,
         "algo_open_order_count": 0,
+        "ordinary_open_orders": [{} for _ in range(ordinary_open_orders)],
+        "algo_open_orders": [],
         "positions": [
             {
-                "instrument_ref": "SOLUSDT-PERP",
+                "instrument_ref": "TESTUSDT-PERP",
                 "position_side": position_side,
                 "direction": "LONG",
                 "absolute_quantity": quantity,

@@ -353,6 +353,66 @@ def test_activation_timeline_includes_activation_start() -> None:
     ]
 
 
+def test_activation_timeline_exposes_frozen_strategy_entry_evidence() -> None:
+    setup_evidence = {
+        "mode": "DONCHIAN_BREAKOUT",
+        "trigger_boundary": "65000",
+        "confirmation_closes": ["65010", "65020"],
+    }
+
+    class Cursor:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        @staticmethod
+        def execute(query, _parameters):
+            if "FROM halpha.plan_event" in query:
+                return Cursor(
+                    [
+                        (
+                            "plan-event-1",
+                            "ENTRY_BREAKOUT",
+                            "activation-1:BAR:1:2",
+                            NOW,
+                            "PROPOSED_ACTION_CAP_ACCEPTED",
+                            None,
+                            {"accepted": True},
+                            {
+                                "execution_context": {
+                                    "entry_risk_context": {
+                                        "trigger_atr": "500",
+                                        "setup_evidence": setup_evidence,
+                                    }
+                                }
+                            },
+                            NOW,
+                        )
+                    ]
+                )
+            return Cursor([])
+
+    api = object.__new__(PostgreSQLPlanningApi)
+    api._environment_id = "demo-main"
+    api._connect = Connection
+
+    timeline = api.activation_timeline("activation-1")
+
+    assert timeline[0]["detail"]["entry_risk_context"] == {
+        "trigger_atr": "500",
+        "setup_evidence": setup_evidence,
+    }
+
+
 def test_activation_list_uses_effective_exit_command_as_close_reason(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
 import json
@@ -20,6 +21,19 @@ from pydantic import (
     model_validator,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict, TomlConfigSettingsSource
+
+from halpha.capital.models import (
+    DAILY_LOSS_STOP_FRACTION,
+    MAX_CORRELATED_EXPOSURE_FRACTION,
+    MAX_GROSS_EXPOSURE_FRACTION,
+    MAX_INSTRUMENT_EXPOSURE_FRACTION,
+    MAX_OPEN_RISK_FRACTION,
+    MAX_PLAN_LOSS_FRACTION,
+    ROLLING_DRAWDOWN_LOOKBACK_DAYS,
+    ROLLING_DRAWDOWN_STOP_FRACTION,
+    WEEKLY_LOSS_STOP_FRACTION,
+    NewRiskDisciplinePolicy,
+)
 
 
 class ConfigurationError(RuntimeError):
@@ -131,6 +145,25 @@ class ReleaseConfig(FrozenModel):
         elif path_value is not None:
             raise ValueError("LIVE_WRITE_GATE_PATH_PROFILE_MISMATCH")
         return self
+
+
+class LiveProfitQualificationReference(FrozenModel):
+    """One owner-selected local Demo evidence artifact and its content digest."""
+
+    artifact_path: str
+    expected_content_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("artifact_path")
+    @classmethod
+    def artifact_path_is_explicit_json(cls, value: str) -> str:
+        path = Path(value)
+        if (
+            not path.is_absolute()
+            or path.suffix.lower() != ".json"
+            or ".." in path.parts
+        ):
+            raise ValueError("LIVE_PROFIT_QUALIFICATION_PATH_INVALID")
+        return value
 
 
 class TradingContextTarget(FrozenModel):
@@ -382,6 +415,10 @@ class HalphaSettings(BaseSettings):
     executor: ExecutorConfig
     maintenance: MaintenanceConfig
     email: EmailConfig
+    new_risk_discipline: NewRiskDisciplinePolicy = Field(
+        default_factory=NewRiskDisciplinePolicy
+    )
+    live_profit_qualifications: tuple[LiveProfitQualificationReference, ...] = ()
     windows: WindowsIdentityConfig
 
     @classmethod
@@ -433,6 +470,30 @@ class HalphaSettings(BaseSettings):
                 raise ValueError("TRADING_CONTEXT_TARGET_IDENTITY_MISMATCH")
 
         environment_namespace = spec.namespace
+        policy = self.new_risk_discipline
+        if (
+            Decimal(policy.max_plan_loss_fraction) > Decimal(MAX_PLAN_LOSS_FRACTION)
+            or Decimal(policy.max_open_risk_fraction) > Decimal(MAX_OPEN_RISK_FRACTION)
+            or Decimal(policy.max_gross_exposure_fraction)
+            > Decimal(MAX_GROSS_EXPOSURE_FRACTION)
+            or Decimal(policy.max_instrument_exposure_fraction)
+            > Decimal(MAX_INSTRUMENT_EXPOSURE_FRACTION)
+            or Decimal(policy.max_correlated_exposure_fraction)
+            > Decimal(MAX_CORRELATED_EXPOSURE_FRACTION)
+            or Decimal(policy.daily_loss_stop_fraction)
+            > Decimal(DAILY_LOSS_STOP_FRACTION)
+            or Decimal(policy.weekly_loss_stop_fraction)
+            > Decimal(WEEKLY_LOSS_STOP_FRACTION)
+            or Decimal(policy.rolling_drawdown_stop_fraction)
+            > Decimal(ROLLING_DRAWDOWN_STOP_FRACTION)
+            # A shorter lookback can forget the previous equity peak earlier and
+            # therefore relax admission.  Only the baseline window or a longer
+            # one is a monotonic tightening of this policy.
+            or policy.rolling_drawdown_lookback_days
+            < ROLLING_DRAWDOWN_LOOKBACK_DAYS
+        ):
+            raise ValueError("ACCOUNT_PORTFOLIO_RISK_POLICY_EXCEEDED")
+
         if release.profile == "BINANCE_DEMO":
             if release.authority_class != "DEMO_VALIDATION":
                 raise ValueError("DEMO_AUTHORITY_CLASS_MISMATCH")
@@ -468,6 +529,19 @@ class HalphaSettings(BaseSettings):
                 != f"Halpha/Binance/{environment_namespace}"
             ):
                 raise ValueError("LIVE_BINANCE_REFERENCE_MISMATCH")
+
+        qualification_refs = self.live_profit_qualifications
+        if release.venue_account_type is VenueAccountType.USDM_DEMO and qualification_refs:
+            raise ValueError("LIVE_PROFIT_QUALIFICATION_REQUIRES_LIVE_CONTEXT")
+        qualification_paths = [item.artifact_path for item in qualification_refs]
+        qualification_digests = [
+            item.expected_content_digest for item in qualification_refs
+        ]
+        if (
+            len(qualification_paths) != len(set(qualification_paths))
+            or len(qualification_digests) != len(set(qualification_digests))
+        ):
+            raise ValueError("LIVE_PROFIT_QUALIFICATION_REFERENCE_DUPLICATED")
 
         app_role_kind = (
             "app_reader" if release.profile == "BINANCE_LIVE_READ_ONLY" else "app"
@@ -595,6 +669,7 @@ class AppSettingsView(FrozenModel):
 class ExecutorSettingsView(FrozenModel):
     release: ReleaseConfig
     executor: ExecutorConfig
+    new_risk_discipline: NewRiskDisciplinePolicy
     executor_task_sid: str
     maintenance_sid: str
     stop_event: str
@@ -759,6 +834,7 @@ def executor_settings(settings: HalphaSettings) -> ExecutorSettingsView:
     return ExecutorSettingsView(
         release=settings.release,
         executor=settings.executor,
+        new_risk_discipline=settings.new_risk_discipline,
         executor_task_sid=settings.windows.executor_task_sid,
         maintenance_sid=settings.windows.maintenance_sid,
         stop_event=settings.windows.executor_stop_event,

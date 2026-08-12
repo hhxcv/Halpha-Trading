@@ -945,7 +945,10 @@ class RuntimeController:
             )
         if target == "product":
             services = (
-                ("app", "executor")
+                # Restore the execution and protection loop before waiting for the
+                # user-facing listener. A slow App cold start must not prevent the
+                # Executor from resuming existing responsibilities.
+                ("executor", "app")
                 if not read_only or continuous_observer
                 else ("app",)
             )
@@ -1021,6 +1024,60 @@ class RuntimeController:
             "service": service,
             "runtime_mode": "EXPLICIT_OBSERVATION_SESSION",
             "enabled": False,
+        }
+
+    def set_autostart(
+        self,
+        target: str,
+        *,
+        enabled: bool,
+    ) -> dict[str, object]:
+        """Change only task trigger eligibility; never start or stop a task here."""
+        if target == "product":
+            services = ("app", "executor")
+        elif target in {"app", "executor"}:
+            services = (target,)
+        else:
+            raise RuntimeControlError(f"SERVICE_TARGET_UNSUPPORTED target={target}")
+        results: dict[str, object] = {}
+        for service in services:
+            task = self._task(service)
+            self._require_task_contract(service, task)
+            explicit_read_only_executor = (
+                service == "executor"
+                and self._settings.release.profile == "BINANCE_LIVE_READ_ONLY"
+                and not self._settings.executor.continuous_account_observation
+            )
+            if explicit_read_only_executor:
+                if enabled:
+                    results[service] = {
+                        "status": "EXPLICIT_OBSERVATION_SESSION_REQUIRED",
+                        "service": service,
+                        "enabled": False,
+                    }
+                    continue
+                task.Enabled = False
+                results[service] = {
+                    "status": "AUTOSTART_DISABLED",
+                    "service": service,
+                    "enabled": False,
+                }
+                continue
+            task.Enabled = enabled
+            if bool(task.Enabled) is not enabled:
+                raise RuntimeControlError(
+                    f"TASK_AUTOSTART_UPDATE_FAILED service={service}"
+                )
+            results[service] = {
+                "status": "AUTOSTART_ENABLED" if enabled else "AUTOSTART_DISABLED",
+                "service": service,
+                "enabled": enabled,
+            }
+        return {
+            "status": "AUTOSTART_ENABLED" if enabled else "AUTOSTART_DISABLED",
+            "target": target,
+            "enabled": enabled,
+            "results": results,
         }
 
     def stop(

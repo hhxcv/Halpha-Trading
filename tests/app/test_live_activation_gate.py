@@ -31,6 +31,7 @@ from halpha.planning.order_policies import (
     TakeProfitLadderSpec,
     TakeProfitLevel,
 )
+from halpha.planning.models import PlanDecisionContext
 from halpha.planning.order_schedule import (
     AmountDistribution,
     EntryProgram,
@@ -57,6 +58,15 @@ DECISION_CONTEXT = {
     "rationale": "Validate the bounded plan decision.",
     "evidence": "Current plan inputs and venue facts.",
     "limitations": "Future price, fill and funding remain uncertain.",
+    "intent": "PROFIT_SEEKING",
+    "setup_family": "BREAKOUT_CONTINUATION",
+    "invalidation": "Do not enter after the fixed invalidation boundary.",
+    "evidence_cutoff": NOW.isoformat(),
+}
+VALIDATION_DECISION_CONTEXT = {**DECISION_CONTEXT, "intent": "VALIDATION"}
+DIRECT_DECISION_CONTEXT = {
+    **DECISION_CONTEXT,
+    "playbook_ref": "DIRECT_CAPABILITY_BOUNDARY_V1",
 }
 
 
@@ -204,7 +214,7 @@ def test_live_plan_rejects_demo_immediate_entry_before_database_mutation(
     payload = PlanCreatePayload(
         plan_name="AI live boundary check",
         creator_kind="AI",
-        decision_context=DECISION_CONTEXT,
+        decision_context=VALIDATION_DECISION_CONTEXT,
         decision_basis={
             "kind": "STRATEGY_SIGNAL",
             "decision_basis_ref": "ONE_SHOT_DONCHIAN_ATR_BREAKOUT",
@@ -224,6 +234,30 @@ def test_live_plan_rejects_demo_immediate_entry_before_database_mutation(
             payload,
             idempotency_key="demo-check-live-rejected",
             observed_at=NOW,
+        )
+
+
+def test_validation_only_strategy_rejects_profit_intent_before_database_mutation() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="STRATEGY_DECISION_INTENT_NOT_QUALIFIED",
+    ):
+        PlanCreatePayload(
+            plan_name="Unqualified profit strategy",
+            creator_kind="AI",
+            decision_context=DECISION_CONTEXT,
+            decision_basis={
+                "kind": "STRATEGY_SIGNAL",
+                "decision_basis_ref": "ONE_SHOT_DONCHIAN_ATR_BREAKOUT",
+                "parameters": {"demo_immediate_entry": False},
+            },
+            instrument_ref="BTCUSDT-PERP",
+            direction="LONG",
+            target_exposure="100",
+            max_margin="100",
+            max_notional="100",
+            max_allowed_loss="100",
+            valid_minutes=15,
         )
 
 
@@ -248,7 +282,7 @@ def _direct_payload(schedule: OrderScheduleSpec) -> PlanCreatePayload:
     return PlanCreatePayload(
         plan_name="AI direct capability boundary",
         creator_kind="AI",
-        decision_context=DECISION_CONTEXT,
+        decision_context=DIRECT_DECISION_CONTEXT,
         decision_basis={
             "kind": "DIRECT_EXECUTION",
             "decision_basis_ref": DIRECT_EXECUTION_REF,
@@ -272,10 +306,42 @@ def test_new_plan_requires_a_complete_decision_context() -> None:
         PlanCreatePayload.model_validate(values)
 
     values["decision_context"] = {
-        **DECISION_CONTEXT,
+        **DIRECT_DECISION_CONTEXT,
         "limitations": "   ",
     }
     with pytest.raises(ValidationError, match="PLAN_DECISION_CONTEXT_INVALID"):
+        PlanCreatePayload.model_validate(values)
+
+
+def test_new_risk_plan_requires_a_falsifiable_experiment_record() -> None:
+    values = _direct_payload(_direct_schedule()).model_dump(mode="json")
+    values["decision_context"] = {
+        "rationale": "Generic direction guess.",
+        "evidence": "Current quote.",
+        "limitations": "Future path unknown.",
+    }
+
+    with pytest.raises(
+        ValidationError,
+        match="PLAN_DECISION_EXPERIMENT_INCOMPLETE",
+    ):
+        PlanCreatePayload.model_validate(values)
+
+
+def test_demo_flow_check_cannot_be_labelled_as_profit_seeking() -> None:
+    values = _direct_payload(_direct_schedule()).model_dump(mode="json")
+    values["decision_basis"] = {
+        "kind": "STRATEGY_SIGNAL",
+        "decision_basis_ref": "ONE_SHOT_DONCHIAN_ATR_BREAKOUT",
+        "parameters": {"demo_immediate_entry": True},
+    }
+    values["order_schedule_spec"] = None
+    values["decision_context"]["playbook_ref"] = None
+
+    with pytest.raises(
+        ValidationError,
+        match="DEMO_FLOW_CHECK_REQUIRES_VALIDATION_INTENT",
+    ):
         PlanCreatePayload.model_validate(values)
 
 
@@ -621,9 +687,13 @@ def test_activation_preview_returns_the_fixed_protection_and_exit_terms(
             parameters,
             product_build_id="b" * 64,
         ),
-        requested_limits=SimpleNamespace(
-            max_notional="500",
-            model_dump=lambda **_kwargs: {
+        decision_context=PlanDecisionContext.model_validate(
+            VALIDATION_DECISION_CONTEXT
+        ),
+            requested_limits=SimpleNamespace(
+                max_notional="500",
+                max_allowed_loss="500",
+                model_dump=lambda **_kwargs: {
                 "max_margin": "500",
                 "max_notional": "500",
                 "max_allowed_loss": "500",
@@ -648,6 +718,13 @@ def test_activation_preview_returns_the_fixed_protection_and_exit_terms(
         "halpha.app.planning_api.PostgreSQLPlanningRepository",
         _Repository,
     )
+    monkeypatch.setattr(
+        "halpha.app.planning_api.PlanningApplicationService.new_risk_discipline_status",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            new_risk_allowed=True,
+            model_dump=lambda **_kwargs: None,
+        ),
+    )
 
     preview = api.activation_preview("plan-version-live-001")
 
@@ -657,6 +734,14 @@ def test_activation_preview_returns_the_fixed_protection_and_exit_terms(
     assert preview["product_build_consistent"] is False
     assert preview["runtime_compatible"] is True
     assert preview["live_activation_eligible"] is True
+
+    version.decision_context = PlanDecisionContext.model_validate(DECISION_CONTEXT)
+    incompatible_preview = api.activation_preview("plan-version-live-001")
+    assert incompatible_preview["runtime_compatible"] is False
+    assert incompatible_preview["runtime_incompatibility_reason"] == (
+        "STRATEGY_DECISION_INTENT_NOT_QUALIFIED"
+    )
+    assert incompatible_preview["live_activation_eligible"] is False
 
 
 def test_plan_list_marks_old_build_provenance_but_keeps_runtime_compatibility(
@@ -682,6 +767,7 @@ def test_plan_list_marks_old_build_provenance_but_keeps_runtime_compatibility(
                     "plan_name": "AI short breakout",
                     "created_at": NOW.isoformat(),
                     "creator_kind": "AI",
+                    "decision_context": VALIDATION_DECISION_CONTEXT,
                     "decision_basis": {
                         "kind": "STRATEGY_SIGNAL",
                         "decision_basis_ref": "ONE_SHOT_DONCHIAN_ATR_BREAKOUT",
@@ -706,6 +792,7 @@ def test_plan_list_marks_old_build_provenance_but_keeps_runtime_compatibility(
                 None,
                 list(fixed_basis.allowed_action_profiles),
                 None,
+                VALIDATION_DECISION_CONTEXT,
             )
         ]
     )
