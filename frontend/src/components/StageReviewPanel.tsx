@@ -23,6 +23,7 @@ import {
   type StageReviewCreatePayload,
 } from "../api/client";
 import { formatUserVisibleTime } from "../format";
+import { financialToneClassName, financialToneForSignedValue } from "../marketColors";
 import {
   clearPersistentRequestIdentity,
   persistentRequestIdentity,
@@ -71,17 +72,8 @@ function signedUsdt(value: unknown): string {
   if (!Number.isFinite(number)) return "未知";
   return `${new Intl.NumberFormat("zh-CN", {
     minimumFractionDigits: 2,
-    maximumFractionDigits: 6,
+    maximumFractionDigits: 2,
     signDisplay: "exceptZero",
-  }).format(number)} USDT`;
-}
-
-function unsignedUsdt(value: unknown): string {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return "未知";
-  return `${new Intl.NumberFormat("zh-CN", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 6,
   }).format(number)} USDT`;
 }
 
@@ -275,15 +267,15 @@ export default function StageReviewPanel({
                 mt: 1.5,
               }}>
                 {[
-                  ["可靠闭合", `${reliableCount} 笔`],
-                  ["累计净盈亏", signedUsdt(metrics.net_pnl)],
-                  ["累计净回报", returnPercent(metrics.notional_return_percent)],
-                  ["累计手续费", unsignedUsdt(metrics.commission)],
-                  ["待评价", `${pendingCount} 笔`],
-                ].map(([label, value]) => (
-                  <Box key={label}>
-                    <Typography variant="caption" color="text.secondary">{label}</Typography>
-                    <Typography className="mono" sx={{ fontWeight: 750 }}>{value}</Typography>
+                  { label: "可靠闭合", value: `${reliableCount} 笔` },
+                  { label: "累计净盈亏", value: signedUsdt(metrics.net_pnl), tone: financialToneForSignedValue(metrics.net_pnl) },
+                  { label: "累计净回报", value: returnPercent(metrics.notional_return_percent), tone: financialToneForSignedValue(metrics.notional_return_percent) },
+                  { label: "累计手续费", value: signedUsdt(-Math.abs(Number(metrics.commission))), tone: financialToneForSignedValue(-1) },
+                  { label: "待评价", value: `${pendingCount} 笔` },
+                ].map((item) => (
+                  <Box key={item.label}>
+                    <Typography variant="caption" color="text.secondary">{item.label}</Typography>
+                    <Typography className={`mono ${financialToneClassName(item.tone) ?? ""}`} sx={{ fontWeight: 750 }}>{item.value}</Typography>
                   </Box>
                 ))}
               </Box>

@@ -7,8 +7,8 @@ import {
 import type { ReactNode } from "react";
 
 import {
-  MarketToneText,
-  marketToneForSignedValue,
+  FinancialToneText,
+  financialToneForSignedValue,
   type MarketColorScheme,
 } from "../marketColors";
 import {
@@ -28,7 +28,7 @@ function signedUsdt(value: number | null | undefined): string {
   const normalized = Math.abs(value as number) < 0.0000005 ? 0 : value as number;
   return `${new Intl.NumberFormat("zh-CN", {
     minimumFractionDigits: 2,
-    maximumFractionDigits: 6,
+    maximumFractionDigits: 2,
     signDisplay: "exceptZero",
   }).format(normalized)} USDT`;
 }
@@ -37,8 +37,13 @@ function unsignedUsdt(value: number | null | undefined): string {
   if (!Number.isFinite(value)) return "未知";
   return `${new Intl.NumberFormat("zh-CN", {
     minimumFractionDigits: 2,
-    maximumFractionDigits: 6,
+    maximumFractionDigits: 2,
   }).format(value as number)} USDT`;
+}
+
+function costUsdt(value: number | null | undefined): string {
+  if (!Number.isFinite(value)) return "未知";
+  return signedUsdt(-Math.abs(value as number));
 }
 
 function percent(value: number): string {
@@ -123,12 +128,12 @@ export default function ReviewPerformanceOverview({
             {
               label: "账户累计净盈亏",
               value: signedUsdt(accountSummary.netPnl),
-              tone: marketToneForSignedValue(accountSummary.netPnl),
+              tone: financialToneForSignedValue(accountSummary.netPnl),
             },
             {
               label: "账户累计净回报",
               value: signedReturnPercent(accountSummary.notionalReturnPercent),
-              tone: marketToneForSignedValue(accountSummary.notionalReturnPercent),
+              tone: financialToneForSignedValue(accountSummary.notionalReturnPercent),
               help: accountSummary.notionalReturnPercent === null
                 ? `需要每笔完整闭合交易都有可靠的正入场成交额；当前覆盖 ${accountSummary.entryNotionalTradeCount}/${accountSummary.tradeCount} 笔。不会用部分样本替代。`
                 : `账户累计净盈亏 ÷ 全部可靠闭合交易的入场成交额合计；当前分母 ${unsignedUsdt(accountSummary.totalEntryNotional)}。保留验证性交易和工具问题造成的真实账户结果，但不是账户权益或保证金收益率。`,
@@ -141,7 +146,7 @@ export default function ReviewPerformanceOverview({
             {
               label: "盈利样本单笔净结果",
               value: signedUsdt(profitSeekingSummary.averageNetPnl),
-              tone: marketToneForSignedValue(profitSeekingSummary.averageNetPnl),
+              tone: financialToneForSignedValue(profitSeekingSummary.averageNetPnl),
               help: "盈利导向已评价样本累计净盈亏 ÷ 样本数；是费用后的异质历史平均结果，不是未来收益预测。",
             },
             {
@@ -158,7 +163,7 @@ export default function ReviewPerformanceOverview({
             {
               label: "账户最大回撤",
               value: signedUsdt(-accountSummary.maximumDrawdown),
-              tone: marketToneForSignedValue(-accountSummary.maximumDrawdown),
+              tone: financialToneForSignedValue(-accountSummary.maximumDrawdown),
               help: "按全部可靠闭合交易的真实账户净结果依次累加，从此前最高点到后续最低点的最大下降；起始值按 0 计算。",
             },
             {
@@ -167,13 +172,13 @@ export default function ReviewPerformanceOverview({
                 ? `${profitSeekingSummary.currentStreakCount} 笔`
                 : "无",
               tone: profitSeekingSummary.currentStreakKind === "LOSS"
-                ? marketToneForSignedValue(-1)
+                ? financialToneForSignedValue(-1)
                 : profitSeekingSummary.currentStreakKind === "WIN"
-                  ? marketToneForSignedValue(1)
+                  ? financialToneForSignedValue(1)
                   : undefined,
               help: "只按最近一段合格策略样本的净结果统计；方向改变或持平会结束当前连续结果。",
             },
-            { label: "账户累计手续费", value: unsignedUsdt(accountSummary.commissions) },
+            { label: "账户累计手续费", value: costUsdt(accountSummary.commissions), tone: financialToneForSignedValue(-1) },
           ].map((item) => (
             <Box
               key={item.label}
@@ -210,7 +215,7 @@ export default function ReviewPerformanceOverview({
                   </Typography>
                 )}
               <Typography className="mono" sx={{ mt: 0.25, fontWeight: 750 }}>
-                <MarketToneText tone={item.tone}>{item.value}</MarketToneText>
+                <FinancialToneText tone={item.tone}>{item.value}</FinancialToneText>
               </Typography>
             </Box>
           ))}

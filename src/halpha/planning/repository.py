@@ -142,11 +142,37 @@ class PostgreSQLPlanningRepository:
         )
 
     def has_fixed_version(self, plan_id: str) -> bool:
+        """Compatibility read for historical snapshots.
+
+        New plan admission must not use this predicate: a snapshot has no
+        user-visible lifecycle of its own and is only persisted together with a
+        successful activation.  It remains for historical readers while older
+        data is retained.
+        """
         row = self._connection.execute(
             """
             SELECT EXISTS (
                 SELECT 1 FROM halpha.trade_plan_version
                 WHERE environment_id = %s AND plan_id = %s
+            )
+            """,
+            (self._environment_id, plan_id),
+        ).fetchone()
+        return bool(row and row[0])
+
+    def has_activation(self, plan_id: str) -> bool:
+        """Return whether this plan has ever entered its immutable run path."""
+
+        row = self._connection.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM halpha.plan_activation activation
+                JOIN halpha.trade_plan_version snapshot
+                  ON snapshot.environment_id = activation.environment_id
+                 AND snapshot.plan_version_id = activation.plan_version_ref
+                WHERE activation.environment_id = %s
+                  AND snapshot.plan_id = %s
             )
             """,
             (self._environment_id, plan_id),
@@ -179,6 +205,7 @@ class PostgreSQLPlanningRepository:
             """
             INSERT INTO halpha.trade_plan_version (
                 plan_version_id, environment_id, plan_id, fixed_at,
+                ai_review_ref,
                 decision_basis_ref, product_build_id, parameter_schema_version,
                 parameters, parameter_digest, account_ref, venue_ref, instrument_ref,
                 direction, max_margin, max_notional, max_allowed_loss, terms,
@@ -187,7 +214,7 @@ class PostgreSQLPlanningRepository:
                 position_alignment, position_alignment_digest
             ) VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
             )
             """,
             (
@@ -195,6 +222,7 @@ class PostgreSQLPlanningRepository:
                 version.environment_id,
                 version.plan_id,
                 version.fixed_at,
+                getattr(version, "ai_review_ref", None),
                 basis.decision_basis_ref,
                 basis.product_build_id,
                 basis.parameter_schema_version,
@@ -272,7 +300,7 @@ class PostgreSQLPlanningRepository:
         row = self._connection.execute(
             """
             SELECT plan_version_id, plan_id, environment_id, fixed_at,
-                   fixed_decision_basis, account_ref, venue_ref, instrument_ref,
+                   ai_review_ref, fixed_decision_basis, account_ref, venue_ref, instrument_ref,
                    direction, max_margin, max_notional, max_allowed_loss, terms,
                    content_digest, order_schedule_spec, order_schedule_spec_digest,
                    position_alignment, position_alignment_digest
@@ -283,7 +311,7 @@ class PostgreSQLPlanningRepository:
         ).fetchone()
         if row is None:
             raise PlanningConflict("PLAN_VERSION_NOT_FOUND")
-        terms = dict(row[12])
+        terms = dict(row[13])
         created_at = terms.pop("created_at", None)
         decision_context_payload = terms.pop("decision_context", None)
         try:
@@ -295,17 +323,17 @@ class PostgreSQLPlanningRepository:
         except ValueError:
             raise PlanningConflict("PLAN_DECISION_CONTEXT_CORRUPT") from None
         try:
-            schedule_spec = load_persisted_order_schedule_spec(row[14], row[15])
+            schedule_spec = load_persisted_order_schedule_spec(row[15], row[16])
         except ValueError:
             raise PlanningConflict("ORDER_SCHEDULE_SPEC_CORRUPT") from None
         alignment = (
-            PositionAlignmentSpec.model_validate(row[16])
-            if row[16] is not None
+            PositionAlignmentSpec.model_validate(row[17])
+            if row[17] is not None
             else None
         )
-        if (alignment is None) != (row[17] is None) or (
+        if (alignment is None) != (row[18] is None) or (
             alignment is not None
-            and content_digest(alignment) != str(row[17])
+            and content_digest(alignment) != str(row[18])
         ):
             raise PlanningConflict("POSITION_ALIGNMENT_CORRUPT")
         return TradePlanVersion.model_validate(
@@ -319,25 +347,26 @@ class PostgreSQLPlanningRepository:
                     datetime.fromisoformat(str(created_at)) if created_at else None
                 ),
                 "creator_kind": terms.pop("creator_kind", None),
+                "ai_review_ref": str(row[4]) if row[4] is not None else None,
                 "decision_context": decision_context,
-                "decision_basis": _fixed_decision_basis(row[4]),
+                "decision_basis": _fixed_decision_basis(row[5]),
                 "order_schedule_spec": schedule_spec,
                 "position_alignment": alignment,
-                "account_ref": str(row[5]),
-                "venue_ref": str(row[6]),
-                "instrument_ref": str(row[7]),
-                "direction": str(row[8]),
+                "account_ref": str(row[6]),
+                "venue_ref": str(row[7]),
+                "instrument_ref": str(row[8]),
+                "direction": str(row[9]),
                 "target_exposure": str(terms.pop("target_exposure")),
                 "requested_limits": {
-                    "max_margin": str(row[9]),
-                    "max_notional": str(row[10]),
-                    "max_allowed_loss": str(row[11]),
+                    "max_margin": str(row[10]),
+                    "max_notional": str(row[11]),
+                    "max_allowed_loss": str(row[12]),
                 },
                 "valid_from": datetime.fromisoformat(str(terms.pop("valid_from"))),
                 "valid_until": datetime.fromisoformat(str(terms.pop("valid_until"))),
                 "allowed_actions": frozenset(terms.pop("allowed_actions")),
                 "terms": terms,
-                "content_digest": str(row[13]),
+                "content_digest": str(row[14]),
             },
             context={PERSISTED_HISTORY_CONTEXT_KEY: True},
         )

@@ -216,6 +216,26 @@ def _runtime_ready_log_fields(
     }
 
 
+def _runtime_build_failure_log_fields(exc: Exception) -> dict[str, str]:
+    """Return a stable, credential-safe startup failure record.
+
+    ``ProductExecutorRuntime.build`` deliberately sanitizes unexpected
+    dependency failures before it crosses the process boundary.  Preserve that
+    reason at the only durable startup log boundary so a scheduled restart is
+    diagnosable without emitting exception text or configuration values.
+    """
+
+    reason_code = (
+        str(exc)
+        if isinstance(exc, ExecutorRuntimeError)
+        else f"PRODUCT_RUNTIME_BUILD_FAILED type={type(exc).__name__}"
+    )
+    return {
+        "exception_type": type(exc).__name__,
+        "reason_code": reason_code,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog=ProcessRole.EXECUTOR.value)
     parser.add_argument("--config", type=Path, required=True)
@@ -529,7 +549,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             failure_stop_signaled = False
             try:
                 liveness_watchdog.start()
-                runtime.build()
+                try:
+                    runtime.build()
+                except Exception as exc:
+                    logger.error(
+                        "runtime_build_failed",
+                        **_runtime_build_failure_log_fields(exc),
+                    )
+                    raise
                 if observation is not None:
                     observation.record_process_started()
 

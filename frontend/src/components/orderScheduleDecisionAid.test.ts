@@ -77,9 +77,8 @@ describe("currentEntryBoundaryBreach", () => {
 });
 
 describe("entrySignalQualityWarning", () => {
-  it("warns that an immediate plan does not inherit conditions from its name or chart", () => {
-    expect(entrySignalQualityWarning("LONG", "ALL", [ready]))
-      .toContain("计划名称与图上线不会自动成为执行条件");
+  it("keeps an intentionally immediate plan quiet", () => {
+    expect(entrySignalQualityWarning("LONG", "ALL", [ready])).toBeNull();
   });
 
   it("does not mistake a spread-only constraint for a directional entry signal", () => {

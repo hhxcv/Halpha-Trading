@@ -111,8 +111,8 @@ export function localOrderScheduleProblems(
   const protection = spec.protection_policy;
   if (protection !== null) {
     const stopDistance = finiteNumber(protection.initial_stop.distance_bps);
-    if (stopDistance === null || stopDistance <= 0 || stopDistance > 5_000) {
-      problems.push("初始止损距离必须大于 0 且不超过 5000 bps。");
+    if (stopDistance === null || stopDistance <= 0 || stopDistance >= 10_000) {
+      problems.push("初始止损距离必须大于 0 且低于 10000 bps。");
     }
     for (const level of protection.take_profit_ladder?.levels ?? []) {
       if (!isPositive(level.trigger_r)) problems.push("止盈目标 R 必须大于 0。");

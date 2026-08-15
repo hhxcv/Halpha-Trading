@@ -9,6 +9,7 @@ import sys
 from typing import Sequence
 
 from halpha.configuration import ConfigurationError, load_settings
+from halpha.database.migrate import verify_current_schema_for_config
 from halpha.runtime_control import RuntimeControlError, RuntimeController
 from halpha.runtime_identity import (
     RuntimeIdentityError,
@@ -77,13 +78,31 @@ def render_status_report(report: dict[str, object]) -> str:
                 )
             )
     lines = [
-        f"Halpha service status: {_human_token(report.get('status', 'UNKNOWN'))}",
-        "",
-        _table(
-            ("SERVICE", "STATE", "HEALTH", "ENABLED", "PID", "LISTENERS", "MANAGED BY"),
-            rows,
-        ),
+        f"Halpha service status: {_human_token(report.get('status', 'UNKNOWN'))}"
     ]
+    schema = report.get("database_schema")
+    if isinstance(schema, dict):
+        schema_status = _human_token(schema.get("status", "UNKNOWN"))
+        schema_reason = schema.get("reason")
+        detail = f" ({schema_reason})" if schema_reason else ""
+        lines.append(f"Database schema: {schema_status}{detail}")
+    lines.extend(
+        (
+            "",
+            _table(
+                (
+                    "SERVICE",
+                    "STATE",
+                    "HEALTH",
+                    "ENABLED",
+                    "PID",
+                    "LISTENERS",
+                    "MANAGED BY",
+                ),
+                rows,
+            ),
+        )
+    )
     warnings = report.get("warnings")
     if isinstance(warnings, list) and warnings:
         lines.extend(("", "Warnings:", *(f"  - {warning}" for warning in warnings)))
@@ -198,9 +217,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         require_repository_runtime(root)
         config_path = args.config or root / DEFAULT_CONFIG
         settings = load_settings(config_path)
-        controller = RuntimeController(root, settings, config_path)
+        controller = RuntimeController(
+            root,
+            settings,
+            config_path,
+            schema_readiness=lambda: verify_current_schema_for_config(config_path),
+        )
         if args.command == "status":
             report = controller.inventory().to_dict()
+            database_schema = controller.database_schema_status()
+            report["database_schema"] = database_schema
+            if database_schema["status"] != "CURRENT":
+                report["status"] = "ATTENTION_REQUIRED"
+                warning = str(
+                    database_schema.get(
+                        "reason",
+                        "DATABASE_SCHEMA_READINESS_NOT_CHECKED",
+                    )
+                )
+                warnings = list(report["warnings"])
+                if warning not in warnings:
+                    warnings.append(warning)
+                report["warnings"] = warnings
             exit_code = 0 if report["status"] == "CONTROLLED" else 3
         elif args.command == "start":
             report = controller.start(

@@ -242,6 +242,54 @@ def _exposure_state(
     )
 
 
+def _available_notional_capacity(
+    *,
+    positions: tuple[AccountPositionRisk, ...],
+    attempts: tuple[NewRiskAttempt, ...],
+    limits: _RiskLimits,
+    exposure: _ExposureState,
+    instrument_ref: str | None,
+) -> Decimal | None:
+    """Project remaining target-instrument nominal exposure without reserving it.
+
+    The result deliberately covers only the exposure portion of the account
+    discipline.  A caller must still apply the compiled schedule's loss budget
+    and the activation / submission-time CAP checks.
+    """
+    if instrument_ref is None:
+        return None
+    cluster = _cluster(instrument_ref)
+    if cluster is None:
+        return None
+
+    planned: dict[str, Decimal] = {}
+    for attempt in attempts:
+        planned[attempt.instrument_ref] = planned.get(
+            attempt.instrument_ref, Decimal(0)
+        ) + Decimal(attempt.max_notional)
+    actual: dict[str, Decimal] = {}
+    for position in positions:
+        actual[position.instrument_ref] = actual.get(
+            position.instrument_ref, Decimal(0)
+        ) + abs(Decimal(position.notional))
+
+    planned_target = planned.get(instrument_ref, Decimal(0))
+    target_before = max(actual.get(instrument_ref, Decimal(0)), planned_target)
+    gross_other = exposure.gross_before - target_before
+    cluster_before = sum(
+        amount
+        for current_instrument, amount in _overlay_exposure(actual, planned).items()
+        if _cluster(current_instrument) == cluster
+    )
+    cluster_other = cluster_before - target_before
+    candidates = (
+        limits.gross - gross_other - planned_target,
+        limits.instrument - planned_target,
+        limits.correlated - cluster_other - planned_target,
+    )
+    return max(Decimal(0), min(candidates))
+
+
 def _loss_state(
     *,
     results: tuple[NewRiskResult, ...],
@@ -401,6 +449,8 @@ def _status_unknown(
         account_snapshot_cutoff=None,
         risk_equity=None,
         max_plan_loss=None,
+        minimum_reward_risk_ratio=policy.minimum_reward_risk_ratio,
+        available_notional_capacity=None,
         open_risk_limit=None,
         open_risk_committed=None,
         open_risk_after_proposal=None,
@@ -482,6 +532,15 @@ def evaluate_new_risk_discipline(
         instrument_ref=proposed_instrument_ref,
         direction=proposed_direction,
     )
+    exposure_target = proposed if proposed.instrument_ref else _ProposedRisk(
+        present=False,
+        loss=Decimal(0),
+        notional=Decimal(0),
+        instrument_ref=entry_instrument_ref,
+        direction=entry_direction,
+        cluster=_cluster(entry_instrument_ref) if entry_instrument_ref else None,
+        blocker_codes=(),
+    )
 
     open_attempts = tuple(item for item in attempts if item.lifecycle != "COMPLETED")
     planned_risk = sum(
@@ -490,7 +549,7 @@ def evaluate_new_risk_discipline(
     exposure = _exposure_state(
         positions=account_equity.positions,
         attempts=open_attempts,
-        proposed=proposed,
+        proposed=exposure_target,
     )
     losses = _loss_state(
         results=results,
@@ -504,6 +563,8 @@ def evaluate_new_risk_discipline(
         blockers.append("NEW_RISK_ENTRY_DIRECTION_INVALID")
     if entry_instrument_ref is not None and entry_direction is None:
         blockers.append("NEW_RISK_ENTRY_DIRECTION_INVALID")
+    if entry_instrument_ref is not None and _cluster(entry_instrument_ref) is None:
+        blockers.append("NEW_RISK_CORRELATION_CLUSTER_UNKNOWN")
     if exposure.unknown_instruments:
         blockers.append("NEW_RISK_CORRELATION_CLUSTER_UNKNOWN")
     blockers.extend(
@@ -537,6 +598,18 @@ def evaluate_new_risk_discipline(
             frozen_scale_in=is_frozen_scale_in and not proposed.present,
         )
     )
+    capacity_instrument = proposed.instrument_ref or entry_instrument_ref
+    available_notional_capacity = (
+        _available_notional_capacity(
+            positions=account_equity.positions,
+            attempts=open_attempts,
+            limits=limits,
+            exposure=exposure,
+            instrument_ref=capacity_instrument,
+        )
+        if not blockers
+        else None
+    )
     return NewRiskDisciplineStatus(
         status=_discipline_status(blockers),
         new_risk_allowed=not blockers,
@@ -545,6 +618,12 @@ def evaluate_new_risk_discipline(
         account_snapshot_cutoff=cutoff,
         risk_equity=canonical_decimal(risk_equity),
         max_plan_loss=canonical_decimal(limits.max_plan_loss),
+        minimum_reward_risk_ratio=policy.minimum_reward_risk_ratio,
+        available_notional_capacity=(
+            canonical_decimal(available_notional_capacity)
+            if available_notional_capacity is not None
+            else None
+        ),
         open_risk_limit=canonical_decimal(limits.open_risk),
         open_risk_committed=canonical_decimal(planned_risk),
         open_risk_after_proposal=canonical_decimal(planned_risk + proposed.loss),
@@ -555,7 +634,7 @@ def evaluate_new_risk_discipline(
         instrument_exposure_limit=canonical_decimal(limits.instrument),
         instrument_exposure=canonical_decimal(exposure.instrument_before),
         instrument_exposure_after_proposal=canonical_decimal(exposure.instrument_after),
-        correlation_cluster=proposed.cluster,
+        correlation_cluster=exposure_target.cluster,
         correlated_exposure_limit=canonical_decimal(limits.correlated),
         correlated_exposure=canonical_decimal(exposure.correlated_before),
         correlated_exposure_after_proposal=canonical_decimal(exposure.correlated_after),

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
+from math import isfinite
 from typing import Any, Protocol
 
 import psycopg
@@ -36,7 +37,12 @@ class ProjectionUnavailable(RuntimeError):
 
 
 class WorkbenchProjection(Protocol):
-    def overview(self) -> dict[str, Any]: ...
+    def overview(
+        self,
+        *,
+        entry_instrument_ref: str | None = None,
+        entry_direction: str | None = None,
+    ) -> dict[str, Any]: ...
 
     def availability(self) -> dict[str, Any]: ...
 
@@ -96,6 +102,45 @@ def _empty_account_snapshot(status: str) -> dict[str, object]:
         "account_summary": None,
         "account_positions": [],
         "account_orders": [],
+    }
+
+
+def _project_account_observation_failure(
+    *,
+    snapshot_cutoff: object,
+    failure_at: object,
+    reason_code: object,
+    retry_after_seconds: object,
+) -> dict[str, object]:
+    """Expose only a failure that is newer than the latest full snapshot."""
+
+    failed_at = _aware_utc(failure_at)
+    latest_snapshot = _aware_utc(snapshot_cutoff)
+    safe_reason = str(reason_code or "").strip()
+    if (
+        failed_at is None
+        or not safe_reason
+        or len(safe_reason) > 128
+        or not all(character in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_" for character in safe_reason)
+        or (latest_snapshot is not None and failed_at <= latest_snapshot)
+    ):
+        return {
+            "account_observation_failure_at": None,
+            "account_observation_failure_code": None,
+            "account_observation_retry_after_seconds": None,
+        }
+    try:
+        retry_after = float(retry_after_seconds)
+    except (TypeError, ValueError):
+        retry_after = None
+    if retry_after is not None and (not isfinite(retry_after) or retry_after < 0):
+        retry_after = None
+    return {
+        "account_observation_failure_at": failed_at.isoformat().replace(
+            "+00:00", "Z"
+        ),
+        "account_observation_failure_code": safe_reason,
+        "account_observation_retry_after_seconds": retry_after,
     }
 
 
@@ -438,7 +483,12 @@ class PostgreSQLWorkbenchProjection:
                 f"DATABASE_UNAVAILABLE type={type(exc).__name__}"
             ) from None
 
-    def overview(self) -> dict[str, Any]:
+    def overview(
+        self,
+        *,
+        entry_instrument_ref: str | None = None,
+        entry_direction: str | None = None,
+    ) -> dict[str, Any]:
         try:
             with self._connect() as connection, connection.cursor() as cursor:
                 cursor.execute(
@@ -456,7 +506,10 @@ class PostgreSQLWorkbenchProjection:
                          FROM halpha.plan_activation
                          WHERE environment_id = %s
                            AND lifecycle <> 'COMPLETED'
-                           AND has_entry_fill)
+                           AND has_entry_fill),
+                        observation.failure_at,
+                        observation.reason_code,
+                        observation.retry_after_seconds
                     FROM (SELECT 1) AS singleton
                     LEFT JOIN LATERAL (
                         SELECT venue_fact_id, cutoff, payload
@@ -468,10 +521,19 @@ class PostgreSQLWorkbenchProjection:
                         ORDER BY cutoff DESC, received_at DESC, venue_fact_id DESC
                         LIMIT 1
                     ) AS snapshot ON TRUE
+                    LEFT JOIN LATERAL (
+                        SELECT failure_at, reason_code, retry_after_seconds
+                        FROM halpha.account_observation_failure
+                        WHERE environment_id = %s
+                          AND account_ref = %s
+                        LIMIT 1
+                    ) AS observation ON TRUE
                     """,
                     (
                         self.environment_id,
                         self.environment_id,
+                        self.environment_id,
+                        self.account_id,
                         self.environment_id,
                         self.account_id,
                     ),
@@ -479,12 +541,14 @@ class PostgreSQLWorkbenchProjection:
                 row = cursor.fetchone()
                 observed_at = _aware_utc(row[0]) if row is not None else None
                 if observed_at is None:
-                    discipline = evaluate_new_risk_discipline(
-                        policy=self.new_risk_discipline_policy,
-                        observed_at=datetime.now(UTC),
-                        account_equity=None,
-                        attempts=(),
-                    )
+                        discipline = evaluate_new_risk_discipline(
+                            policy=self.new_risk_discipline_policy,
+                            observed_at=datetime.now(UTC),
+                            account_equity=None,
+                            attempts=(),
+                            entry_instrument_ref=entry_instrument_ref,
+                            entry_direction=entry_direction,
+                        )
                 else:
                     try:
                         discipline = read_new_risk_discipline(
@@ -493,6 +557,8 @@ class PostgreSQLWorkbenchProjection:
                             account_ref=self.account_id,
                             policy=self.new_risk_discipline_policy,
                             observed_at=observed_at,
+                            entry_instrument_ref=entry_instrument_ref,
+                            entry_direction=entry_direction,
                         )
                     except Exception:
                         discipline = evaluate_new_risk_discipline(
@@ -500,6 +566,8 @@ class PostgreSQLWorkbenchProjection:
                             observed_at=observed_at,
                             account_equity=None,
                             attempts=(),
+                            entry_instrument_ref=entry_instrument_ref,
+                            entry_direction=entry_direction,
                         )
         except ProjectionUnavailable:
             raise
@@ -519,6 +587,12 @@ class PostgreSQLWorkbenchProjection:
             payload=row[6],
             attributed_instruments=tuple(str(item) for item in (row[7] or ())),
         )
+        account_observation_failure = _project_account_observation_failure(
+            snapshot_cutoff=row[5],
+            failure_at=row[8],
+            reason_code=row[9],
+            retry_after_seconds=row[10],
+        )
         return {
             "database_available": True,
             "server_fact_cutoff": str(cutoff),
@@ -527,6 +601,7 @@ class PostgreSQLWorkbenchProjection:
             "database_role": str(row[3]),
             "new_risk_discipline": discipline.model_dump(mode="json"),
             **account_snapshot,
+            **account_observation_failure,
         }
 
     def availability(self) -> dict[str, Any]:

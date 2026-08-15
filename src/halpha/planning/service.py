@@ -137,6 +137,56 @@ def plan_runtime_incompatibility(
     return fixed_decision_basis_runtime_incompatibility(decision_basis)
 
 
+def plan_reward_risk_ratio(
+    *,
+    decision_basis: FixedDecisionBasis,
+    order_schedule_spec: OrderScheduleSpec | None,
+) -> Decimal | None:
+    """Return the conservative weighted price-exit reward/risk ratio."""
+
+    if decision_basis.kind is DecisionBasisKind.DIRECT_EXECUTION:
+        if order_schedule_spec is None:
+            return None
+        ladder = order_schedule_spec.protection_policy.take_profit_ladder
+        if ladder is None:
+            return None
+        return sum(
+            (
+                Decimal(level.trigger_r) * Decimal(level.quantity_fraction)
+                for level in ladder.levels
+            ),
+            Decimal(0),
+        )
+    if not isinstance(decision_basis, FixedStrategyPlanBasis):
+        return None
+    parameters = decision_basis.normalized_parameters
+    try:
+        first_r = Decimal(str(parameters["take_profit_1_r"]))
+        first_fraction = Decimal(str(parameters["take_profit_1_fraction"]))
+        second_r = Decimal(str(parameters["take_profit_2_r"]))
+    except (InvalidOperation, KeyError, TypeError, ValueError):
+        return None
+    ratio = first_r * first_fraction + second_r * (Decimal(1) - first_fraction)
+    return ratio if ratio.is_finite() and ratio > 0 else None
+
+
+def require_plan_reward_risk_discipline(
+    *,
+    decision_basis: FixedDecisionBasis,
+    order_schedule_spec: OrderScheduleSpec | None,
+    policy: NewRiskDisciplinePolicy,
+) -> Decimal:
+    ratio = plan_reward_risk_ratio(
+        decision_basis=decision_basis,
+        order_schedule_spec=order_schedule_spec,
+    )
+    if ratio is None:
+        raise ValueError("PLAN_REWARD_RISK_UNAVAILABLE")
+    if ratio < Decimal(policy.minimum_reward_risk_ratio):
+        raise ValueError("PLAN_REWARD_RISK_BELOW_DISCIPLINE_MINIMUM")
+    return ratio
+
+
 def _aware_utc(value: object) -> datetime | None:
     if not isinstance(value, datetime):
         return None
@@ -365,12 +415,42 @@ class PlanningApplicationService:
         expected_version: int,
         content: TradePlanContent,
         observed_at: datetime,
+        preserve_system_evidence_cutoff: bool = True,
     ) -> TradePlanDraft:
         current = self._planning.get_draft(plan_id, for_update=True)
         if current.draft_version != expected_version:
             raise ValueError("PLAN_VERSION_CONFLICT")
-        if self._planning.has_fixed_version(plan_id):
-            raise ValueError("PLAN_DRAFT_FIXED")
+        if self._planning.has_activation(plan_id):
+            raise ValueError("PLAN_ALREADY_STARTED")
+        if preserve_system_evidence_cutoff and content.decision_context is not None:
+            current_context = current.content.decision_context
+            content = content.model_copy(
+                update={
+                    "decision_context": content.decision_context.model_copy(
+                        update={
+                            "evidence_cutoff": (
+                                current_context.evidence_cutoff
+                                if current_context is not None
+                                else None
+                            )
+                        }
+                    )
+                }
+            )
+        requested_duration = content.valid_until - content.valid_from
+        comparable = content.model_copy(
+            update={
+                "created_at": current.content.created_at,
+                "creator_kind": current.content.creator_kind,
+                "valid_from": current.content.valid_from,
+                "valid_until": current.content.valid_from + requested_duration,
+            }
+        )
+        # Periodic saving must not manufacture a new draft version when the
+        # trader has not changed a plan field. That could otherwise invalidate
+        # an AI review already bound to this draft.
+        if content_digest(current.content) == content_digest(comparable):
+            return current
         content = content.model_copy(
             update={
                 "created_at": current.content.created_at,
@@ -392,28 +472,42 @@ class PlanningApplicationService:
         draft = self._planning.get_draft(plan_id, for_update=True)
         if draft.draft_version != expected_version:
             raise ValueError("PLAN_VERSION_CONFLICT")
-        if self._planning.has_fixed_version(plan_id):
-            raise ValueError("PLAN_DRAFT_FIXED")
+        if self._planning.has_activation(plan_id):
+            raise ValueError("PLAN_ALREADY_STARTED")
         self._planning.delete_draft(plan_id, expected_version=expected_version)
 
-    def fix_draft(
+    def build_activation_snapshot(
         self,
         *,
         plan_id: str,
         expected_draft_version: int,
         plan_version_id: str,
         product_build_id: str,
-        fixed_at: datetime,
+        snapshot_at: datetime,
+        ai_review_ref: str | None = None,
+        new_risk_discipline_policy: NewRiskDisciplinePolicy | None = None,
     ) -> TradePlanVersion:
+        """Build the immutable executor input without persisting it.
+
+        A snapshot is an implementation detail of a successful start, not a
+        separately visible plan state.  The caller may validate and compile a
+        schedule from this transient value, then persist it only in the same
+        transaction that creates the activation.
+        """
+
         draft = self._planning.get_draft(plan_id, for_update=True)
         if draft.draft_version != expected_draft_version:
             raise ValueError("PLAN_VERSION_CONFLICT")
+        if self._planning.has_activation(plan_id):
+            raise ValueError("PLAN_ALREADY_STARTED")
         content = draft.content
         basis = build_fixed_decision_basis(
             content.decision_basis,
             product_build_id=product_build_id,
         )
         if content.position_alignment is None:
+            if not ai_review_ref:
+                raise ValueError("PLAN_AI_REVIEW_REQUIRED")
             context_incompatibility = new_risk_decision_context_incompatibility(
                 decision_basis_kind=basis.kind,
                 decision_context=content.decision_context,
@@ -431,14 +525,24 @@ class PlanningApplicationService:
                 )
                 if intent_incompatibility is not None:
                     raise ValueError(intent_incompatibility)
+            if new_risk_discipline_policy is not None:
+                require_plan_reward_risk_discipline(
+                    decision_basis=basis,
+                    order_schedule_spec=content.order_schedule_spec,
+                    policy=new_risk_discipline_policy,
+                )
         fields = {
             "plan_version_id": plan_version_id,
             "plan_id": plan_id,
             "environment_id": self._environment_id,
-            "fixed_at": fixed_at,
+            # The persisted column retains its historical physical name.  It
+            # records snapshot creation time and is never exposed as a plan
+            # lifecycle state.
+            "fixed_at": snapshot_at,
             "plan_name": content.plan_name,
             "created_at": content.created_at,
             "creator_kind": content.creator_kind,
+            "ai_review_ref": ai_review_ref,
             "decision_context": content.decision_context,
             "decision_basis": basis,
             "order_schedule_spec": content.order_schedule_spec,
@@ -454,7 +558,34 @@ class PlanningApplicationService:
             "allowed_actions": content.allowed_actions,
             "terms": content.terms,
         }
-        version = TradePlanVersion(**fields, content_digest=content_digest(fields))
+        return TradePlanVersion(**fields, content_digest=content_digest(fields))
+
+    def fix_draft(
+        self,
+        *,
+        plan_id: str,
+        expected_draft_version: int,
+        plan_version_id: str,
+        product_build_id: str,
+        fixed_at: datetime,
+        ai_review_ref: str | None = None,
+        new_risk_discipline_policy: NewRiskDisciplinePolicy | None = None,
+    ) -> TradePlanVersion:
+        """Persist one immutable snapshot for compatibility callers.
+
+        Normal workbench submission uses :meth:`fix_and_activate`, which keeps
+        this insert and activation creation in one transaction.
+        """
+
+        version = self.build_activation_snapshot(
+            plan_id=plan_id,
+            expected_draft_version=expected_draft_version,
+            plan_version_id=plan_version_id,
+            product_build_id=product_build_id,
+            snapshot_at=fixed_at,
+            ai_review_ref=ai_review_ref,
+            new_risk_discipline_policy=new_risk_discipline_policy,
+        )
         self._planning.insert_version(version)
         return version
 
@@ -471,8 +602,28 @@ class PlanningApplicationService:
         live_profit_qualification_checker: (
             Callable[[TradePlanVersion], Mapping[str, Any]] | None
         ) = None,
+        ai_review_checker: (
+            Callable[[TradePlanVersion], Mapping[str, Any]] | None
+        ) = None,
     ) -> PlanActivation:
         version = self._planning.get_version(plan_version_id)
+        ai_review_snapshot: dict[str, Any] | None = None
+        if version.position_alignment is None:
+            if not version.ai_review_ref:
+                raise ValueError("PLAN_AI_REVIEW_REQUIRED")
+            if ai_review_checker is None:
+                raise ValueError("PLAN_AI_REVIEW_NOT_CONFIGURED")
+            review_result = ai_review_checker(version)
+            if not isinstance(review_result, Mapping):
+                raise ValueError("PLAN_AI_REVIEW_SNAPSHOT_INVALID")
+            ai_review_snapshot = dict(review_result)
+            if (
+                ai_review_snapshot.get("review_id") != version.ai_review_ref
+                or ai_review_snapshot.get("status") != "APPROVED"
+                or ai_review_snapshot.get("decision") != "APPROVE"
+                or ai_review_snapshot.get("draft_content_digest") is None
+            ):
+                raise ValueError("PLAN_AI_REVIEW_NOT_APPROVED")
         live_profit_qualification_snapshot: dict[str, Any] | None = None
         if (
             environment_kind is EnvironmentKind.LIVE
@@ -513,6 +664,11 @@ class PlanningApplicationService:
             version.position_alignment is None
             and new_risk_discipline_policy is not None
         ):
+            require_plan_reward_risk_discipline(
+                decision_basis=version.decision_basis,
+                order_schedule_spec=version.order_schedule_spec,
+                policy=new_risk_discipline_policy,
+            )
             discipline = self.new_risk_discipline_status(
                 account_ref=version.account_ref,
                 policy=new_risk_discipline_policy,
@@ -614,6 +770,11 @@ class PlanningApplicationService:
                 "deadlines": {"entry_valid_until": entry_valid_until.isoformat()},
                 "condition_judgements": {},
                 "last_bar_cursors": {},
+                **(
+                    {"ai_review": ai_review_snapshot}
+                    if ai_review_snapshot is not None
+                    else {}
+                ),
                 **(
                     {
                         "live_profit_qualification": (
@@ -1229,8 +1390,22 @@ class PlanningApplicationService:
         authority_class: AuthorityClass,
         product_build_id: str,
         observed_at: datetime,
+        ai_review_ref: str | None = None,
+        order_schedule_snapshot: OrderSchedulePreview | None = None,
+        ai_review_checker: (
+            Callable[[TradePlanVersion], Mapping[str, Any]] | None
+        ) = None,
+        live_profit_qualification_checker: (
+            Callable[[TradePlanVersion], Mapping[str, Any]] | None
+        ) = None,
+        new_risk_discipline_policy: NewRiskDisciplinePolicy | None = None,
     ) -> tuple[TradePlanVersion, PlanActivation]:
-        """Perform draft -> fixed -> activation inside the caller's transaction."""
+        """Persist a run snapshot and activation as one transaction unit.
+
+        The caller owns the transaction.  If any current-fact, discipline,
+        schedule, or activation check fails, the inserted snapshot rolls back
+        with the activation and the editable draft remains unchanged.
+        """
 
         version = self.fix_draft(
             plan_id=plan_id,
@@ -1238,6 +1413,8 @@ class PlanningApplicationService:
             plan_version_id=plan_version_id,
             product_build_id=product_build_id,
             fixed_at=observed_at,
+            ai_review_ref=ai_review_ref,
+            new_risk_discipline_policy=new_risk_discipline_policy,
         )
         activation = self.activate_version(
             plan_version_id=plan_version_id,
@@ -1245,5 +1422,9 @@ class PlanningApplicationService:
             environment_kind=environment_kind,
             authority_class=authority_class,
             observed_at=observed_at,
+            order_schedule_snapshot=order_schedule_snapshot,
+            ai_review_checker=ai_review_checker,
+            live_profit_qualification_checker=live_profit_qualification_checker,
+            new_risk_discipline_policy=new_risk_discipline_policy,
         )
         return version, activation

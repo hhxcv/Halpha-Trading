@@ -123,29 +123,17 @@ export function latestActivationsByPlanVersion(
 export function planWorkbenchSections(
   plans: PlanSummary[],
   activations: ActivationSummary[],
-  nowMs: number,
+  _nowMs: number,
 ): PlanWorkbenchSections {
   const currentActivations = activations.filter(
     (activation) => activation.lifecycle !== "COMPLETED",
   );
-  const latestByVersion = latestActivationsByPlanVersion(activations);
-  const activeVersionRefs = new Set(
-    currentActivations.map((activation) => activation.plan_version_ref),
-  );
-  const inactivePlans = plans.filter(
-    (plan) => !plan.plan_version_id || !activeVersionRefs.has(plan.plan_version_id),
-  );
-  const historicalPlans = inactivePlans.filter((plan) => Boolean(
-    plan.plan_version_id
-    && (
-      plan.runtime_compatible === false
-      || (plan.fixed_valid_until && Date.parse(plan.fixed_valid_until) <= nowMs)
-      || latestByVersion.get(plan.plan_version_id)?.lifecycle === "COMPLETED"
-    )
-  ));
   return {
     currentActivations,
-    currentPlans: inactivePlans.filter((plan) => !historicalPlans.includes(plan)),
-    historicalPlans,
+    // A plan is either an editable draft, represented by its current
+    // activation, or an ended plan.  Snapshot metadata never forms a fourth
+    // list state.
+    currentPlans: plans.filter((plan) => plan.status === "DRAFT"),
+    historicalPlans: plans.filter((plan) => plan.status === "ENDED"),
   };
 }

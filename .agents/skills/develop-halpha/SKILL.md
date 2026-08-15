@@ -63,6 +63,7 @@ Exhaust supported capabilities in existing dependencies before adding one. Do no
 - **Every change:** run the smallest targeted check that directly exercises the change and likely failure.
 - **Shared boundary or state change:** add relevant integration and direct-consumer checks.
 - **Executable UX:** inspect the affected route, states and viewports in a real browser when visual or interaction behavior changed.
+- **Financial and time displays:** when a changed page shows economic outcomes, verify profit/received funding uses the active K-line up color with `+`, while losses, stop-risk, projected loss, fees and paid funding use the active K-line down color with `−`; verify zero and unknown stay neutral, and default `Asia/Shanghai` times omit the redundant `UTC+8` suffix.
 - **L4 or real-account-action-state change:** run the general documentation validator and the small governance validator.
 - **Core trading change:** exercise normal behavior, the critical counterexample, duplicate/retry and stop or rollback in the closest authorized environment.
 - **Selected strategy handoff:** first compare the product decision with the research handoff trace on identical normalized inputs and cutoffs, then use NautilusTrader to validate event, order, fill, funding, margin and online/offline behavior. Separate unexplained decision drift from expected execution-model differences; do not enable the strategy while either remains unresolved.

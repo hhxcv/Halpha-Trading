@@ -1,4 +1,12 @@
-import { Fragment, useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+  type ReactNode,
+} from "react";
 import {
   Alert,
   Box,
@@ -10,6 +18,7 @@ import {
   IconButton,
   LinearProgress,
   MenuItem,
+  Slider,
   Stack,
   Table,
   TableBody,
@@ -23,25 +32,31 @@ import {
   Tooltip,
   Typography,
 } from "@mui/material";
-import { InfoOutlined, RefreshOutlined } from "@mui/icons-material";
+import { ErrorOutlined, InfoOutlined, RefreshOutlined } from "@mui/icons-material";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useNavigate, useOutletContext, useParams, useSearchParams } from "react-router";
 
 import {
   ApiFailure,
-  createActivation,
   createPlan,
   exportPlaybookQualification,
-  fixPlan,
-  getActivationPreview,
   getExecutionFeeEvidence,
   getMarketContext,
+  getMarketFundingRateHistory,
+  getLatestPlanAiReview,
+  getOverview,
+  getOverviewForEntry,
   getPlan,
   getStrategies,
   isUnknownMutationResult,
   previewDecisionEvidence,
+  requestPlanAiReview,
+  submitAndStartPlan,
   type DecisionEvidencePreviewPayload,
   type PlanCreatePayload,
+  type PlanAiReview,
+  type PlanAiReviewConfiguration,
+  type PlanDraft,
   type PlanDraftPayload,
   type OrderScheduleSpec,
   type SettingsStatus,
@@ -51,6 +66,7 @@ import {
 import PageHeader from "../components/PageHeader";
 import FactGrid from "../components/FactGrid";
 import OrderScheduleEditor, { createDefaultOrderScheduleSpec } from "../components/OrderScheduleEditor";
+import PlanAiReviewPanel from "../components/PlanAiReviewPanel";
 import {
   hydrateOrderScheduleSpec,
   isPositive,
@@ -62,6 +78,25 @@ import type { OrderChartPriceAnnotation } from "../components/orderScheduleChart
 import StrategyIntroduction from "../components/StrategyIntroduction";
 import DecisionEvidencePanel from "../components/DecisionEvidencePanel";
 import {
+  accountObservationBlockerText,
+  NewRiskDisciplineBlockNotice,
+  newRiskDisciplineBlockerText,
+  newRiskDisciplineBlockerCodesFromFailureCode,
+} from "../components/TradingDisciplineStrip";
+import {
+  directFundingCap,
+  fundingAmountAtPercentage,
+  fundingPercentageForAmount,
+} from "../directFundingCap";
+import {
+  lossLimitedDirectEntry,
+  scaleScheduleToEntryNotional,
+} from "../directLossLimit";
+import {
+  formatFundingRatePercent,
+  formatFundingSettlementInterval,
+} from "../fundingEstimate";
+import {
   closedBarBreakoutGapPercent,
   entryExtensionBoundary,
   formatUserVisibleTime,
@@ -69,11 +104,14 @@ import {
   marketPrice,
   marketVolume,
   quoteAmount,
+  quoteCurrencyAmount,
   subtractDecimal,
   tradingPrice,
 } from "../format";
 import {
+  FinancialToneText,
   MarketToneText,
+  financialToneForSignedValue,
   marketToneClassName,
   marketToneForDirection,
   type MarketColorScheme,
@@ -105,12 +143,17 @@ import {
   initialStrategyPlanIntent,
   strategyAllowsPlanIntent,
 } from "../strategyIntentQualification";
-import { isValidPlaybookRef, normalizePlaybookRef } from "../playbookIdentity";
 import {
   playbookQualificationFilename,
   serializePlaybookQualification,
   type PlaybookQualificationTarget,
 } from "../playbookQualificationArtifact";
+import {
+  minimumRewardRisk,
+  rewardRiskDisciplineBlocked,
+  strategyRewardRisk,
+  weightedTakeProfitRewardRisk,
+} from "../planRewardRisk";
 
 
 type Direction = "LONG" | "SHORT";
@@ -129,27 +172,16 @@ type PlanDecisionContextInput = {
 };
 type StrategyDirectionFilter = "ALL" | Direction;
 type StrategySort = "NAME_ASC" | "NAME_DESC" | "VERSION_DESC";
-type PlanMutationAttempt =
-  | {
-      kind: "CREATE";
-      payload: PlanCreatePayload;
-      idempotencyKey: string;
-    }
-  | {
-      kind: "UPDATE";
-      payload: PlanDraftPayload;
-      planId: string;
-      draftVersion: number;
-    };
-type UpdateRecoveryState =
+type DraftSaveState =
   | { status: "IDLE" }
-  | { status: "REFRESHING" }
-  | { status: "REFRESHED"; draftVersion: number }
-  | { status: "FAILED" };
-type QuickStartAttempt = {
-  payload: PlanCreatePayload;
-  createIdentity: StableRequestIdentity;
+  | { status: "SAVING" }
+  | { status: "SAVED"; at: number }
+  | { status: "FAILED"; message: string };
+type SubmitAndStartAttempt = {
+  planId: string;
+  draftVersion: number;
 };
+type SubmitAndStartPhase = "IDLE" | "SUBMITTING";
 
 function qualificationExportError(error: unknown): string {
   const code = error instanceof ApiFailure
@@ -165,7 +197,48 @@ function qualificationExportError(error: unknown): string {
   return labels[code] ?? code;
 }
 
+function aiReviewRequestErrorMessage(
+  error: unknown,
+  requestFailed: boolean,
+): string | null {
+  if (error instanceof ApiFailure) {
+    if (
+      error.code === "PLAN_AI_REVIEW_CONTEXT_UNAVAILABLE"
+      || error.code === "PLAN_AI_REVIEW_CONTEXT_TEMPORARILY_UNAVAILABLE"
+      || error.code === "PLAN_AI_REVIEW_CONTEXT_INVALID"
+    ) {
+      return "AI 审核尚未开始：服务端未能形成当前审核上下文（非 AI 审核结论）。";
+    }
+    if (error.code === "PLAN_VERSION_CONFLICT") {
+      return "草稿已更新；请等待页面读取最新版本后重新提交 AI 审核。";
+    }
+    return `AI 审核尚未开始（${error.code}，非 AI 审核结论）。`;
+  }
+  return requestFailed
+    ? "AI 审核提交结果未知；请先等待页面重新读取状态。"
+    : null;
+}
+
+function overviewReadFailureMessage(error: unknown): string {
+  if (error instanceof ApiFailure) {
+    if (error.code === "OVERVIEW_CONNECTION_FAILED") {
+      return "本机账户纪律服务连接失败。";
+    }
+    if (error.code === "DATABASE_FACTS_UNAVAILABLE") {
+      return "账户纪律服务无法读取当前账户事实。";
+    }
+    if (error.status >= 500) {
+      return "账户纪律服务暂不可用。";
+    }
+  }
+  return "账户纪律状态读取失败。";
+}
+
 const DIRECT_EXECUTION_REF = "DIRECT_EXECUTION@1";
+// Must move with src/halpha/app/plan_ai_review.py.  A changed fixed prompt
+// changes the meaning of an approval/rejection, so an earlier conclusion is
+// retained for audit but cannot authorize the current plan.
+const CURRENT_PLAN_AI_REVIEW_PROMPT_VERSION = "HALPHA_PLAN_AI_REVIEW_V4";
 const DIRECT_DECISION_CONTEXT: PlanDecisionContextInput = {
   rationale: "",
   evidence: "",
@@ -209,20 +282,148 @@ const setupFamilyLabels: Record<PlanSetupFamily, string> = {
   OTHER: "其他（需写清规则）",
 };
 
-function fundingRatePercent(value: string): string {
-  const rate = Number(value);
-  if (!Number.isFinite(rate)) return "未知";
-  const percent = rate * 100;
-  const normalized = percent.toFixed(4).replace(/\.?0+$/, "");
-  return `${percent > 0 ? "+" : ""}${normalized || "0"}%`;
+function stableInputFingerprint(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableInputFingerprint).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => (
+      `${JSON.stringify(key)}:${stableInputFingerprint(record[key])}`
+    )).join(",")}}`;
+  }
+  return JSON.stringify(value);
 }
 
-function fundingDirectionText(value: string, direction: Direction): string {
-  const rate = Number(value);
-  if (!Number.isFinite(rate) || rate === 0) return "当前费率为 0";
-  const selectedSidePays = (rate > 0 && direction === "LONG")
-    || (rate < 0 && direction === "SHORT");
-  return selectedSidePays ? "当前方向跨结算时点支付" : "当前方向跨结算时点收取";
+function decisionContextWithoutSystemEvidenceCutoff(
+  context: PlanDraftPayload["decision_context"],
+): Record<string, unknown> {
+  const { evidence_cutoff: _systemEvidenceCutoff, ...userContext } = context;
+  return userContext;
+}
+
+function reviewInputFingerprint(value: unknown): string {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return stableInputFingerprint(value);
+  }
+  const payload = value as Record<string, unknown>;
+  const context = payload.decision_context;
+  if (!context || typeof context !== "object" || Array.isArray(context)) {
+    return stableInputFingerprint(payload);
+  }
+  const { evidence_cutoff: _systemEvidenceCutoff, ...userContext } = (
+    context as Record<string, unknown>
+  );
+  return stableInputFingerprint({
+    ...payload,
+    decision_context: userContext,
+  });
+}
+
+function newestDraft(
+  first: PlanDraft | null,
+  second: PlanDraft | null,
+): PlanDraft | null {
+  if (!first) return second;
+  if (!second) return first;
+  return first.draft_version >= second.draft_version ? first : second;
+}
+
+function savedDraftInput(draft: PlanDraft): Record<string, unknown> {
+  const content = draft.content;
+  const durationMinutes = Math.round(
+    (Date.parse(content.valid_until) - Date.parse(content.valid_from)) / 60_000,
+  );
+  return {
+    plan_name: content.plan_name,
+    decision_context: content.decision_context
+      ? decisionContextWithoutSystemEvidenceCutoff(content.decision_context)
+      : null,
+    decision_basis: content.decision_basis,
+    ...(content.order_schedule_spec
+      ? { order_schedule_spec: content.order_schedule_spec }
+      : {}),
+    ...(content.position_alignment
+      ? { position_alignment: content.position_alignment }
+      : {}),
+    venue_ref: content.venue_ref,
+    instrument_ref: content.instrument_ref,
+    direction: content.direction,
+    target_exposure: content.target_exposure,
+    max_margin: content.requested_limits.max_margin,
+    max_notional: content.requested_limits.max_notional,
+    max_allowed_loss: content.requested_limits.max_allowed_loss,
+    valid_minutes: durationMinutes,
+  };
+}
+
+function scheduleInputWithoutDerivedFeeBudget(
+  schedule: OrderScheduleSpec,
+): OrderScheduleSpec {
+  return {
+    ...schedule,
+    protection_policy: {
+      ...schedule.protection_policy,
+      // The fee budget is filled from the current venue fee evidence. It is
+      // part of a persisted schedule, but is not a trader edit and must not
+      // silently invalidate an AI review when that evidence refreshes.
+      full_fill_loss_budget: null,
+    },
+  };
+}
+
+function directReviewInputFingerprint(input: {
+  planName: string;
+  decisionContext: PlanDraftPayload["decision_context"];
+  instrument: string;
+  direction: Direction;
+  requestedNotional: string;
+  validMinutes: string;
+  orderSchedule: OrderScheduleSpec;
+}): string {
+  return stableInputFingerprint({
+    plan_name: input.planName,
+    decision_context: decisionContextWithoutSystemEvidenceCutoff(
+      input.decisionContext,
+    ),
+    decision_basis: {
+      kind: "DIRECT_EXECUTION",
+      decision_basis_ref: DIRECT_EXECUTION_REF,
+      parameters: {},
+    },
+    order_schedule_spec: scheduleInputWithoutDerivedFeeBudget(input.orderSchedule),
+    venue_ref: "BINANCE_USDM",
+    instrument_ref: input.instrument,
+    direction: input.direction,
+    requested_notional: input.requestedNotional,
+    valid_minutes: input.validMinutes,
+  });
+}
+
+function savedDirectReviewInputFingerprint(draft: PlanDraft): string {
+  const content = draft.content;
+  const durationMinutes = Math.round(
+    (Date.parse(content.valid_until) - Date.parse(content.valid_from)) / 60_000,
+  );
+  if (!content.order_schedule_spec) return "";
+  return directReviewInputFingerprint({
+    planName: content.plan_name ?? "",
+    decisionContext: content.decision_context ?? {
+      rationale: "",
+      evidence: "",
+      limitations: "",
+      intent: null,
+      setup_family: null,
+      playbook_ref: null,
+      invalidation: "",
+      evidence_cutoff: null,
+    },
+    instrument: content.instrument_ref,
+    direction: content.direction,
+    requestedNotional: content.requested_limits.max_notional,
+    validMinutes: String(durationMinutes),
+    orderSchedule: hydrateOrderScheduleSpec(content.order_schedule_spec),
+  });
 }
 
 function marketStreamStatusText(status: MarketStreamClientStatus): string {
@@ -284,6 +485,7 @@ function StrategySelection({
   loading,
   failed,
   readOnly,
+  disciplineNotice,
   onSelect,
   onSelectDirect,
   onCancel,
@@ -292,6 +494,7 @@ function StrategySelection({
   loading: boolean;
   failed: boolean;
   readOnly: boolean;
+  disciplineNotice?: ReactNode;
   onSelect: (strategyId: string) => void;
   onSelectDirect: () => void;
   onCancel: () => void;
@@ -335,15 +538,16 @@ function StrategySelection({
   return (
     <Box sx={{ width: "min(1040px, calc(100% - clamp(32px, 4vw, 48px)))", mx: "auto", py: { xs: 2.5, sm: 3 } }}>
       <PageHeader
-        eyebrow="新建交易计划 · 第 1 步 / 2"
+        eyebrow="新建交易计划"
         title="选择执行依据"
-        description="可以让策略产生入场决定，也可以直接定义一组不可变订单；两种方式都经过相同的资金边界、确认与启动流程。"
+        description="可以让策略产生入场决定，也可以直接定义一组不可变订单；两种方式都经过相同的纪律与执行保护。"
       />
       {readOnly && (
         <Alert severity="info" variant="outlined" sx={{ mb: 2 }}>
-          当前实盘入口为只读公开行情模式；可以查看策略说明，但不能配置、保存、确认或启动计划。
+          当前实盘入口为只读公开行情模式；可以查看策略说明，但不能配置、保存或提交并启动计划。
         </Alert>
       )}
+      {disciplineNotice}
       <Box
         component="section"
         aria-labelledby="direct-execution-title"
@@ -552,10 +756,18 @@ export default function NewPlanPage() {
   const requestedDirection: Direction = searchParams.get("direction") === "SHORT"
     ? "SHORT"
     : "LONG";
-  const requestedTradeAmount = Number(searchParams.get("tradeAmount")) > 0
-    && Number.isFinite(Number(searchParams.get("tradeAmount")))
-      ? searchParams.get("tradeAmount") ?? "500"
-      : "500";
+  // A draft's creator is immutable once its first version is saved.  The
+  // assisted creation entry point therefore supplies its origin before the
+  // periodic draft saver can allocate the plan id.
+  const requestedCreatorKind: PlanCreatorKind = searchParams.get("creator_kind") === "AI"
+    ? "AI"
+    : "HUMAN";
+  const requestedTradeAmountNumber = Number(searchParams.get("tradeAmount"));
+  const requestedTradeAmountExplicit = requestedTradeAmountNumber > 0
+    && Number.isFinite(requestedTradeAmountNumber);
+  const requestedTradeAmount = requestedTradeAmountExplicit
+    ? searchParams.get("tradeAmount") ?? "500"
+    : "500";
   const sourcePositionSnapshotCutoff = searchParams.get("snapshotCutoff");
   const editing = Boolean(planId);
   const copying = Boolean(!editing && sourcePlanId);
@@ -567,6 +779,11 @@ export default function NewPlanPage() {
     directModeRequested ? DIRECT_EXECUTION_REF : null,
   );
   const strategies = useQuery({ queryKey: ["strategies"], queryFn: getStrategies });
+  const accountOverview = useQuery({
+    queryKey: ["overview"],
+    queryFn: getOverview,
+    refetchInterval: 5_000,
+  });
   const draft = useQuery({
     queryKey: ["plan", loadedPlanId],
     queryFn: () => getPlan(loadedPlanId ?? ""),
@@ -601,7 +818,7 @@ export default function NewPlanPage() {
   const automaticPlanNameRef = useRef<string | null>(
     initialPlanNameRef.current || null,
   );
-  const [creatorKind, setCreatorKind] = useState<PlanCreatorKind>("HUMAN");
+  const [creatorKind, setCreatorKind] = useState<PlanCreatorKind>(requestedCreatorKind);
   const [parameters, setParameters] = useState<StrategyParameters>(() => ({
     ...DEFAULT_PARAMETERS,
     direction: requestedDirection,
@@ -632,29 +849,92 @@ export default function NewPlanPage() {
   ));
   const [stopReferenceInterval, setStopReferenceInterval] =
     useState<MarketInterval>("15m");
-  const [chartMarketReady, setChartMarketReady] = useState(false);
   const directReferenceSeededRef = useRef(false);
   const directReferenceSeedValueRef = useRef<string | null>(null);
   const pendingCreateIdentityRef = useRef<StableRequestIdentity | null>(null);
-  const [updateRecovery, setUpdateRecovery] = useState<UpdateRecoveryState>({
-    status: "IDLE",
-  });
-  const pendingUpdateHydrationVersionRef = useRef<number | null>(null);
-  const [draftHydrationRevision, setDraftHydrationRevision] = useState(0);
+  const pendingAiReviewIdentityRef = useRef<StableRequestIdentity | null>(null);
+  const pendingSubmitAndStartIdentityRef = useRef<StableRequestIdentity | null>(null);
+  const [reviewDraft, setReviewDraft] = useState<PlanDraft | null>(null);
+  const latestPersistedDraftRef = useRef<PlanDraft | null>(null);
+  const [draftSaveState, setDraftSaveState] = useState<DraftSaveState>({ status: "IDLE" });
+  const [submitAndStartPhase, setSubmitAndStartPhase] =
+    useState<SubmitAndStartPhase>("IDLE");
+  const [lastSavedInputFingerprint, setLastSavedInputFingerprint] = useState<string | null>(null);
+  const autoSaveAttemptFingerprintRef = useRef<string | null>(null);
+  const initializedSavedDraftRef = useRef<string | null>(null);
+  const currentInputFingerprintRef = useRef("");
+  const saveCurrentDraftRef = useRef<() => void>(() => undefined);
+  const [aiReview, setAiReview] = useState<PlanAiReview | null>(null);
+  const [aiReviewStarting, setAiReviewStarting] = useState(false);
+  const [aiReviewConfiguration, setAiReviewConfiguration] =
+    useState<PlanAiReviewConfiguration>({
+      model: "gpt-5.6-terra",
+      reasoning_effort: "medium",
+    });
+  const aiReviewInProgress = aiReviewStarting
+    || aiReview?.status === "QUEUED"
+    || aiReview?.status === "RUNNING";
+  const [reviewedInputFingerprint, setReviewedInputFingerprint] =
+    useState<string | null>(null);
+  const [aiReviewClock, setAiReviewClock] = useState(() => Date.now());
   const [orderScheduleReady, setOrderScheduleReady] = useState(false);
   const [directMaximumProjectedLoss, setDirectMaximumProjectedLoss] =
     useState<string | null>(null);
+  const [directEffectiveNotional, setDirectEffectiveNotional] =
+    useState<string | null>(null);
+  const [directRequestedNotional, setDirectRequestedNotional] =
+    useState<string | null>(null);
+  const [directScheduleProblems, setDirectScheduleProblems] = useState<string[]>([]);
+  const directFundingDiscipline = useQuery({
+    queryKey: [
+      "overview",
+      "direct-execution-funding",
+      instrument,
+      parameters.direction,
+    ],
+    queryFn: () => getOverviewForEntry({
+      entryInstrumentRef: instrument,
+      entryDirection: parameters.direction,
+    }),
+    enabled: directExecution && !selectingStrategy,
+    refetchInterval: 5_000,
+  });
+  const directFundingDisciplineState = directFundingDiscipline.data?.new_risk_discipline;
+  const directFundingCapState = directFundingCap(directFundingDisciplineState);
+  const strategyFundingDiscipline = useQuery({
+    queryKey: [
+      "overview",
+      "strategy-funding",
+      instrument,
+      parameters.direction,
+      strategyId,
+    ],
+    queryFn: () => getOverviewForEntry({
+      entryInstrumentRef: instrument,
+      entryDirection: parameters.direction,
+    }),
+    enabled: !directExecution && !selectingStrategy && Boolean(strategyId),
+    refetchInterval: 5_000,
+  });
+  const strategyFundingDisciplineState = strategyFundingDiscipline.data?.new_risk_discipline;
+  const strategyFundingCapState = directFundingCap(strategyFundingDisciplineState);
+  const directFundingCapSeededRef = useRef(false);
+  const directFundingCapTouchedRef = useRef(
+    requestedTradeAmountExplicit || editing || copying,
+  );
   const handleOrderScheduleValidation = useCallback((ready: boolean) => {
     setOrderScheduleReady(ready);
   }, []);
   const handleMaximumProjectedLoss = useCallback((value: string | null) => {
     setDirectMaximumProjectedLoss(value);
   }, []);
-  const handleChartMarketReadiness = useCallback((ready: boolean) => {
-    setChartMarketReady(ready);
+  const handleEffectiveNotional = useCallback((value: string | null) => {
+    setDirectEffectiveNotional(value);
+  }, []);
+  const handleRequestedNotional = useCallback((value: string | null) => {
+    setDirectRequestedNotional(value);
   }, []);
   const handleChartIntervalChange = useCallback((interval: MarketInterval) => {
-    setChartMarketReady(false);
     setChartInterval(interval);
     writeChartIntervalPreference(status.environment_id, instrument, interval);
   }, [instrument, status.environment_id]);
@@ -664,7 +944,6 @@ export default function NewPlanPage() {
   );
   const environmentScope = `${status.environment_kind}:${status.environment_id}`;
   useEffect(() => {
-    setChartMarketReady(false);
     setChartInterval(readChartIntervalPreference(
       status.environment_id,
       instrument,
@@ -685,6 +964,13 @@ export default function NewPlanPage() {
       && channelLookbackValid,
     retry: 1,
     retryDelay: 2_000,
+  });
+  const fundingHistory = useQuery({
+    queryKey: ["market-funding-history", environmentScope, expectedMarketSource, instrument],
+    queryFn: () => getMarketFundingRateHistory(instrument),
+    enabled: !selectingStrategy && directExecution,
+    retry: 1,
+    staleTime: 60_000,
   });
   const stopReferenceMarket = useQuery({
     queryKey: [
@@ -728,7 +1014,6 @@ export default function NewPlanPage() {
     const seededPrice = directReferenceSeedValueRef.current;
     directReferenceSeedValueRef.current = null;
     setOrderScheduleReady(false);
-    setChartMarketReady(false);
     if (seededPrice === null) return;
     setOrderSchedule((current) => (
       current.price_distribution.kind === "SINGLE"
@@ -775,9 +1060,9 @@ export default function NewPlanPage() {
       : `${source.plan_name?.trim() || "未命名计划"} 副本`.slice(0, 80));
     if (source.decision_context) {
       setDecisionContext({
-        rationale: source.decision_context.rationale,
-        evidence: source.decision_context.evidence,
-        limitations: source.decision_context.limitations,
+        rationale: source.decision_context.rationale ?? "",
+        evidence: source.decision_context.evidence ?? "",
+        limitations: source.decision_context.limitations ?? "",
         intent: source.decision_context.intent ?? "",
         setup_family: source.decision_context.setup_family ?? "",
         playbook_ref: source.decision_context.playbook_ref ?? "",
@@ -789,20 +1074,17 @@ export default function NewPlanPage() {
       (Date.parse(source.valid_until) - Date.parse(source.valid_from)) / 60_000,
     );
     if (Number.isFinite(duration) && duration > 0) setValidMinutes(String(duration));
-    const recoveredDraftVersion = pendingUpdateHydrationVersionRef.current;
-    if (recoveredDraftVersion !== null) {
-      pendingUpdateHydrationVersionRef.current = null;
-      setUpdateRecovery({
-        status: "REFRESHED",
-        draftVersion: recoveredDraftVersion,
-      });
-    }
-  }, [draft.data?.content_digest, draftHydrationRevision, editing]);
+  }, [draft.data?.content_digest, editing]);
 
   const update = <K extends keyof StrategyParameters>(key: K, value: StrategyParameters[K]) => {
     setParameters((current) => ({ ...current, [key]: value }));
   };
-  const updateDirectTradeAmount = (nextAmount: string) => {
+  const updateDirectTradeAmount = (
+    nextAmount: string,
+    options: { userInitiated?: boolean } = {},
+  ) => {
+    const { userInitiated = true } = options;
+    if (userInitiated) directFundingCapTouchedRef.current = true;
     const previousAmount = Number(tradeAmount);
     const distribution = orderSchedule.amount_distribution;
     const pricePlan = orderSchedule.price_distribution;
@@ -834,6 +1116,26 @@ export default function NewPlanPage() {
     }));
     setOrderScheduleReady(false);
   };
+  useEffect(() => {
+    const maximum = directFundingCapState.maximum;
+    if (
+      directFundingCapSeededRef.current
+      || !directExecution
+      || editing
+      || copying
+      || directFundingCapTouchedRef.current
+      || maximum === null
+      || !Number.isFinite(Number(maximum))
+      || Number(maximum) <= 0
+    ) return;
+    directFundingCapSeededRef.current = true;
+    updateDirectTradeAmount(maximum, { userInitiated: false });
+  }, [
+    copying,
+    directExecution,
+    directFundingCapState.maximum,
+    editing,
+  ]);
   const selectStrategy = (nextStrategyId: string) => {
     if (nextStrategyId !== selectedStrategyId) setParameters(DEFAULT_PARAMETERS);
     const strategy = strategies.data?.find((item) => item.strategy_id === nextStrategyId);
@@ -868,6 +1170,8 @@ export default function NewPlanPage() {
     automaticPlanNameRef.current = automaticName;
     directReferenceSeededRef.current = false;
     directReferenceSeedValueRef.current = null;
+    directFundingCapSeededRef.current = false;
+    directFundingCapTouchedRef.current = false;
     setOrderScheduleReady(false);
     setCreationStep("configuration");
     window.requestAnimationFrame(() => window.scrollTo({ top: 0, left: 0 }));
@@ -879,7 +1183,81 @@ export default function NewPlanPage() {
     && Number.isInteger(Number(validMinutes));
   const normalizedPlanName = planName.trim();
   const planNameValid = normalizedPlanName.length > 0 && normalizedPlanName.length <= 80;
-  const tradeAmountValid = Number(tradeAmount) > 0 && Number.isFinite(Number(tradeAmount));
+  const tradeAmountInputValid = Number(tradeAmount) > 0 && Number.isFinite(Number(tradeAmount));
+  const directFundingMaximum = directFundingCapState.maximum;
+  const directFundingMaximumNumber = directFundingMaximum !== null
+    && Number.isFinite(Number(directFundingMaximum))
+    ? Number(directFundingMaximum)
+    : null;
+  const directFundingSliderValue = fundingPercentageForAmount(
+    directFundingMaximum,
+    tradeAmount,
+  );
+  const directFundingCapExceeded = directExecution
+    && directFundingMaximumNumber !== null
+    && directFundingMaximumNumber > 0
+    && Number(tradeAmount) > directFundingMaximumNumber + 1e-8;
+  const directFundingCapacityExhausted = directExecution
+    && directFundingMaximumNumber !== null
+    && directFundingMaximumNumber <= 0;
+  const directFundingDisciplineBlocked = directExecution
+    && directFundingDisciplineState?.new_risk_allowed === false;
+  const directFundingDisciplineIssue = !directExecution
+    ? null
+    : directFundingDiscipline.isError
+      ? overviewReadFailureMessage(directFundingDiscipline.error)
+      : !directFundingDiscipline.data
+        ? "正在读取账户纪律。"
+        : directFundingDisciplineBlocked
+          ? (
+            accountObservationBlockerText(
+              directFundingDiscipline.data,
+              status.executor_status,
+            ) ?? newRiskDisciplineBlockerText(
+              directFundingDisciplineState?.blocker_codes ?? [],
+            )
+          ) || "当前交易纪律阻止新增风险。"
+          : null;
+  const directPlanLossLimit = directFundingDisciplineState?.max_plan_loss ?? null;
+  const directLossLimitedEntry = lossLimitedDirectEntry({
+    effectiveNotional: directEffectiveNotional,
+    maximumProjectedLoss: directMaximumProjectedLoss,
+    maxPlanLoss: directPlanLossLimit,
+  });
+  const directScheduleForSubmission = scaleScheduleToEntryNotional(
+    orderSchedule,
+    directRequestedNotional,
+    directLossLimitedEntry.maximumEntryNotional,
+  );
+  const directExecutionNotional = directLossLimitedEntry.maximumEntryNotional
+    ?? tradeAmount;
+  const strategyFundingMaximum = strategyFundingCapState.maximum;
+  const strategyFundingMaximumNumber = strategyFundingMaximum !== null
+    && Number.isFinite(Number(strategyFundingMaximum))
+    ? Number(strategyFundingMaximum)
+    : null;
+  const strategyFundingCapExceeded = !directExecution
+    && strategyFundingMaximumNumber !== null
+    && strategyFundingMaximumNumber > 0
+    && Number(tradeAmount) > strategyFundingMaximumNumber + 1e-8;
+  const directRewardRiskRatio = weightedTakeProfitRewardRisk(
+    orderSchedule.protection_policy.take_profit_ladder?.levels ?? [],
+  );
+  const strategyRewardRiskRatio = strategyRewardRisk(parameters);
+  const applicableMinimumRewardRisk = minimumRewardRisk(
+    (directExecution ? directFundingDisciplineState : strategyFundingDisciplineState)
+      ?.minimum_reward_risk_ratio,
+  );
+  const applicableRewardRiskRatio = directExecution
+    ? directRewardRiskRatio
+    : strategyRewardRiskRatio;
+  const planRewardRiskBlocked = rewardRiskDisciplineBlocked(
+    applicableRewardRiskRatio,
+    applicableMinimumRewardRisk,
+  );
+  const tradeAmountValid = tradeAmountInputValid
+    && !directFundingCapExceeded
+    && !strategyFundingCapExceeded;
   const initialStopValid = numberInRange(parameters.initial_stop_atr_multiple, 1, 3);
   const maxExtensionValid = numberInRange(parameters.max_entry_extension_atr, .1, 1);
   const takeProfitFractionValid = numberInRange(parameters.take_profit_1_fraction, .25, .75);
@@ -898,6 +1276,7 @@ export default function NewPlanPage() {
     && takeProfitOrderValid;
   const configurationValid = planValidityValid
     && tradeAmountValid
+    && !planRewardRiskBlocked
     && (directExecution
       ? orderScheduleReady && isPositive(directMaximumProjectedLoss ?? "")
       : strategyParameterRangesValid);
@@ -912,6 +1291,14 @@ export default function NewPlanPage() {
     && !marketSourceMismatch
     ? market.data
     : undefined;
+  useEffect(() => {
+    if (!currentMarket?.source_cutoff || decisionContext.evidence_cutoff) return;
+    setDecisionContext((current) => (
+      current.evidence_cutoff
+        ? current
+        : { ...current, evidence_cutoff: currentMarket.source_cutoff }
+    ));
+  }, [currentMarket?.source_cutoff, decisionContext.evidence_cutoff]);
   const selectedStopReferenceMarket = stopReferenceInterval === "15m"
     ? currentMarket
     : stopReferenceMarket.data?.channel_lookback_15m === parameters.channel_lookback_15m
@@ -938,6 +1325,10 @@ export default function NewPlanPage() {
     )
     ? marketStream.funding
     : null;
+  const usableFundingHistory = fundingHistory.data
+    && isMarketSourceForEnvironment(fundingHistory.data.source, status.environment_kind)
+    ? fundingHistory.data
+    : null;
   const stableReferencePrice = currentMarket?.reference_price ?? null;
   const liveReferencePrice = usableLiveQuote?.reference_price ?? null;
   const visibleReferencePrice = liveReferencePrice ?? stableReferencePrice;
@@ -950,31 +1341,28 @@ export default function NewPlanPage() {
   const visibleSourceCutoff = usableLiveQuote?.source_cutoff
     ?? currentMarket?.source_cutoff
     ?? null;
+  const optionalDecisionText = (value: string): string | null => {
+    const normalized = value.trim();
+    return normalized || null;
+  };
   const normalizedDecisionContext: PlanDraftPayload["decision_context"] = {
-    rationale: decisionContext.rationale.trim(),
-    evidence: decisionContext.evidence.trim(),
-    limitations: decisionContext.limitations.trim(),
+    rationale: optionalDecisionText(decisionContext.rationale),
+    evidence: optionalDecisionText(decisionContext.evidence),
+    limitations: optionalDecisionText(decisionContext.limitations),
     intent: decisionContext.intent || null,
     setup_family: decisionContext.setup_family || null,
-    playbook_ref: directExecution
-      ? normalizePlaybookRef(decisionContext.playbook_ref) || null
-      : null,
-    invalidation: decisionContext.invalidation.trim() || null,
-    evidence_cutoff: visibleSourceCutoff ?? decisionContext.evidence_cutoff,
+    playbook_ref: null,
+    invalidation: optionalDecisionText(decisionContext.invalidation),
+    evidence_cutoff: decisionContext.evidence_cutoff
+      ?? currentMarket?.source_cutoff
+      ?? null,
   };
   const decisionContextValid = (
-    normalizedDecisionContext.rationale.length > 0
+    normalizedDecisionContext.rationale !== null
+    && normalizedDecisionContext.rationale !== undefined
     && normalizedDecisionContext.rationale.length <= 2000
-    && normalizedDecisionContext.evidence.length > 0
-    && normalizedDecisionContext.evidence.length <= 2000
-    && normalizedDecisionContext.limitations.length > 0
-    && normalizedDecisionContext.limitations.length <= 2000
-    && typeof normalizedDecisionContext.invalidation === "string"
-    && normalizedDecisionContext.invalidation.length > 0
-    && normalizedDecisionContext.invalidation.length <= 2000
     && normalizedDecisionContext.intent !== null
     && normalizedDecisionContext.setup_family !== null
-    && (!directExecution || isValidPlaybookRef(decisionContext.playbook_ref))
     && Boolean(normalizedDecisionContext.evidence_cutoff)
     && (!parameters.demo_immediate_entry || normalizedDecisionContext.intent === "VALIDATION")
     && (
@@ -998,7 +1386,7 @@ export default function NewPlanPage() {
         },
     intent: decisionContext.intent as PlanDecisionIntent,
     setup_family: decisionContext.setup_family as PlanSetupFamily,
-    playbook_ref: normalizedDecisionContext.playbook_ref,
+    playbook_ref: null,
   };
   const decisionEvidence = useQuery({
     queryKey: [
@@ -1014,11 +1402,11 @@ export default function NewPlanPage() {
     ],
     queryFn: () => previewDecisionEvidence(decisionEvidencePayload),
     enabled: !selectingStrategy
-      && Boolean(directExecution || strategyId)
+      && !directExecution
+      && Boolean(strategyId)
       && Boolean(decisionContext.intent)
       && Boolean(decisionContext.setup_family)
-      && (!directExecution || isValidPlaybookRef(decisionContext.playbook_ref))
-      && (directExecution || strategyParameterRangesValid),
+      && strategyParameterRangesValid,
     retry: 1,
     staleTime: 30_000,
   });
@@ -1185,12 +1573,14 @@ export default function NewPlanPage() {
       ] satisfies OrderChartPriceAnnotation[])
         .filter((annotation) => Number.isFinite(annotation.price) && annotation.price > 0)
     : [];
+  // Chart-bar readiness is presentation state. Direct-plan eligibility needs a
+  // current server market context and a fresh same-environment execution quote;
+  // the backend rebuilds the schedule again at review, fix, and activation.
   const directMarketDataReady = Boolean(
     currentMarket
     && !market.isError
     && !market.isFetching
     && expectedMarketSource
-    && chartMarketReady
     && marketStream.status === "LIVE"
     && usableLiveQuote !== null,
   );
@@ -1223,11 +1613,14 @@ export default function NewPlanPage() {
       venue_ref: "BINANCE_USDM" as const,
       instrument_ref: instrument,
       direction: parameters.direction,
-      target_exposure: tradeAmount,
+      target_exposure: directExecution ? directExecutionNotional : tradeAmount,
+      // Keep the user-selected funding ceiling intact.  Protection may reduce
+      // the submitted schedule's actual entry notional, but that reduction is
+      // an execution result rather than a rewrite of the plan's upper limit.
       max_margin: tradeAmount,
       max_notional: tradeAmount,
       max_allowed_loss: directExecution
-        ? directMaximumProjectedLoss ?? tradeAmount
+        ? directPlanLossLimit ?? directMaximumProjectedLoss ?? tradeAmount
         : tradeAmount,
       valid_minutes: Number(validMinutes),
     };
@@ -1239,7 +1632,7 @@ export default function NewPlanPage() {
             decision_basis_ref: DIRECT_EXECUTION_REF,
             parameters: {},
           },
-          order_schedule_spec: orderSchedule,
+          order_schedule_spec: directScheduleForSubmission,
         }
       : {
           ...commonPayload,
@@ -1250,163 +1643,363 @@ export default function NewPlanPage() {
           },
         };
   };
-  const refreshUnknownUpdateResult = async (): Promise<void> => {
-    pendingUpdateHydrationVersionRef.current = null;
-    setUpdateRecovery({ status: "REFRESHING" });
-    try {
-      const result = await draft.refetch();
-      if (result.isError || !result.data) {
-        setUpdateRecovery({ status: "FAILED" });
-        return;
-      }
-      pendingUpdateHydrationVersionRef.current = result.data.draft_version;
-      setDraftHydrationRevision((current) => current + 1);
-    } catch {
-      setUpdateRecovery({ status: "FAILED" });
-    }
-  };
-  const mutation = useMutation({
-    mutationFn: (attempt: PlanMutationAttempt) => {
-      if (attempt.kind === "UPDATE") {
-        return updatePlan(
-          attempt.planId,
-          attempt.draftVersion,
-          attempt.payload,
-        );
-      }
-      return createPlan(attempt.payload, attempt.idempotencyKey);
-    },
-    onMutate: (attempt) => {
-      if (attempt.kind === "UPDATE") {
-        setUpdateRecovery({ status: "IDLE" });
-      }
-    },
-    onSuccess: (_result, attempt) => {
-      if (attempt.kind === "CREATE") {
-        pendingCreateIdentityRef.current = null;
-        clearPersistentRequestIdentity(createIdentityScope);
-      }
-      navigate("/plans");
-    },
-    onError: (error, attempt) => {
-      if (attempt.kind === "UPDATE" && isUnknownMutationResult(error)) {
-        void refreshUnknownUpdateResult();
-      }
-      if (
-        attempt.kind === "CREATE"
-        && !isUnknownMutationResult(error)
-      ) {
-        pendingCreateIdentityRef.current = null;
-        clearPersistentRequestIdentity(createIdentityScope);
-      }
-    },
-  });
-  const quickStart = useMutation({
-    mutationFn: async ({ payload, createIdentity }: QuickStartAttempt) => {
-      const created = await createPlan(payload, createIdentity.idempotencyKey);
-      const createdPlanId = String(created.plan_id ?? "");
-      const createdDraftVersion = Number(created.draft_version);
-      if (!createdPlanId || !Number.isInteger(createdDraftVersion)) {
-        throw new ApiFailure(500, "QUICK_START_DRAFT_IDENTITY_INVALID");
-      }
-
-      const fixScope = `${environmentScope}:FIX_PLAN:${createdPlanId}`;
-      const fixFingerprint = JSON.stringify({
-        planId: createdPlanId,
-        draftVersion: createdDraftVersion,
-      });
-      const fixIdentity = persistentRequestIdentity(
-        null,
-        fixScope,
-        fixFingerprint,
-      );
-      const fixed = await fixPlan(
-        createdPlanId,
-        createdDraftVersion,
-        fixIdentity.idempotencyKey,
-      );
-      const planVersionId = String(fixed.plan_version_id ?? "");
-      if (!planVersionId) {
-        throw new ApiFailure(500, "QUICK_START_PLAN_VERSION_ID_INVALID");
-      }
-
-      const activationScope = (
-        `${environmentScope}:CREATE_ACTIVATION:${planVersionId}`
-      );
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        const activationPreview = await getActivationPreview(planVersionId);
-        const scheduleSnapshot = (
-          typeof activationPreview.order_schedule_snapshot === "object"
-          && activationPreview.order_schedule_snapshot !== null
-          && !Array.isArray(activationPreview.order_schedule_snapshot)
-        )
-          ? activationPreview.order_schedule_snapshot as Record<string, unknown>
-          : {};
-        const expectedScheduleDigest = String(
-          activationPreview.expected_schedule_digest ?? "",
-        );
-        if (
-          activationPreview.product_build_consistent !== true
-          || activationPreview.executor_status !== "READY"
-          || scheduleSnapshot.valid !== true
-          || !/^[0-9a-f]{64}$/u.test(expectedScheduleDigest)
-        ) {
-          throw new ApiFailure(409, "QUICK_START_ACTIVATION_PREVIEW_NOT_READY");
-        }
-
-        const activationPayload = {
-          plan_version_id: planVersionId,
-          expected_schedule_digest: expectedScheduleDigest,
+  const activeDraft = newestDraft(
+    reviewDraft,
+    editing ? draft.data ?? null : null,
+  );
+  latestPersistedDraftRef.current = activeDraft;
+  const activePlanId = activeDraft?.plan_id ?? null;
+  const currentInputFingerprint = directExecution
+    ? directReviewInputFingerprint({
+        planName: normalizedPlanName,
+        decisionContext: normalizedDecisionContext,
+        instrument,
+      direction: parameters.direction,
+      requestedNotional: tradeAmount,
+      validMinutes,
+      orderSchedule: directScheduleForSubmission,
+    })
+    : reviewInputFingerprint(planDraftPayload());
+  currentInputFingerprintRef.current = currentInputFingerprint;
+  useEffect(() => {
+    if (!activeDraft) return;
+    const identity = `${activeDraft.plan_id}:${activeDraft.draft_version}`;
+    if (initializedSavedDraftRef.current === identity) return;
+    initializedSavedDraftRef.current = identity;
+    const savedFingerprint = directExecution
+      ? savedDirectReviewInputFingerprint(activeDraft)
+      : reviewInputFingerprint(savedDraftInput(activeDraft));
+    setLastSavedInputFingerprint(savedFingerprint);
+    autoSaveAttemptFingerprintRef.current = savedFingerprint;
+    setDraftSaveState({
+      status: "SAVED",
+      at: Date.parse(activeDraft.updated_at) || Date.now(),
+    });
+  }, [
+    activeDraft?.draft_version,
+    activeDraft?.plan_id,
+    activeDraft?.updated_at,
+    directExecution,
+  ]);
+  const canPersistDraft = !liveReadOnly
+    && !aiReviewInProgress
+    && planNameValid
+    && planValidityValid
+    && tradeAmountInputValid
+    && (directExecution || Boolean(strategyId));
+  const draftSave = useMutation({
+    mutationFn: async ({
+      payload,
+      fingerprint,
+    }: {
+      payload: PlanDraftPayload;
+      fingerprint: string;
+    }) => {
+      const existingDraft = latestPersistedDraftRef.current;
+      if (existingDraft) {
+        return {
+          draft: await updatePlan(
+            existingDraft.plan_id,
+            existingDraft.draft_version,
+            payload,
+          ),
+          fingerprint,
         };
-        if (attempt > 0) {
-          clearPersistentRequestIdentity(activationScope);
-        }
-        const activationIdentity = persistentRequestIdentity(
-          null,
-          activationScope,
-          JSON.stringify(activationPayload),
-        );
-        try {
-          const activated = await createActivation(
-            activationPayload,
-            activationIdentity.idempotencyKey,
-          );
-          const activation = (
-            typeof activated.activation === "object"
-            && activated.activation !== null
-            && !Array.isArray(activated.activation)
-          )
-            ? activated.activation as Record<string, unknown>
-            : {};
-          const activationId = String(activation.activation_id ?? "");
-          if (!activationId) {
-            throw new ApiFailure(500, "QUICK_START_ACTIVATION_ID_INVALID");
-          }
-          return {
-            activationId,
-            fixScope,
-            activationScope,
-          };
-        } catch (error) {
-          if (
-            attempt === 0
-            && error instanceof ApiFailure
-            && error.code === "ACTIVATION_PREVIEW_STALE"
-          ) {
-            clearPersistentRequestIdentity(activationScope);
-            continue;
-          }
-          throw error;
-        }
       }
-      throw new ApiFailure(409, "ACTIVATION_PREVIEW_STALE");
-    },
-    onSuccess: ({ activationId, fixScope, activationScope }) => {
+      const createPayload = {
+        ...payload,
+        creator_kind: creatorKind,
+      } satisfies PlanCreatePayload;
+      const createIdentity = persistentRequestIdentity(
+        pendingCreateIdentityRef.current,
+        createIdentityScope,
+        stableInputFingerprint(createPayload),
+      );
+      pendingCreateIdentityRef.current = createIdentity;
+      const saved = await createPlan(createPayload, createIdentity.idempotencyKey);
       pendingCreateIdentityRef.current = null;
       clearPersistentRequestIdentity(createIdentityScope);
-      clearPersistentRequestIdentity(fixScope);
-      clearPersistentRequestIdentity(activationScope);
+      return { draft: saved, fingerprint };
+    },
+    onMutate: () => setDraftSaveState({ status: "SAVING" }),
+    onSuccess: ({ draft: saved, fingerprint }) => {
+      latestPersistedDraftRef.current = saved;
+      setReviewDraft(saved);
+      setLastSavedInputFingerprint(fingerprint);
+      autoSaveAttemptFingerprintRef.current = fingerprint;
+      setDraftSaveState({ status: "SAVED", at: Date.now() });
+      if (!editing) {
+        navigate(`/plans/${saved.plan_id}/edit`, { replace: true });
+      }
+    },
+    onError: (error, attempt) => {
+      if (!isUnknownMutationResult(error)) {
+        pendingCreateIdentityRef.current = null;
+        clearPersistentRequestIdentity(createIdentityScope);
+      }
+      const code = error instanceof ApiFailure ? error.code : "DRAFT_SAVE_FAILED";
+      if (code === "PLAN_VERSION_CONFLICT" && editing) {
+        // A completed autosave can reach the server before React renders its
+        // returned version. Refresh the authoritative version, then allow the
+        // normal fingerprint comparison to issue one safe follow-up save.
+        autoSaveAttemptFingerprintRef.current = null;
+        void draft.refetch();
+      } else {
+        autoSaveAttemptFingerprintRef.current = attempt.fingerprint;
+      }
+      setDraftSaveState({
+        status: "FAILED",
+        message: `草稿未保存（${code}）。`,
+      });
+    },
+  });
+  const saveCurrentDraft = useCallback(() => {
+    if (!canPersistDraft || draftSave.isPending) return;
+    draftSave.mutate({
+      payload: planDraftPayload(),
+      fingerprint: currentInputFingerprint,
+    });
+  }, [canPersistDraft, currentInputFingerprint, draftSave, planDraftPayload]);
+  saveCurrentDraftRef.current = saveCurrentDraft;
+  useEffect(() => {
+    if (
+      !canPersistDraft
+      || draftSave.isPending
+    ) return undefined;
+    const timer = window.setInterval(() => {
+      const fingerprint = currentInputFingerprintRef.current;
+      if (
+        lastSavedInputFingerprint === fingerprint
+        || autoSaveAttemptFingerprintRef.current === fingerprint
+      ) return;
+      saveCurrentDraftRef.current();
+    }, 1_500);
+    return () => window.clearInterval(timer);
+  }, [
+    canPersistDraft,
+    draftSave.isPending,
+    lastSavedInputFingerprint,
+  ]);
+  const latestAiReview = useQuery({
+    queryKey: ["plan-ai-review", activePlanId],
+    queryFn: () => getLatestPlanAiReview(activePlanId ?? ""),
+    enabled: Boolean(activePlanId),
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      return status === "QUEUED" || status === "RUNNING" ? 1_000 : false;
+    },
+  });
+  useEffect(() => {
+    const next = latestAiReview.data;
+    if (!next) return;
+    setAiReview((current) => (
+      !current
+      || current.review_id !== next.review_id
+      || Date.parse(next.updated_at) >= Date.parse(current.updated_at)
+        ? next
+        : current
+    ));
+  }, [latestAiReview.data]);
+  const handleAiReviewUpdate = useCallback((next: PlanAiReview) => {
+    setAiReview((current) => (
+      !current
+      || current.review_id !== next.review_id
+      || Date.parse(next.updated_at) >= Date.parse(current.updated_at)
+        ? next
+        : current
+    ));
+  }, []);
+  const reviewBindsActiveDraft = Boolean(
+    aiReview
+    && activeDraft
+    && aiReview.plan_id === activeDraft.plan_id
+    && aiReview.draft_version === activeDraft.draft_version
+    && aiReview.draft_content_digest === activeDraft.content_digest,
+  );
+  useEffect(() => {
+    const deadline = Date.parse(aiReview?.approval_valid_until ?? "");
+    if (!Number.isFinite(deadline)) return undefined;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      setAiReviewClock(Date.now());
+      return undefined;
+    }
+    const timer = window.setTimeout(
+      () => setAiReviewClock(Date.now()),
+      remaining + 20,
+    );
+    return () => window.clearTimeout(timer);
+  }, [aiReview?.approval_valid_until]);
+  const aiReviewApprovalExpired = Boolean(
+    reviewBindsActiveDraft
+    && aiReview?.status === "APPROVED"
+    && aiReview?.decision === "APPROVE"
+    && Number.isFinite(Date.parse(aiReview.approval_valid_until ?? ""))
+    && Date.parse(aiReview.approval_valid_until ?? "") <= aiReviewClock,
+  );
+  const boundInputFingerprint = reviewedInputFingerprint
+    ?? (reviewBindsActiveDraft && activeDraft
+      ? (directExecution
+        ? savedDirectReviewInputFingerprint(activeDraft)
+        : reviewInputFingerprint(savedDraftInput(activeDraft)))
+      : null);
+  const aiReviewMatchesCurrentInput = reviewBindsActiveDraft
+    && boundInputFingerprint === currentInputFingerprint
+    && aiReview?.configuration.model === aiReviewConfiguration.model
+    && aiReview?.configuration.reasoning_effort === aiReviewConfiguration.reasoning_effort
+    && aiReview?.prompt_version === CURRENT_PLAN_AI_REVIEW_PROMPT_VERSION
+    && !aiReviewApprovalExpired;
+  const aiReviewStaleReason = !aiReview || aiReviewMatchesCurrentInput
+    ? null
+    : aiReviewApprovalExpired
+      ? "MARKET_CONTEXT_EXPIRED" as const
+    : aiReview.prompt_version !== CURRENT_PLAN_AI_REVIEW_PROMPT_VERSION
+      ? "PROMPT_UPGRADED" as const
+      : aiReview.configuration.model !== aiReviewConfiguration.model
+        || aiReview.configuration.reasoning_effort !== aiReviewConfiguration.reasoning_effort
+        ? "CONFIGURATION_CHANGED" as const
+        : "PLAN_CHANGED" as const;
+  const aiReviewApproved = aiReviewMatchesCurrentInput
+    && aiReview?.status === "APPROVED"
+    && aiReview?.decision === "APPROVE";
+  const aiReviewIdentityScope = activePlanId
+    ? `${environmentScope}:PLAN_AI_REVIEW:${activePlanId}`
+    : null;
+  useEffect(() => {
+    if (
+      !aiReviewIdentityScope
+      || !aiReview
+      || !["APPROVED", "REJECTED", "FAILED"].includes(aiReview.status)
+    ) return;
+    pendingAiReviewIdentityRef.current = null;
+    clearPersistentRequestIdentity(aiReviewIdentityScope);
+  }, [aiReview?.status, aiReviewIdentityScope]);
+  const aiReviewRequest = useMutation({
+    onMutate: () => setAiReviewStarting(true),
+    mutationFn: async () => {
+      const payload = planDraftPayload();
+      const inputFingerprint = currentInputFingerprint;
+      const existingDraft = latestPersistedDraftRef.current;
+      let saved: PlanDraft;
+      if (existingDraft && lastSavedInputFingerprint === inputFingerprint) {
+        saved = existingDraft;
+      } else if (existingDraft) {
+        saved = await updatePlan(
+          existingDraft.plan_id,
+          existingDraft.draft_version,
+          payload,
+        );
+      } else {
+        const createPayload = {
+          ...payload,
+          creator_kind: creatorKind,
+        } satisfies PlanCreatePayload;
+        const createIdentity = persistentRequestIdentity(
+          pendingCreateIdentityRef.current,
+          createIdentityScope,
+          stableInputFingerprint(createPayload),
+        );
+        pendingCreateIdentityRef.current = createIdentity;
+        saved = await createPlan(
+          createPayload,
+          createIdentity.idempotencyKey,
+        );
+        pendingCreateIdentityRef.current = null;
+        clearPersistentRequestIdentity(createIdentityScope);
+      }
+      latestPersistedDraftRef.current = saved;
+      setReviewDraft(saved);
+      setLastSavedInputFingerprint(inputFingerprint);
+      autoSaveAttemptFingerprintRef.current = inputFingerprint;
+      setAiReview(null);
+      setReviewedInputFingerprint(inputFingerprint);
+      const reviewScope = `${environmentScope}:PLAN_AI_REVIEW:${saved.plan_id}`;
+      const reviewIdentity = persistentRequestIdentity(
+        pendingAiReviewIdentityRef.current,
+        reviewScope,
+        stableInputFingerprint({
+          plan_id: saved.plan_id,
+          draft_version: saved.draft_version,
+          draft_content_digest: saved.content_digest,
+          configuration: aiReviewConfiguration,
+        }),
+      );
+      pendingAiReviewIdentityRef.current = reviewIdentity;
+      const review = await requestPlanAiReview(
+        saved.plan_id,
+        saved.draft_version,
+        reviewIdentity.idempotencyKey,
+        aiReviewConfiguration,
+      );
+      // The server refreshes the system-owned review evidence cutoff in the
+      // same transaction that creates the review.  Reload its new exact draft
+      // binding instead of leaving the editor on the pre-review version.
+      const refreshed = await getPlan(saved.plan_id);
+      return { review, saved: refreshed, inputFingerprint };
+    },
+    onSuccess: ({ review, saved, inputFingerprint }) => {
+      setReviewDraft(saved);
+      setReviewedInputFingerprint(inputFingerprint);
+      setAiReview(review);
+      void latestAiReview.refetch();
+    },
+    onSettled: () => setAiReviewStarting(false),
+  });
+  const submitAndStart = useMutation({
+    onMutate: () => {
+      setSubmitAndStartPhase("SUBMITTING");
+    },
+    mutationFn: async ({ planId, draftVersion }: SubmitAndStartAttempt) => {
+      const submitScope = `${environmentScope}:PLAN_SUBMIT_AND_START:${planId}`;
+      const submitFingerprint = JSON.stringify({
+        planId,
+        draftVersion,
+      });
+      const submitIdentity = persistentRequestIdentity(
+        pendingSubmitAndStartIdentityRef.current,
+        submitScope,
+        submitFingerprint,
+      );
+      pendingSubmitAndStartIdentityRef.current = submitIdentity;
+      const result = await submitAndStartPlan(
+        planId,
+        draftVersion,
+        submitIdentity.idempotencyKey,
+      );
+      const activation = (
+        typeof result.activation === "object"
+        && result.activation !== null
+        && !Array.isArray(result.activation)
+      )
+        ? result.activation as Record<string, unknown>
+        : {};
+      const activationId = String(activation.activation_id ?? "");
+      if (!activationId) {
+        throw new ApiFailure(500, "SUBMIT_AND_START_ACTIVATION_ID_INVALID");
+      }
+      return { activationId, submitScope };
+    },
+    onSuccess: ({ activationId, submitScope }) => {
+      setSubmitAndStartPhase("IDLE");
+      pendingSubmitAndStartIdentityRef.current = null;
+      clearPersistentRequestIdentity(submitScope);
       navigate(`/activations/${activationId}`);
+    },
+    onError: (error) => {
+      setSubmitAndStartPhase("IDLE");
+      if (!isUnknownMutationResult(error) && activePlanId) {
+        pendingSubmitAndStartIdentityRef.current = null;
+        clearPersistentRequestIdentity(
+          `${environmentScope}:PLAN_SUBMIT_AND_START:${activePlanId}`,
+        );
+      }
+      if (
+        error instanceof ApiFailure
+        && newRiskDisciplineBlockerCodesFromFailureCode(error.code).length > 0
+      ) {
+        void accountOverview.refetch();
+        void directFundingDiscipline.refetch();
+      }
     },
   });
 
@@ -1415,47 +2008,37 @@ export default function NewPlanPage() {
   const loadFailed = (Boolean(loadedPlanId) && draft.isError)
     || (!directExecution && strategies.isError)
     || (!loading && !selectingStrategy && !directExecution && !selectedStrategy);
-  const mutationCode = mutation.error instanceof ApiFailure
-    ? mutation.error.code
-    : "结果未知";
-  const mutationResultUnknown = mutation.isError
-    && isUnknownMutationResult(mutation.error);
-  const unknownUpdateMessage = updateRecovery.status === "REFRESHING"
-    ? "草稿更新结果未知；正在重新读取服务器草稿，请勿直接重试保存。"
-    : updateRecovery.status === "REFRESHED"
-      ? `服务器草稿已刷新至版本 ${updateRecovery.draftVersion}；请核对页面内容，确认原修改未生效后再决定是否重试。`
-      : updateRecovery.status === "FAILED"
-        ? "草稿更新结果未知，且服务器草稿读取失败；请先重新读取草稿，不要直接重试保存。"
-        : "草稿更新结果未知；尚未完成服务器草稿核对，请勿直接重试保存。";
-  const mutationMessage = mutationResultUnknown
-    ? editing
-      ? unknownUpdateMessage
-      : "草稿保存结果未知；再次提交会沿用同一请求身份核对原结果，不会创建替代请求。"
-    : mutationCode === "PLAN_VERSION_CONFLICT"
-    ? "草稿已被其他请求更新，请返回列表后重新打开。"
-    : `${editing ? "草稿未更新" : "草稿未保存"}：${mutationCode}`;
-  const mutationRecoveryAction = editing
-    && mutationResultUnknown
-    && updateRecovery.status === "FAILED"
+  const accountDiscipline = accountOverview.data?.new_risk_discipline;
+  const accountDisciplineUnavailableMessage = liveReadOnly
+    ? "账户级新增风险状态暂时不可读取。当前入口同时为只读公开行情模式，不能创建或保存计划；恢复可写后，提交并启动仍会按服务端当前事实复核。"
+    : "账户级新增风险状态暂时不可读取。可以继续准备并保存草稿；提交并启动会按服务端当前事实复核。恢复完整账户快照后再核对。";
+  const accountDisciplineBlockedConsequence = liveReadOnly
+    ? "当前入口同时为只读公开行情模式，不能创建或保存计划；恢复可写后，提交并启动仍会以当前事实重新核对，不会为新计划预留或绕过容量。"
+    : "可以继续准备并保存草稿；提交并启动仍会以当前事实重新核对，不会为新计划预留或绕过容量。";
+  const accountDisciplineNotice = !editing && accountOverview.isError
     ? (
-      <Button
-        color="inherit"
-        size="small"
-        onClick={() => void refreshUnknownUpdateResult()}
-      >
-        重新读取草稿
-      </Button>
+      <Alert severity="warning" variant="outlined" sx={{ mb: 2 }}>
+        {accountDisciplineUnavailableMessage}
+      </Alert>
     )
-    : undefined;
-  const updateRecoveryAllowsSubmit = !editing
-    || !mutationResultUnknown
-    || updateRecovery.status === "REFRESHED";
+    : !editing && accountDiscipline && !accountDiscipline.new_risk_allowed
+      ? (
+        <Box sx={{ mb: 2 }}>
+          <NewRiskDisciplineBlockNotice
+            discipline={accountDiscipline}
+            consequence={accountDisciplineBlockedConsequence}
+          />
+        </Box>
+      )
+      : null;
+  const strategyTargetedDisciplineBlocked = !directExecution
+    && strategyFundingDisciplineState?.new_risk_allowed === false
+    && accountDiscipline?.new_risk_allowed !== false;
   const canSubmit = !loading
     && !liveReadOnly
     && !loadFailed
-    && !mutation.isPending
-    && !quickStart.isPending
-    && updateRecoveryAllowsSubmit
+    && !draftSave.isPending
+    && !submitAndStart.isPending
     && !marketContextRefreshing
     && (!directExecution || !market.isError)
     && !marketSourceMismatch
@@ -1464,63 +2047,29 @@ export default function NewPlanPage() {
     && configurationValid
     && planNameValid
     && decisionContextValid;
-  const directDemoQuickStartVisible = !editing
-    && directExecution
-    && status.environment_kind === "DEMO";
-  const directDemoQuickStartReady = status.executor_status === "READY"
-    && status.app_executor_product_build_consistent !== false;
-  const canQuickStart = canSubmit
-    && directDemoQuickStartVisible
-    && directDemoQuickStartReady
-    && entryBoundaryBreach === null;
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!canSubmit) return;
-    const payload = planDraftPayload();
-    if (editing && draft.data) {
-      mutation.mutate({
-        kind: "UPDATE",
-        payload,
-        planId: draft.data.plan_id,
-        draftVersion: draft.data.draft_version,
-      });
-      return;
-    }
-    const createPayload = {
-      ...payload,
-      creator_kind: creatorKind,
-    } satisfies PlanCreatePayload;
-    const requestIdentity = persistentRequestIdentity(
-      pendingCreateIdentityRef.current,
-      createIdentityScope,
-      JSON.stringify(createPayload),
-    );
-    pendingCreateIdentityRef.current = requestIdentity;
-    mutation.mutate({
-      kind: "CREATE",
-      payload: createPayload,
-      idempotencyKey: requestIdentity.idempotencyKey,
+    if (!canSubmit || !aiReviewApproved || !activeDraft) return;
+    submitAndStart.mutate({
+      planId: activeDraft.plan_id,
+      draftVersion: activeDraft.draft_version,
     });
   };
-  const startDirectDemoNow = () => {
-    if (!canQuickStart) {
-      return;
-    }
-    const createPayload = {
-      ...planDraftPayload(),
-      creator_kind: creatorKind,
-    } satisfies PlanCreatePayload;
-    const requestIdentity = persistentRequestIdentity(
-      pendingCreateIdentityRef.current,
-      createIdentityScope,
-      JSON.stringify(createPayload),
-    );
-    pendingCreateIdentityRef.current = requestIdentity;
-    quickStart.mutate({
-      payload: createPayload,
-      createIdentity: requestIdentity,
-    });
-  };
+  const submitAndStartButtonLabel = submitAndStartPhase === "SUBMITTING"
+    ? "正在复核并启动…"
+    : "提交并启动";
+  const submitAndStartErrorCode = submitAndStart.error instanceof ApiFailure
+    ? submitAndStart.error.code
+    : "结果未知";
+  const submitAndStartDisciplineBlockers = submitAndStart.error instanceof ApiFailure
+    ? newRiskDisciplineBlockerCodesFromFailureCode(submitAndStart.error.code)
+    : [];
+  const submitAndStartDisciplineRejected = submitAndStartDisciplineBlockers.length > 0;
+  const submitAndStartGenericErrorMessage = isUnknownMutationResult(submitAndStart.error)
+    ? "提交并启动结果尚未确认；请保留当前草稿并用同一提交操作核对，不要修改后另行提交。"
+    : submitAndStartErrorCode === "PLAN_AI_REVIEW_EXPIRED"
+      ? "AI 审核的市场依据已过期（非 AI 拒绝）；请按当前草稿重新提交 AI 审核。"
+    : `未能提交并启动（${submitAndStartErrorCode}）；草稿未变更，可修正后重新提交。`;
   const orderSettings = (
     <Box
       component="section"
@@ -1558,36 +2107,37 @@ export default function NewPlanPage() {
             : "当前唯一策略对象固定为 BTCUSDT-PERP"}
           slotProps={{ htmlInput: { readOnly: true } }}
         />
-        <TextField label="交易金额（USDT）" value={tradeAmount} onChange={(event) => setTradeAmount(event.target.value)} error={!tradeAmountValid} required helperText={tradeAmountValid ? "该金额就是本计划的资金边界，启动时无需再次授权" : "必须填写大于 0 的金额"} />
+        <TextField
+          label="交易金额（USDT）"
+          value={tradeAmount}
+          onChange={(event) => setTradeAmount(event.target.value)}
+          error={!tradeAmountValid}
+          required
+          helperText={!tradeAmountInputValid
+            ? "必须填写大于 0 的金额"
+            : strategyFundingCapExceeded
+              ? `超过当前交易纪律允许的 ${quoteCurrencyAmount(strategyFundingMaximum ?? "0")} USDT。`
+              : !directExecution && strategyFundingMaximum !== null
+                ? `当前交易纪律允许最多 ${quoteCurrencyAmount(strategyFundingMaximum)} USDT；策略计划以此金额形成最大预计损失边界。`
+                : "该金额就是本计划的资金边界，启动时无需再次授权"}
+        />
         <TextField label="计划有效分钟" type="number" value={validMinutes} onChange={(event) => setValidMinutes(event.target.value)} error={!planValidityValid} helperText="范围 15–10080 分钟" slotProps={{ htmlInput: { min: 15, max: 10080, step: 1 } }} required />
       </Box>
-      <Alert severity="warning" variant="outlined" sx={{ mt: directExecution ? 2 : 3 }}>
-        交易金额限制本计划可新增的风险，但不是 Binance 资金冻结，也不能保证最终损失不会超过该值。
-      </Alert>
+      {strategyTargetedDisciplineBlocked ? (
+        <Box sx={{ mt: 2 }}>
+          <NewRiskDisciplineBlockNotice
+            discipline={strategyFundingDisciplineState}
+            title="当前策略方向的新增风险纪律未通过"
+            consequence="可以继续准备草稿；提交并启动和实际新增风险动作都会重新核对，页面不能覆盖该限制。"
+          />
+        </Box>
+      ) : null}
     </Box>
   );
   const decisionContextFields = (
     <Box sx={{ pt: 1.25, borderTop: 1, borderColor: "divider" }}>
-      <Typography component="h3" variant="subtitle2">决策记录</Typography>
-      <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: .25, mb: 1.25 }}>
-        随计划版本保存，用于启动与复核；先固定假设和证伪条件，不能在看到结果后改写。
-      </Typography>
-      <Stack spacing={1.25}>
-        {directExecution && <TextField
-          size="small"
-          label="交易剧本标识"
-          value={decisionContext.playbook_ref}
-          onChange={(event) => setDecisionContext((current) => ({
-            ...current,
-            playbook_ref: event.target.value,
-          }))}
-          error={!isValidPlaybookRef(decisionContext.playbook_ref)}
-          helperText={isValidPlaybookRef(decisionContext.playbook_ref)
-            ? "同一标识只用于同一套入场、失效、保护和退出规则；规则实质变化时必须换新标识"
-            : "必填：1–96 位字母、数字或 . _ : -，如 BTC_BREAKOUT_V1；不要填写每笔唯一信号 ID"}
-          slotProps={{ htmlInput: { maxLength: 96 } }}
-          required
-        />}
+      <Typography component="h3" variant="subtitle2">交易判断</Typography>
+      <Stack spacing={1.25} sx={{ mt: 1.25 }}>
         <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "repeat(2,minmax(0,1fr))" }, gap: 1.25 }}>
           <TextField
             select
@@ -1601,15 +2151,17 @@ export default function NewPlanPage() {
             error={!decisionContext.intent
               || (decisionContext.intent === "PROFIT_SEEKING" && !profitSeekingIntentAllowed)
               || (decisionContext.intent === "VALIDATION" && !validationIntentAllowed)}
-            helperText={decisionContext.intent === "PROFIT_SEEKING" && !profitSeekingIntentAllowed
-              ? "当前策略未取得盈利导向资格；请选择机制验证。服务端也会拒绝把它固定或激活为盈利样本"
+            helperText={directExecution
+              ? undefined
+              : decisionContext.intent === "PROFIT_SEEKING" && !profitSeekingIntentAllowed
+              ? "当前策略未取得盈利导向资格；请选择机制验证。服务端也会拒绝以该目的提交并启动"
               : decisionContext.intent === "VALIDATION" && !validationIntentAllowed
                 ? "当前策略未取得验证用途资格；不能保存或激活这个目的"
               : decisionContext.intent === "VALIDATION"
               ? "验证软件或执行闭环；实际盈亏保留，但不进入策略收益样本"
               : decisionContext.intent === "PROFIT_SEEKING"
                 ? "按固定交易假设获取市场收益；盈利与亏损都进入后续评价"
-                : "必须明确是盈利导向还是机制验证"}
+              : "必须明确是盈利导向还是机制验证"}
             required
           >
             <MenuItem value="" disabled>请选择本次目的</MenuItem>
@@ -1630,7 +2182,6 @@ export default function NewPlanPage() {
               setup_family: event.target.value as PlanSetupFamily,
             }))}
             error={!decisionContext.setup_family}
-            helperText="历史证据只与同一形态比较；不要为迎合结果改标签"
             required
           >
             <MenuItem value="" disabled>请选择交易形态</MenuItem>
@@ -1639,53 +2190,32 @@ export default function NewPlanPage() {
             ))}
           </TextField>
         </Box>
-        {([
-          ["rationale", "可证伪交易假设", "必须说明价格为何应在什么条件下向所选方向发展，不能只写“看涨/突破”"],
-          ["evidence", "入场前证据", "记录结构、K 线、成交量、波动、订单条件或外部信号；页面会另存当前行情截止点"],
-          ["invalidation", "假设失效与放弃条件", "说明什么事实出现时不再入场或承认判断错误；文字不会自动成为订单条件，需在订单计划中落实"],
-          ["limitations", "已知局限", "记录样本不足、未知项、滑点、资金费、数据或方法边界"],
-        ] as const).map(([key, label, helper]) => {
-          const value = decisionContext[key];
-          const valid = value.trim().length > 0 && value.trim().length <= 2000;
-          return (
-            <TextField
-              key={key}
-              size="small"
-              multiline
-              minRows={2}
-              maxRows={5}
-              label={label}
-              value={value}
-              onChange={(event) => setDecisionContext((current) => ({
-                ...current,
-                [key]: event.target.value,
-              }))}
-              error={!valid}
-              helperText={valid ? `${helper} · ${value.length}/2000` : "必填，最多 2000 个字符"}
-              slotProps={{ htmlInput: { maxLength: 2000 } }}
-              required
-            />
-          );
-        })}
         <TextField
           size="small"
-          label="Halpha 行情证据截止"
-          value={normalizedDecisionContext.evidence_cutoff
-            ? formatUserVisibleTime(normalizedDecisionContext.evidence_cutoff)
-            : "等待当前环境行情"}
-          helperText="由当前环境行情自动固定；不是未来价格承诺"
-          slotProps={{ htmlInput: { readOnly: true } }}
-          error={!normalizedDecisionContext.evidence_cutoff}
+          multiline
+          minRows={directExecution ? 3 : 4}
+          maxRows={8}
+          label="交易理由"
+          value={decisionContext.rationale}
+          onChange={(event) => setDecisionContext((current) => ({
+            ...current,
+            rationale: event.target.value,
+          }))}
+          error={!decisionContext.rationale.trim() || decisionContext.rationale.trim().length > 2000}
+          helperText={directExecution
+            ? undefined
+            : decisionContext.rationale.trim()
+              ? `${decisionContext.rationale.length}/2000`
+              : "必填"}
+          slotProps={{ htmlInput: { maxLength: 2000 } }}
+          required
         />
-        <Alert severity="info" variant="outlined">
-          这些文字只记录决策。真正阻止追价、失效入场或扩大损失的边界，必须同时配置为订单条件、取消规则、止损或时间退出。
-        </Alert>
       </Stack>
     </Box>
   );
-  const decisionEvidencePanel = decisionContext.intent
+  const decisionEvidencePanel = !directExecution
+    && decisionContext.intent
     && decisionContext.setup_family
-    && (!directExecution || isValidPlaybookRef(decisionContext.playbook_ref))
     ? <DecisionEvidencePanel
         evidence={decisionEvidence.data}
         pending={decisionEvidence.isPending || decisionEvidence.isFetching}
@@ -1704,11 +2234,7 @@ export default function NewPlanPage() {
           : null}
         onExportQualification={(target) => qualificationExport.mutate(target)}
       />
-    : <Alert severity="info" variant="outlined" sx={{ mt: 2 }}>
-        {directExecution
-          ? "填写交易剧本标识并选择本次目的和交易形态后，Halpha 才能核对完全同类历史样本；不会用全品种、相似标签或单次信号 ID 扫描凑数。"
-          : "选择本次目的和交易形态后，Halpha 才能核对完全同类历史样本；不会用全品种或相似标签扫描凑数。"}
-      </Alert>;
+    : null;
 
   if (selectingStrategy) {
     return <StrategySelection
@@ -1716,6 +2242,7 @@ export default function NewPlanPage() {
       loading={strategies.isPending}
       failed={strategies.isError}
       readOnly={liveReadOnly}
+      disciplineNotice={accountDisciplineNotice}
       onSelect={selectStrategy}
       onSelectDirect={selectDirectExecution}
       onCancel={() => navigate("/plans")}
@@ -1730,9 +2257,13 @@ export default function NewPlanPage() {
       : !planNameValid
         ? "填写有效计划名称。"
         : !decisionContextValid
-          ? "补全交易目的、形态、可证伪假设、失效条件、依据、局限与当前行情截止。"
-        : !tradeAmountValid
-          ? "计划资金上限必须大于 0。"
+          ? "选择交易目的和形态，并填写一段完整的交易理由。"
+        : planRewardRiskBlocked
+          ? `价格退出的计划加权收益 / 风险必须达到 ${quoteAmount(applicableMinimumRewardRisk)}R；时间退出不能替代该新增风险纪律。`
+          : !tradeAmountInputValid
+            ? "计划资金上限必须大于 0。"
+          : directFundingCapExceeded
+            ? `资金上限超过当前纪律可用的 ${quoteCurrencyAmount(directFundingMaximum ?? "0")} USDT；已设上限不会被自动修改，请主动调整后再提交。`
           : !planValidityValid
             ? "填写 15–10080 分钟的有效期。"
             : market.isError
@@ -1744,48 +2275,211 @@ export default function NewPlanPage() {
               : !orderScheduleReady
                   ? "修正输入并等待当前版本的服务端预览通过。"
                   : null;
-    const levelCount = orderSchedule.entry_program?.kind === "TIME_SLICED"
-      ? orderSchedule.entry_program.slice_count
-      : orderSchedule.price_distribution.kind === "LADDER"
-        ? orderSchedule.price_distribution.level_count
-        : 1;
-    const quickStartErrorCode = quickStart.error instanceof ApiFailure
-      ? quickStart.error.code
-      : "结果未知";
-    const quickStartErrorMessage = quickStartErrorCode === "ATTRIBUTION_AMBIGUOUS"
-      ? `${instrument} 已有运行中的计划；当前计划已创建但未启动。请先处理现有计划。`
-      : isUnknownMutationResult(quickStart.error)
-        ? "启动结果尚未确认；请先到计划列表核对状态，不要重复创建。"
-        : `未能启动计划（${quickStartErrorCode}）。请检查当前输入或稍后重试。`;
-    const quickStartInfrastructureReason = directDemoQuickStartVisible
-      && !directDemoQuickStartReady
-      ? status.app_executor_product_build_consistent === false
-        ? "Demo 执行暂不可用：应用与执行器版本不一致。更新执行器后可启动；草稿仍可保存。"
-        : "Demo 执行暂不可用：执行器尚未就绪。恢复后可启动；草稿仍可保存。"
+    const directSubmitAndStartErrorMessage = submitAndStartDisciplineRejected
+      ? "当前账户纪律拒绝提交并启动；草稿仍可修改。请在恢复条件满足后重新提交。"
+      : submitAndStartErrorCode === "PLAN_AI_REVIEW_EXPIRED"
+        ? "AI 审核的市场依据已过期（非 AI 拒绝）；请按当前草稿重新提交 AI 审核。"
+      : submitAndStartErrorCode === "PLAN_REWARD_RISK_UNAVAILABLE"
+        ? "当前计划没有可计算的价格退出收益 / 风险；请返回退出步骤配置价格止盈并重新审核。"
+        : submitAndStartErrorCode === "PLAN_REWARD_RISK_BELOW_DISCIPLINE_MINIMUM"
+          ? `当前计划收益 / 风险低于纪律最低 ${quoteAmount(applicableMinimumRewardRisk)}R；请调整价格退出后重新审核。`
+      : submitAndStartErrorCode === "ATTRIBUTION_AMBIGUOUS"
+        ? `${instrument} 已有运行中的计划；草稿仍可修改。请先处理现有计划后重新提交。`
+        : submitAndStartGenericErrorMessage;
+    const directAiReviewRequestError = aiReviewRequestErrorMessage(
+      aiReviewRequest.error,
+      aiReviewRequest.isError,
+    );
+    const directAiReviewBlockedReasons = Array.from(new Set([
+      ...directScheduleProblems,
+      directBlockingReason,
+      !planNameValid ? "填写有效的计划名称。" : null,
+      !decisionContextValid ? "选择交易目的、形态并填写交易理由。" : null,
+      planRewardRiskBlocked
+        ? `价格退出的计划加权收益 / 风险须达到 ${quoteAmount(applicableMinimumRewardRisk)}R。`
+        : null,
+      !tradeAmountInputValid ? "资金上限必须大于 0。" : null,
+      directFundingCapExceeded
+        ? `资金上限超过当前纪律可用的 ${quoteCurrencyAmount(directFundingMaximum ?? "0")} USDT。`
+        : null,
+      directFundingDisciplineIssue,
+      directFundingCapacityExhausted ? "当前纪律名义敞口没有剩余容量。" : null,
+      !planValidityValid ? "填写 15–10080 分钟的有效期。" : null,
+      !directMarketDataReady ? "等待当前行情与交易所规则就绪。" : null,
+      !orderScheduleReady ? "修正订单计划并等待服务端预览通过。" : null,
+      draftSave.isPending ? "正在保存草稿。" : null,
+    ].filter((reason): reason is string => Boolean(reason))));
+    const directAiReviewPanel = (
+      <PlanAiReviewPanel
+        review={aiReview}
+        reviewMatchesDraft={aiReviewMatchesCurrentInput}
+        staleReason={aiReviewStaleReason}
+        requesting={aiReviewRequest.isPending}
+        requestError={directAiReviewRequestError}
+        requestBlockedReasons={directAiReviewBlockedReasons}
+        configuration={aiReviewConfiguration}
+        onConfigurationChange={setAiReviewConfiguration}
+        onRequest={() => aiReviewRequest.mutate()}
+        onReviewUpdate={handleAiReviewUpdate}
+      />
+    );
+    const directOpenRiskRemaining = directFundingDisciplineState?.open_risk_limit !== null
+      && directFundingDisciplineState?.open_risk_limit !== undefined
+      && directFundingDisciplineState?.open_risk_committed !== null
+      && directFundingDisciplineState?.open_risk_committed !== undefined
+      ? subtractDecimal(
+        directFundingDisciplineState.open_risk_limit,
+        directFundingDisciplineState.open_risk_committed,
+      )
       : null;
-    const planOptions = (
+    const directExposurePair = (used: string | null | undefined, limit: string | null | undefined) => (
+      used !== null
+      && used !== undefined
+      && limit !== null
+      && limit !== undefined
+        ? `${quoteCurrencyAmount(used)} / ${quoteCurrencyAmount(limit)} USDT`
+        : "待账户快照"
+    );
+    const directExposureRows = directFundingDisciplineState
+      ? [
+        ["总名义敞口", directExposurePair(
+          directFundingDisciplineState.gross_exposure,
+          directFundingDisciplineState.gross_exposure_limit,
+        )],
+        [`${instrument} 敞口`, directExposurePair(
+          directFundingDisciplineState.instrument_exposure,
+          directFundingDisciplineState.instrument_exposure_limit,
+        )],
+        [`${directFundingDisciplineState.correlation_cluster ?? "相关簇"}敞口`, directExposurePair(
+          directFundingDisciplineState.correlated_exposure,
+          directFundingDisciplineState.correlated_exposure_limit,
+        )],
+      ] as const
+      : [["名义敞口", "待账户快照"]] as const;
+    const directTakeProfitLevels = orderSchedule.protection_policy.take_profit_ladder?.levels ?? [];
+    const directRiskRewardFact = directTakeProfitLevels.length > 0
+      ? `价格止盈 ${directTakeProfitLevels.map((level, index) => (
+        `TP${index + 1} ${quoteAmount(level.trigger_r)}R`
+      )).join(" · ")}`
+      : orderSchedule.protection_policy.time_exit_seconds !== null
+        ? "未设价格止盈（已设时间退出）"
+        : "未设自动退出";
+    const directDisciplineReviewSummary = (
       <Box
         component="section"
-        aria-labelledby="direct-plan-identity-title"
+        data-testid="direct-discipline-review-summary"
         sx={{
-          px: 1.5,
-          py: 1.25,
+          borderTop: 1,
+          borderColor: directFundingCapExceeded
+            || directFundingCapacityExhausted
+            || planRewardRiskBlocked
+            ? "error.main"
+            : "divider",
+          pt: 1.25,
         }}
       >
-        <Typography id="direct-plan-identity-title" component="h2" variant="subtitle2">
-          计划信息
+        <Typography component="h3" variant="caption" color="text.secondary" sx={{ display: "block", mb: .75 }}>
+          交易纪律
         </Typography>
-        <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: .25, mb: 1.25 }}>
-          名称、创建来源和有效期将随计划保存；启动前请在此确认。
-        </Typography>
-        <Stack spacing={1.25}>
+        <Box
+          component="dl"
+          sx={{
+            m: 0,
+            display: "grid",
+            borderTop: 1,
+            borderColor: "divider",
+          }}
+        >
+          {[
+            [
+              "计划资金",
+              `${quoteCurrencyAmount(tradeAmount || "0")} / 可用 ${directFundingMaximum === null ? "待账户快照" : `${quoteCurrencyAmount(directFundingMaximum)} USDT`}`,
+              directFundingCapExceeded,
+            ],
+            [
+              "最大预计亏损",
+              directMaximumProjectedLoss
+                ? <FinancialToneText tone={financialToneForSignedValue(-1)}>{`-${quoteCurrencyAmount(directMaximumProjectedLoss)} USDT`}</FinancialToneText>
+                : "等待预览",
+              false,
+            ],
+            [
+              "单计划限额",
+              directPlanLossLimit
+                ? <FinancialToneText tone={financialToneForSignedValue(-1)}>{`-${quoteCurrencyAmount(directPlanLossLimit)} USDT`}</FinancialToneText>
+                : "待账户快照",
+              false,
+            ],
+            [
+              "收益 / 风险",
+              `${directRiskRewardFact} · 计划加权 ${directRewardRiskRatio === null ? "不可计算" : `${quoteAmount(directRewardRiskRatio)}R`} / 最低 ${quoteAmount(applicableMinimumRewardRisk)}R`,
+              planRewardRiskBlocked,
+            ],
+            [
+              "组合剩余风险",
+              directOpenRiskRemaining === null ? "待账户快照" : `${quoteCurrencyAmount(directOpenRiskRemaining)} USDT`,
+              directFundingCapacityExhausted,
+            ],
+            ...directExposureRows.map(([label, display]) => [label, display, false] as const),
+          ].map(([label, display, blocked]) => (
+            <Box
+              key={String(label)}
+              sx={{
+                display: "grid",
+                gridTemplateColumns: "104px minmax(0, 1fr)",
+                columnGap: 1,
+                alignItems: "baseline",
+                py: .8,
+                borderBottom: 1,
+                borderColor: "divider",
+              }}
+            >
+              <Typography component="dt" variant="caption" color="text.secondary" sx={{ m: 0 }}>
+                {label}
+              </Typography>
+              <Typography
+                component="dd"
+                variant="body2"
+                color={blocked ? "error.main" : "text.primary"}
+                sx={{ minWidth: 0, m: 0, fontWeight: 650, lineHeight: 1.45 }}
+              >
+                {display}
+              </Typography>
+            </Box>
+          ))}
+        </Box>
+      </Box>
+    );
+    const directConfigGroupSx = {
+      borderTop: 1,
+      borderColor: "divider",
+      pt: 1.1,
+    } as const;
+    const directConfigGroupTitleSx = {
+      borderLeft: 3,
+      borderColor: "primary.main",
+      pl: 1,
+      fontWeight: 850,
+    } as const;
+    const directPlanMetadata = (
+      <Box
+        component="section"
+        aria-labelledby="direct-plan-metadata-title"
+        sx={directConfigGroupSx}
+      >
+        <Box sx={{ pb: .85 }}>
+          <Typography id="direct-plan-metadata-title" component="h2" variant="body2" sx={directConfigGroupTitleSx}>
+            计划基础信息
+          </Typography>
+        </Box>
+        <Stack spacing={1.1}>
           <TextField
             size="small"
             label="计划名称"
             value={planName}
             onChange={(event) => setPlanName(event.target.value)}
             error={planName.length > 0 && !planNameValid}
-            helperText={planNameValid ? "自动生成，可按需修改" : "必填，最多 80 个字符"}
+            helperText={planNameValid ? undefined : "必填，最多 80 个字符"}
             slotProps={{ htmlInput: { maxLength: 80 } }}
             required
           />
@@ -1808,7 +2502,6 @@ export default function NewPlanPage() {
                 label="创建方式"
                 value={creatorKind}
                 onChange={(event) => setCreatorKind(event.target.value as PlanCreatorKind)}
-                helperText="AI 代创建时须选择 AI 创建"
               >
                 <MenuItem value="HUMAN">人工创建</MenuItem>
                 <MenuItem value="AI">AI 创建</MenuItem>
@@ -1822,9 +2515,16 @@ export default function NewPlanPage() {
               />
             )}
           </Box>
-          {decisionContextFields}
-          {decisionEvidencePanel}
         </Stack>
+      </Box>
+    );
+    const planOptions = (
+      <Box
+        component="section"
+        aria-label="交易判断核对"
+        sx={{ px: 1.5, py: 1.25 }}
+      >
+        {decisionContextFields}
       </Box>
     );
     const workspaceHeader = (
@@ -1837,7 +2537,7 @@ export default function NewPlanPage() {
             arrow
             title={addPositionRequested
               ? "追加开仓是独立的新风险计划，不修改外部持仓的来源和既有盈亏。"
-              : "直接执行不会再选择策略。保存只创建计划草稿；确认并启动后才会按固定档位和条件进入执行链路。"}
+              : "直接执行不选择策略；保存草稿不会启动，提交并启动会创建运行快照并交给执行器。"}
           >
             <IconButton size="small" aria-label={addPositionRequested ? "了解独立追加开仓" : "了解直接执行与保存草稿"}>
               <InfoOutlined sx={{ fontSize: 16 }} />
@@ -1881,7 +2581,7 @@ export default function NewPlanPage() {
               {visibleReferencePrice ? marketPrice(visibleReferencePrice) : "未知"}
             </Typography>
           </Box>
-          <Box sx={{ display: { xs: "none", sm: "block" }, minWidth: 0 }}>
+          <Box sx={{ display: { xs: "none", xl: "block" }, minWidth: 0 }}>
             <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>买一 / 卖一</Typography>
             <Typography className="mono" variant="body2" noWrap sx={{ fontWeight: 700 }}>
               {visibleBidPrice && visibleAskPrice
@@ -1889,13 +2589,13 @@ export default function NewPlanPage() {
                 : "未知"}
             </Typography>
           </Box>
-          <Box sx={{ display: { xs: "none", md: "block" }, minWidth: 0 }}>
+          <Box sx={{ display: { xs: "none", xl: "block" }, minWidth: 0 }}>
             <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>价差</Typography>
             <Typography className="mono" variant="body2" noWrap sx={{ fontWeight: 700 }}>
               {visibleSpread ? `${marketPrice(visibleSpread)} USDT` : "未知"}
             </Typography>
           </Box>
-          <Box sx={{ display: { xs: "none", lg: "block" }, minWidth: 0 }}>
+          <Box sx={{ display: { xs: "none", xl: "block" }, minWidth: 0 }}>
             <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>行情截止</Typography>
             <Typography variant="caption" noWrap>
               {visibleSourceCutoff ? formatUserVisibleTime(visibleSourceCutoff) : "未知"}
@@ -1917,7 +2617,7 @@ export default function NewPlanPage() {
       </Stack>
     );
     const quickControls = (
-      <Box sx={{ px: 1.5, py: 1.35, borderBottom: 1, borderColor: "divider" }}>
+      <Box sx={{ px: 1.5, py: 1.25, borderBottom: 1, borderColor: "divider" }}>
         {addPositionRequested ? (
           <Alert severity="warning" variant="outlined" sx={{ mb: 1.25 }}>
             这是独立的新风险计划，不会把 {instrument} 的外部持仓基线改写成 Halpha 入场。
@@ -1941,7 +2641,15 @@ export default function NewPlanPage() {
             行情来源与当前 {status.environment_kind} 环境不一致，已拒绝显示和预览；请核对运行配置后刷新。
           </Alert>
         ) : null}
-        <Box sx={{ display: "grid", gridTemplateColumns: "minmax(0,1fr) minmax(0,1fr)", gap: 1 }}>
+        <Stack spacing={0}>
+          {directPlanMetadata}
+          <Box component="section" aria-labelledby="direct-direction-title" sx={directConfigGroupSx}>
+            <Box sx={{ pb: .85 }}>
+              <Typography id="direct-direction-title" component="h2" variant="body2" sx={directConfigGroupTitleSx}>
+                方向
+              </Typography>
+            </Box>
+            <Box>
           <ToggleButtonGroup
             exclusive
             fullWidth
@@ -1958,113 +2666,196 @@ export default function NewPlanPage() {
               ));
               update("direction", next);
             }}
-            sx={{ "& .MuiToggleButton-root": { minHeight: 40, py: .5, fontWeight: 800 } }}
+            sx={{
+              "& .MuiToggleButton-root": {
+                minHeight: 40,
+                py: .5,
+                fontWeight: 800,
+                borderColor: "divider",
+                bgcolor: "background.paper",
+              },
+              "& .MuiToggleButton-root[value=\"LONG\"]": {
+                color: "var(--halpha-market-up)",
+              },
+              "& .MuiToggleButton-root[value=\"SHORT\"]": {
+                color: "var(--halpha-market-down)",
+              },
+              "& .MuiToggleButton-root.Mui-selected, & .MuiToggleButton-root.Mui-selected:hover": {
+                bgcolor: "background.paper",
+                fontWeight: 850,
+                borderWidth: 2,
+                boxShadow: "none",
+              },
+              "& .MuiToggleButton-root[value=\"LONG\"].Mui-selected": {
+                color: "var(--halpha-market-up)",
+                borderColor: "var(--halpha-market-up) !important",
+              },
+              "& .MuiToggleButton-root[value=\"SHORT\"].Mui-selected": {
+                color: "var(--halpha-market-down)",
+                borderColor: "var(--halpha-market-down) !important",
+              },
+            }}
           >
-            <ToggleButton value="LONG">做多</ToggleButton>
-            <ToggleButton value="SHORT">做空</ToggleButton>
+            <ToggleButton value="LONG" className={marketToneClassName(marketToneForDirection("LONG"))}>
+              做多
+            </ToggleButton>
+            <ToggleButton value="SHORT" className={marketToneClassName(marketToneForDirection("SHORT"))}>
+              做空
+            </ToggleButton>
           </ToggleButtonGroup>
-          <TextField
-            size="small"
-            label="资金上限（USDT）"
-            value={tradeAmount}
-            onChange={(event) => updateDirectTradeAmount(event.target.value)}
-            error={!tradeAmountValid}
-            slotProps={{ htmlInput: { inputMode: "decimal" } }}
-            required
-          />
-        </Box>
-        <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: .75 }}>
-          资金上限约束本计划新增风险，不是交易所冻结金额；实际下单额在下方单独配置。
-        </Typography>
+            </Box>
+          </Box>
+          <Box
+            aria-label="资金上限配置"
+            sx={{
+              ...directConfigGroupSx,
+              borderColor: directFundingCapExceeded || directFundingCapacityExhausted
+                ? "warning.main"
+                : "divider",
+            }}
+          >
+            <Stack direction="row" spacing={1} sx={{ pb: .85, alignItems: "baseline", justifyContent: "space-between" }}>
+              <Typography component="h2" variant="body2" sx={directConfigGroupTitleSx}>资金上限</Typography>
+              <Typography
+                variant="caption"
+                className="mono"
+                color={directFundingMaximumNumber !== null && directFundingMaximumNumber <= 0 ? "warning.main" : "text.secondary"}
+                sx={{ flexShrink: 0, fontWeight: 750, whiteSpace: "nowrap" }}
+              >
+                {directFundingDiscipline.isError
+                  ? "纪律上限不可读取"
+                  : directFundingDisciplineBlocked
+                    ? "纪律上限不可用"
+                    : directFundingMaximum === null
+                      ? "纪律上限待账户快照"
+                      : `当前可用 ${quoteCurrencyAmount(directFundingMaximum)} USDT`}
+              </Typography>
+            </Stack>
+            <Box sx={{ pt: .4 }}>
+            <Slider
+              aria-label="按当前纪律比例快速设定资金上限"
+              value={directFundingSliderValue}
+              min={0}
+              max={100}
+              step={1}
+              marks={[
+                { value: 25, label: "25%" },
+                { value: 50, label: "50%" },
+                { value: 75, label: "75%" },
+                { value: 100, label: "100%" },
+              ]}
+              disabled={directFundingMaximumNumber === null || directFundingMaximumNumber <= 0}
+              onChange={(_event, next) => {
+                if (typeof next !== "number" || directFundingMaximum === null) return;
+                updateDirectTradeAmount(
+                  fundingAmountAtPercentage(directFundingMaximum, next),
+                );
+              }}
+              sx={{ mt: .4, mb: 2.5 }}
+            />
+            <TextField
+              fullWidth
+              size="small"
+              label="资金上限（USDT）"
+              value={tradeAmount}
+              onChange={(event) => updateDirectTradeAmount(event.target.value)}
+              onBlur={() => {
+                const amount = Number(tradeAmount);
+                if (Number.isFinite(amount) && amount >= 0) {
+                  updateDirectTradeAmount(amount.toFixed(2));
+                }
+              }}
+              error={!tradeAmountValid}
+              helperText={!tradeAmountInputValid
+                ? "请输入大于 0 的金额。"
+                : directFundingCapExceeded
+                ? `纪律上限：${quoteCurrencyAmount(directFundingMaximum ?? "0")} USDT。`
+                : directFundingCapacityExhausted
+                  ? "当前名义敞口没有剩余容量。"
+                  : undefined}
+              slotProps={{ htmlInput: { inputMode: "decimal" } }}
+              required
+            />
+            </Box>
+          </Box>
+        </Stack>
       </Box>
     );
+    const directSubmissionProblems = Array.from(new Set([
+      !activeDraft ? "等待当前草稿保存完成。" : null,
+      !aiReviewApproved ? "完成当前草稿的 AI 审核并获得批准。" : null,
+      directBlockingReason,
+      directFundingDisciplineIssue,
+      directFundingCapacityExhausted ? "当前纪律名义敞口没有剩余容量。" : null,
+      !directMarketDataReady ? "等待当前行情与交易所规则就绪。" : null,
+    ].filter((problem): problem is string => Boolean(problem))));
+    const directSubmitDisabled = !canSubmit
+      || !aiReviewApproved
+      || directFundingDisciplineIssue !== null;
+    const directSubmissionTooltip = directSubmissionProblems.length > 0 ? (
+      <Box component="ul" sx={{ m: 0, pl: 2, py: .25, maxWidth: 360 }}>
+        {directSubmissionProblems.map((problem) => <li key={problem}>{problem}</li>)}
+      </Box>
+    ) : "复核当前草稿并立即启动。";
+    const draftSaveLabel = draftSaveState.status === "SAVING"
+      ? "正在保存草稿"
+      : draftSaveState.status === "SAVED"
+        ? `草稿已保存 ${formatUserVisibleTime(new Date(draftSaveState.at).toISOString())}`
+        : draftSaveState.status === "FAILED"
+          ? draftSaveState.message
+          : "草稿未保存";
     const footerControls = (
       <Stack spacing={.8}>
-        <Stack direction="row" spacing={1} sx={{ alignItems: "center", justifyContent: "space-between" }}>
-          <Typography variant="caption" color="text.secondary">
-            {levelCount} 档 · 资金上限 {tradeAmount ? quoteAmount(tradeAmount) : "—"} USDT
-          </Typography>
-          <Chip
-            size="small"
-            variant="outlined"
-            color="default"
-            label={orderScheduleReady ? "技术预览通过" : "等待有效预览"}
-            sx={{ fontWeight: 750 }}
-          />
-        </Stack>
-        {directBlockingReason ? (
-          <Typography variant="caption" color="text.secondary" aria-live="polite">
-            {directBlockingReason}
-          </Typography>
-        ) : null}
-        {quickStartInfrastructureReason ? (
-          <Typography variant="caption" color="warning.main" aria-live="polite">
-            {quickStartInfrastructureReason}
-          </Typography>
-        ) : null}
-        {entryBoundaryBreachMessage ? (
-          <Alert
-            severity="warning"
-            variant="outlined"
-            data-testid="entry-boundary-breach"
-          >
-            {entryBoundaryBreachMessage}
-          </Alert>
-        ) : null}
-        {mutation.isError ? (
-          <Alert severity="error" variant="outlined" action={mutationRecoveryAction}>
-            {mutationMessage}
-          </Alert>
-        ) : null}
-        {quickStart.isError ? (
-          <Alert
-            severity="error"
-            variant="outlined"
-            action={quickStartErrorCode === "ATTRIBUTION_AMBIGUOUS" ? (
-              <Button color="inherit" size="small" onClick={() => navigate("/plans")}>
-                查看计划
-              </Button>
-            ) : undefined}
-          >
-            {quickStartErrorMessage}
-          </Alert>
-        ) : null}
         <Stack direction="row" spacing={1}>
-          {directDemoQuickStartVisible ? (
-            <Button
-              type="button"
-              variant="contained"
-              color="warning"
-              fullWidth
-              disabled={!canQuickStart}
-              onClick={startDirectDemoNow}
-              sx={{
-                "&.Mui-disabled": {
-                  color: "#475569",
-                  bgcolor: "#E2E8F0",
-                },
-              }}
-            >
-              {quickStart.isPending ? "正在创建并启动…" : "创建并启动 Demo"}
-            </Button>
-          ) : null}
-          <Button
-            type="submit"
-            variant={directDemoQuickStartVisible ? "outlined" : "contained"}
-            fullWidth={!directDemoQuickStartVisible}
-            disabled={!canSubmit}
-            sx={directDemoQuickStartVisible
-              ? { minWidth: 104, whiteSpace: "nowrap" }
-              : undefined}
+          <Tooltip
+            title={canPersistDraft ? "保存当前草稿" : "填写计划名称、有效期和资金上限后可保存。"}
+            arrow
           >
-            {mutation.isPending
-              ? "正在保存…"
-              : editing
-                ? "保存计划修改"
-                : "保存草稿"}
-          </Button>
-          <Button variant="outlined" onClick={() => navigate("/plans")} sx={{ minWidth: 76 }}>取消</Button>
+            <Box sx={{ flex: "0 0 auto" }}>
+              <Button
+                type="button"
+                variant="outlined"
+                disabled={!canPersistDraft || draftSave.isPending}
+                onClick={saveCurrentDraft}
+              >
+                保存草稿
+              </Button>
+            </Box>
+          </Tooltip>
+          <Tooltip title={directSubmissionTooltip} arrow disableHoverListener={!directSubmitDisabled}>
+            <Box sx={{ flex: 1 }}>
+              <Button
+                type="submit"
+                variant="contained"
+                color="warning"
+                fullWidth
+                disabled={directSubmitDisabled}
+              >
+                <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: .5 }}>
+                  {submitAndStartButtonLabel}
+                  {directSubmitDisabled ? <ErrorOutlined color="error" fontSize="small" aria-label="提交并启动条件未满足" /> : null}
+                </Box>
+              </Button>
+            </Box>
+          </Tooltip>
         </Stack>
+        <Typography
+          variant="caption"
+          color={draftSaveState.status === "FAILED" ? "error.main" : "text.secondary"}
+          aria-live="polite"
+        >
+          {draftSaveLabel}
+        </Typography>
+        {submitAndStart.isError ? (
+          <>
+            <Alert
+              severity="error"
+              variant="outlined"
+          >
+              {directSubmitAndStartErrorMessage}
+            </Alert>
+          </>
+        ) : null}
       </Stack>
     );
 
@@ -2085,6 +2876,8 @@ export default function NewPlanPage() {
           onChange={(next) => {
             setOrderScheduleReady(false);
             setDirectMaximumProjectedLoss(null);
+            setDirectEffectiveNotional(null);
+            setDirectRequestedNotional(null);
             setOrderSchedule(next);
           }}
           environmentId={status.environment_id}
@@ -2092,6 +2885,7 @@ export default function NewPlanPage() {
           instrumentRef={instrument}
           direction={parameters.direction}
           maxNotional={tradeAmount}
+          maxPlanLoss={directPlanLossLimit}
           referencePrice={stableReferencePrice}
           liveReferencePrice={liveReferencePrice}
           bidPrice={visibleBidPrice}
@@ -2113,6 +2907,7 @@ export default function NewPlanPage() {
           feeEvidenceLoading={executionFeeEvidence.isPending}
           feeEvidenceUnavailable={executionFeeEvidence.isError}
           funding={usableFunding}
+          fundingHistory={usableFundingHistory}
           chartInterval={chartInterval}
           onChartIntervalChange={handleChartIntervalChange}
           liveBar={marketStream.liveBar}
@@ -2120,18 +2915,57 @@ export default function NewPlanPage() {
           streamGeneration={marketStream.generation}
           marketProjectionReady={directMarketDataReady}
           marketColorScheme={marketColorScheme}
-          scheduleRef={draft.data?.plan_id ?? loadedPlanId ?? "new-direct-order-plan"}
+          scheduleRef={activeDraft?.plan_id ?? loadedPlanId ?? "new-direct-order-plan"}
           workspaceHeader={workspaceHeader}
           leadingControls={quickControls}
           planOptions={planOptions}
+          reviewDisciplineSummary={directDisciplineReviewSummary}
+          aiReviewPanel={directAiReviewPanel}
           footerControls={footerControls}
+          decisionReviewReady={decisionContextValid && !planRewardRiskBlocked}
+          aiReviewApproved={aiReviewApproved}
+          milestoneProblems={[
+            [
+              entryBoundaryBreachMessage,
+              !planNameValid ? "填写有效的计划名称。" : null,
+              !tradeAmountInputValid ? "资金上限必须大于 0。" : null,
+              directFundingCapExceeded ? `资金上限超过当前纪律可用 ${quoteCurrencyAmount(directFundingMaximum ?? "0")} USDT。` : null,
+            ].filter((problem): problem is string => Boolean(problem)),
+            [],
+            [planRewardRiskBlocked ? `计划加权收益 / 风险必须达到 ${quoteAmount(applicableMinimumRewardRisk)}R。` : null].filter((problem): problem is string => Boolean(problem)),
+            [!decisionContextValid ? "选择交易目的、形态并填写交易理由。" : null].filter((problem): problem is string => Boolean(problem)),
+            [!aiReviewApproved ? "完成并获得当前计划的 AI 审核批准。" : null].filter((problem): problem is string => Boolean(problem)),
+          ]}
           onValidationChange={handleOrderScheduleValidation}
+          onSubmissionProblemsChange={setDirectScheduleProblems}
           onMaximumProjectedLossChange={handleMaximumProjectedLoss}
-          onMarketReadinessChange={handleChartMarketReadiness}
+          onEffectiveNotionalChange={handleEffectiveNotional}
+          onRequestedNotionalChange={handleRequestedNotional}
         />
       </Box>
     );
   }
+
+  const strategySubmitDisabled = !canSubmit || !aiReviewApproved;
+  const strategySubmissionProblems = Array.from(new Set([
+    !activeDraft ? "等待当前草稿保存完成。" : null,
+    !aiReviewApproved ? "完成当前草稿的 AI 审核并获得批准。" : null,
+    !planNameValid ? "填写有效的计划名称。" : null,
+    !planValidityValid ? "填写 15–10080 分钟的有效期。" : null,
+    !decisionContextValid ? "选择交易目的、形态并填写交易理由。" : null,
+    planRewardRiskBlocked
+      ? `计划加权收益 / 风险须达到 ${quoteAmount(applicableMinimumRewardRisk)}R。`
+      : null,
+    strategyTargetedDisciplineBlocked ? "当前交易纪律阻止新增风险。" : null,
+    !canSubmit ? "等待当前策略配置与行情核对完成。" : null,
+  ].filter((problem): problem is string => Boolean(problem))));
+  const strategySubmissionTooltip = strategySubmissionProblems.length > 0
+    ? (
+      <Box component="ul" sx={{ m: 0, pl: 2, py: .25, maxWidth: 360 }}>
+        {strategySubmissionProblems.map((problem) => <li key={problem}>{problem}</li>)}
+      </Box>
+    )
+    : "复核当前草稿并立即启动。";
 
   return (
     <Box
@@ -2170,7 +3004,6 @@ export default function NewPlanPage() {
           additionalPriceAnnotations={strategyChartAnnotations}
           onRangeChange={ignoreStrategyChartRangeChange}
           onSingleLimitPriceChange={ignoreStrategyChartPriceChange}
-          onMarketReadinessChange={handleChartMarketReadiness}
         />
       </Box>
       <Box
@@ -2191,29 +3024,24 @@ export default function NewPlanPage() {
           ? "沿用计划参数 · 新草稿"
           : editing
             ? `可编辑草稿${draft.data ? ` · v${draft.data.draft_version}` : ""}`
-            : "新建交易计划 · 第 2 步 / 2"}
+            : "新建交易计划"}
         title={editing
           ? "编辑策略计划"
           : copying
             ? "沿用参数新建计划"
             : "配置策略计划"}
         description={copying
-          ? "原计划的方向、交易金额和策略参数已带入；新计划的有效期从保存时重新计算。你仍可修改，并需要再次确认和启动。"
-          : "配置方向与本次交易金额；高级参数已有默认值。保存后回到计划列表确认并启动。"}
+          ? "原计划的方向、交易金额和策略参数已带入；修改后需要重新审核并提交并启动。"
+          : "配置方向、交易金额和策略参数。"}
       />
       {liveReadOnly && (
         <Alert severity="info" variant="outlined" sx={{ mb: 2 }}>
-          当前实盘入口为只读公开行情模式；不能创建、修改、确认或启动计划。
+          当前实盘入口为只读公开行情模式；不能创建、修改或提交并启动计划。
         </Alert>
       )}
+      {accountDisciplineNotice}
       {loading && <LinearProgress aria-label={editing ? "正在读取草稿" : "正在读取策略"} />}
       {loadFailed && <Alert severity="error">{editing ? "草稿或执行依据当前不可用，不能编辑。" : "执行依据当前不可用。"}</Alert>}
-      {mutation.isError && (
-        <Alert severity="error" sx={{ mb: 2 }} action={mutationRecoveryAction}>
-          {mutationMessage}
-        </Alert>
-      )}
-
       <Box component="section" aria-labelledby="plan-identity-title" sx={{ ...surfaceFrameSx, mb: 3, p: 2 }}>
         <Typography id="plan-identity-title" variant="h2" sx={{ mb: 2 }}>计划信息</Typography>
         <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "repeat(2,minmax(0,1fr))" }, gap: 2 }}>
@@ -2312,7 +3140,7 @@ export default function NewPlanPage() {
             ["买一 / 卖一", `${strategyPrice(currentMarket.bid_price)} / ${strategyPrice(currentMarket.ask_price)}`],
             ["买卖价差", `${strategyPrice(currentSpread)} USDT`],
             ["当前资金费率", usableFunding
-              ? `${fundingRatePercent(usableFunding.funding_rate)} · ${fundingDirectionText(usableFunding.funding_rate, parameters.direction)}`
+              ? `${formatFundingRatePercent(usableFunding.funding_rate)}${formatFundingSettlementInterval(usableFundingHistory?.average_interval_seconds ?? null) ? ` / ${formatFundingSettlementInterval(usableFundingHistory?.average_interval_seconds ?? null)}` : ""}`
               : "实时数据不可用"],
             ["下次资金结算", usableFunding
               ? formatUserVisibleTime(usableFunding.next_funding_at)
@@ -2327,7 +3155,7 @@ export default function NewPlanPage() {
             ["1m 收盘距上沿 / 下沿", `${gapPercent(closedBarBreakoutGapPercent("LONG", currentMarket.latest_close_1m, currentMarket.channel_upper))} / ${gapPercent(closedBarBreakoutGapPercent("SHORT", currentMarket.latest_close_1m, currentMarket.channel_lower))}`],
             ["盘口中间价距上沿 / 下沿", `${gapPercent(currentMarket.long_breakout_gap_pct)} / ${gapPercent(currentMarket.short_breakout_gap_pct)}`],
             ["ATR(14)", `${strategyPrice(currentMarket.atr_14)} USDT`],
-          ].map(([label = "", value = ""]) => ({ label, value }))} />
+          ].map(([label = "", value = ""]) => ({ label: label as string, value }))} />
           <Alert severity="info" variant="outlined" sx={{ mt: 2 }}>
             当前选择 <MarketToneText tone={marketToneForDirection(parameters.direction)}>{parameters.direction === "LONG" ? "做多" : "做空"}</MarketToneText>：1m 收盘距离{parameters.direction === "LONG" ? "通道上沿" : "通道下沿"} {gapPercent(selectedClosedBarBreakoutGap)}（策略触发口径）；
             盘口中间价距离 {gapPercent(selectedBreakoutGap ?? "")}。正值表示尚未突破，负值表示已经越过；入场仍需连续 {parameters.confirmation_bars_1m} 根 1m 收盘确认，并通过标记价格与买卖一形成的执行前保守价格检查。行情截止 {formatUserVisibleTime(currentMarket.source_cutoff)}。
@@ -2346,6 +3174,17 @@ export default function NewPlanPage() {
       </Box>
 
       {orderSettings}
+
+      <Alert
+        severity={planRewardRiskBlocked ? "error" : "info"}
+        variant="outlined"
+        sx={{ mt: 2 }}
+        data-testid="strategy-reward-risk-discipline"
+      >
+        策略计划加权收益 / 风险 {strategyRewardRiskRatio === null ? "不可计算" : `${quoteAmount(strategyRewardRiskRatio)}R`}
+        {` / 当前纪律最低 ${quoteAmount(applicableMinimumRewardRisk)}R`}。
+        {planRewardRiskBlocked ? " 当前参数不能提交 AI 审核或启动。" : " 提交并启动时服务端会按同一阈值复核。"}
+      </Alert>
 
       {status.environment_kind === "DEMO" && <Box sx={{ ...surfaceFrameSx, mt: 3, p: 2, borderColor: parameters.demo_immediate_entry ? "warning.main" : "divider" }}>
         <FormControlLabel
@@ -2377,10 +3216,69 @@ export default function NewPlanPage() {
           <TextField label="止盈二 R 倍数" type="number" value={parameters.take_profit_2_r} onChange={(event) => update("take_profit_2_r", event.target.value)} error={!takeProfit2Valid || !takeProfitOrderValid} helperText="范围 2–6R，且必须大于止盈一" slotProps={{ htmlInput: { min: 2, max: 6, step: "any" } }} required />
         </Box>
       </Box>
+      <Box sx={{ ...surfaceFrameSx, mt: 3 }}>
+        <PlanAiReviewPanel
+          review={aiReview}
+          reviewMatchesDraft={aiReviewMatchesCurrentInput}
+          staleReason={aiReviewStaleReason}
+          requesting={aiReviewRequest.isPending}
+          requestError={aiReviewRequestErrorMessage(
+            aiReviewRequest.error,
+            aiReviewRequest.isError,
+          )}
+          requestBlockedReasons={canSubmit
+            ? []
+            : ["请先完成计划信息、策略参数、交易理由与当前行情核对。"]}
+          configuration={aiReviewConfiguration}
+          onConfigurationChange={setAiReviewConfiguration}
+          onRequest={() => aiReviewRequest.mutate()}
+          onReviewUpdate={handleAiReviewUpdate}
+        />
+      </Box>
       <Stack direction={{ xs: "column", sm: "row" }} spacing={1.5} sx={{ mt: 3 }}>
-        <Button type="submit" variant="contained" disabled={!canSubmit}>{mutation.isPending ? "正在保存…" : marketContextRefreshing ? "正在按当前行情更新预览…" : editing ? "保存计划修改" : "保存计划"}</Button>
+        <Button
+          type="button"
+          variant="outlined"
+          disabled={!canPersistDraft || draftSave.isPending}
+          onClick={saveCurrentDraft}
+        >
+          {draftSave.isPending ? "正在保存草稿" : "保存草稿"}
+        </Button>
+        <Tooltip title={strategySubmissionTooltip} arrow disableHoverListener={!strategySubmitDisabled}>
+          <Box sx={{ flex: 1 }}>
+            <Button type="submit" variant="contained" fullWidth disabled={strategySubmitDisabled}>
+              <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: .5 }}>
+                {submitAndStartButtonLabel}
+                {strategySubmitDisabled ? <ErrorOutlined color="error" fontSize="small" aria-label="提交并启动条件未满足" /> : null}
+              </Box>
+            </Button>
+          </Box>
+        </Tooltip>
         <Button variant="outlined" onClick={() => navigate("/plans")}>取消</Button>
       </Stack>
+      <Typography
+        variant="caption"
+        color={draftSaveState.status === "FAILED" ? "error.main" : "text.secondary"}
+        aria-live="polite"
+        sx={{ display: "block", mt: 1 }}
+      >
+        {draftSaveState.status === "SAVING"
+          ? "正在保存草稿"
+          : draftSaveState.status === "SAVED"
+            ? `草稿已保存 ${formatUserVisibleTime(new Date(draftSaveState.at).toISOString())}`
+            : draftSaveState.status === "FAILED"
+              ? draftSaveState.message
+              : "草稿未保存"}
+      </Typography>
+      {submitAndStart.isError ? (
+        <Alert
+          severity="error"
+          variant="outlined"
+          sx={{ mt: 1 }}
+        >
+          {submitAndStartGenericErrorMessage}
+        </Alert>
+      ) : null}
       </Box>
     </Box>
   );

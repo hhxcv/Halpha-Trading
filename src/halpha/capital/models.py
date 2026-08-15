@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from enum import StrEnum
 import re
+from decimal import Decimal
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -24,6 +25,7 @@ DAILY_LOSS_STOP_FRACTION = "0.015"
 WEEKLY_LOSS_STOP_FRACTION = "0.04"
 ROLLING_DRAWDOWN_STOP_FRACTION = "0.1"
 ROLLING_DRAWDOWN_LOOKBACK_DAYS = 30
+MINIMUM_REWARD_RISK_RATIO = "1"
 
 
 class EnvironmentKind(StrEnum):
@@ -71,6 +73,7 @@ class NewRiskDisciplinePolicy(CapModel):
     daily_loss_stop_fraction: str = DAILY_LOSS_STOP_FRACTION
     weekly_loss_stop_fraction: str = WEEKLY_LOSS_STOP_FRACTION
     rolling_drawdown_stop_fraction: str = ROLLING_DRAWDOWN_STOP_FRACTION
+    minimum_reward_risk_ratio: str = MINIMUM_REWARD_RISK_RATIO
     rolling_drawdown_lookback_days: int = Field(
         default=ROLLING_DRAWDOWN_LOOKBACK_DAYS, ge=1, le=365
     )
@@ -124,6 +127,20 @@ class NewRiskDisciplinePolicy(CapModel):
             > 20
         ):
             raise ValueError("NEW_RISK_DISCIPLINE_EXPOSURE_FRACTION_INVALID")
+        return normalized
+
+    @field_validator("minimum_reward_risk_ratio")
+    @classmethod
+    def reward_risk_ratio_is_bounded(cls, value: str) -> str:
+        normalized = canonical_decimal(
+            decimal_from_string(
+                value,
+                code="NEW_RISK_DISCIPLINE_REWARD_RISK_RATIO_INVALID",
+                positive=True,
+            )
+        )
+        if Decimal(normalized) > Decimal(20):
+            raise ValueError("NEW_RISK_DISCIPLINE_REWARD_RISK_RATIO_INVALID")
         return normalized
 
     @model_validator(mode="after")
@@ -284,6 +301,8 @@ class NewRiskDisciplineStatus(CapModel):
     account_snapshot_cutoff: datetime | None
     risk_equity: str | None
     max_plan_loss: str | None
+    minimum_reward_risk_ratio: str
+    available_notional_capacity: str | None
     open_risk_limit: str | None
     open_risk_committed: str | None
     open_risk_after_proposal: str | None

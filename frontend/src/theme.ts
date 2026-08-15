@@ -68,6 +68,8 @@ export const theme = createTheme({
         html: { backgroundColor: colors.background },
         ":root": {
           "--halpha-accent-text": colors.accentText,
+          "--halpha-selection": colors.accent,
+          "--halpha-selection-text": colors.text,
           "--halpha-semantic-success": semanticColors.success.text,
           "--halpha-semantic-warning": semanticColors.warning.text,
           "--halpha-semantic-error": semanticColors.error.text,

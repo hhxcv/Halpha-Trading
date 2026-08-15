@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import html
 from pathlib import Path
 from time import monotonic
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -44,6 +44,8 @@ from halpha.app.api_models import (
     ExecutionFeeEvidenceResponse,
     OrderSchedulePreviewPayload,
     OverviewResponse,
+    PlanAiReviewResponse,
+    PlanAiReviewRequest,
     PlanDeleteResponse,
     PlanSummaryResponse,
     PlaybookQualificationExportResponse,
@@ -59,11 +61,21 @@ from halpha.app.api_models import (
     SystemStopReleaseResponse,
     TestEmailResponse,
 )
+from halpha.app.plan_ai_review import (
+    CodexCliPlanReviewer,
+    PlanAiReviewCoordinator,
+    PlanAiReviewRecord,
+    PlanAiReviewer,
+    PlanAiReviewStatus,
+    build_plan_ai_review_input,
+    plan_ai_review_approval_valid_until,
+)
 from halpha.app.position_operations import preview_account_position_operation
 from halpha.public_market import (
     BinancePublicMarketContext,
     MarketContext,
     MarketContextProvider,
+    MarketFundingRateHistory,
     MarketContextUnavailable,
     MarketInterval,
     MarketWindow,
@@ -114,8 +126,9 @@ from halpha.app.security import (
 )
 from halpha.capital.repository import CapitalConflict
 from halpha.capital.discipline import evaluate_new_risk_discipline
-from halpha.configuration import HalphaSettings, app_settings
+from halpha.configuration import HalphaSettings, app_settings, runtime_log_directory
 from halpha.database.schema_version import require_current_schema
+from halpha.domain_values import content_digest
 from halpha.live_write_gate import LiveWriteGateStatus, evaluate_live_write_gate
 from halpha.product_build import calculate_product_build_id
 from halpha.planning.repository import PlanningConflict
@@ -664,6 +677,7 @@ def create_app(
     static_dist: Path | None = None,
     monotonic_provider: Callable[[], float] | None = None,
     schema_guard: Callable[[], None] | None = None,
+    plan_ai_reviewer: PlanAiReviewer | None = None,
 ) -> FastAPI:
     """Construct one local App surface without starting external writers."""
 
@@ -819,6 +833,23 @@ def create_app(
         venue_account_type=settings.release.venue_account_type.value,
         live_profit_qualification_provider=current_live_profit_qualification,
     )
+    ai_review_coordinator = PlanAiReviewCoordinator(
+        reviewer=(
+            plan_ai_reviewer
+            or CodexCliPlanReviewer(
+                temporary_root=runtime_log_directory(
+                    repo_root,
+                    settings,
+                    role="app",
+                )
+                / "plan-ai-review",
+            )
+        ),
+        mark_running=planning_api.mark_ai_review_running,
+        update_progress=planning_api.update_ai_review_progress,
+        complete=planning_api.complete_ai_review,
+        fail=planning_api.fail_ai_review,
+    )
     outcomes_api = PostgreSQLOutcomesApi(
         database_name=settings.release.database_name,
         database_role_name=settings.app.database_role_name,
@@ -833,6 +864,7 @@ def create_app(
             startup_schema_guard()
             yield
         finally:
+            await ai_review_coordinator.close()
             await public_market_stream.close()
             if isinstance(public_market_context, BinancePublicMarketContext):
                 await public_market_context.close()
@@ -859,6 +891,7 @@ def create_app(
     app.state.workbench_projection = database
     app.state.live_write_gate_status_provider = current_gate_status
     app.state.public_market_stream = public_market_stream
+    app.state.plan_ai_review_coordinator = ai_review_coordinator
 
     @app.middleware("http")
     async def live_read_only_product_mutation_boundary(
@@ -1000,13 +1033,226 @@ def create_app(
             evaluated_at=datetime.now(UTC),
         )
 
+    async def collect_plan_ai_review_context(
+        draft: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Collect the current, bounded facts before creating review identity.
+
+        The market cutoff returned here is atomically written back to the draft
+        by ``request_ai_review``.  This prevents an old draft field from being
+        presented as a stale user rationale alongside fresh market data.
+        """
+
+        content = dict(draft["content"])
+        instrument_ref = str(content["instrument_ref"])
+        direction = str(content["direction"])
+        market = await public_market_context.fetch(instrument_ref, 20)
+        require_current_market_source(market.source)
+
+        one_minute_end = market.latest_closed_1m_at - timedelta(minutes=1)
+        fifteen_minute_end = market.latest_closed_15m_at - timedelta(minutes=15)
+        four_hour_seconds = 4 * 60 * 60
+        four_hour_boundary = (
+            int(market.latest_closed_15m_at.timestamp())
+            // four_hour_seconds
+            * four_hour_seconds
+        )
+        # Use the open time of the last *closed* four-hour bar, rather than
+        # the in-progress bar that contains the latest 15-minute close.
+        four_hour_end = datetime.fromtimestamp(
+            four_hour_boundary - four_hour_seconds,
+            tz=UTC,
+        )
+        one_minute_window, fifteen_minute_window, four_hour_window = (
+            await asyncio.gather(
+                public_market_context.fetch_window(
+                    instrument_ref,
+                    "1m",
+                    one_minute_end - timedelta(minutes=59),
+                    one_minute_end,
+                ),
+                public_market_context.fetch_window(
+                    instrument_ref,
+                    "15m",
+                    fifteen_minute_end - timedelta(minutes=15 * 63),
+                    fifteen_minute_end,
+                ),
+                public_market_context.fetch_window(
+                    instrument_ref,
+                    "4h",
+                    four_hour_end - timedelta(hours=4 * 63),
+                    four_hour_end,
+                ),
+            )
+        )
+        require_current_market_source(one_minute_window.source)
+        require_current_market_source(fifteen_minute_window.source)
+        require_current_market_source(four_hour_window.source)
+
+        overview_facts = database.overview(
+            entry_instrument_ref=instrument_ref,
+            entry_direction=direction,
+        )
+        discipline = overview_facts.get("new_risk_discipline")
+        if not isinstance(discipline, dict):
+            raise ProjectionUnavailable("NEW_RISK_DISCIPLINE_UNAVAILABLE")
+        return {
+            "market_context": market.model_dump(mode="json"),
+            "market_windows": {
+                "one_minute": one_minute_window.model_dump(mode="json"),
+                "fifteen_minute": fifteen_minute_window.model_dump(mode="json"),
+                "four_hour": four_hour_window.model_dump(mode="json"),
+            },
+            "discipline": discipline,
+            "market_source_cutoff": market.source_cutoff,
+        }
+
+    async def prepare_plan_ai_review(
+        record: PlanAiReviewRecord,
+        review_context: Mapping[str, Any],
+    ) -> PlanAiReviewRecord:
+        """Build one exact review input from an already fresh context."""
+
+        if record.status is not PlanAiReviewStatus.QUEUED:
+            return record
+        draft = domain_call(lambda: planning_api.get_plan(record.plan_id))
+        if (
+            int(draft["draft_version"]) != record.draft_version
+            or str(draft["content_digest"]) != record.draft_content_digest
+        ):
+            return planning_api.fail_ai_review(
+                record.review_id,
+                "PLAN_AI_REVIEW_DRAFT_CHANGED",
+            )
+        try:
+            bound_draft = TradePlanDraft.model_validate(draft)
+            bound_context = bound_draft.content.decision_context
+            review_cutoff = review_context["market_source_cutoff"]
+            if (
+                bound_context is None
+                or not isinstance(review_cutoff, datetime)
+                or bound_context.evidence_cutoff != review_cutoff
+            ):
+                raise ValueError("PLAN_AI_REVIEW_CONTEXT_BINDING_MISMATCH")
+        except (ValidationError, ValueError, KeyError):
+            # A retried request must never combine a fresh market fetch with a
+            # queued review that was already bound to another cutoff.  Leave a
+            # visible system failure instead of passing mismatched evidence to
+            # the model, which could otherwise look like an AI rejection.
+            return planning_api.fail_ai_review(
+                record.review_id,
+                "PLAN_AI_REVIEW_CONTEXT_INVALID",
+            )
+        content = dict(draft["content"])
+        instrument_ref = str(content["instrument_ref"])
+        direction = str(content["direction"])
+        try:
+            market_context = dict(review_context["market_context"])
+            market_windows = dict(review_context["market_windows"])
+            discipline = dict(review_context["discipline"])
+            market_source_cutoff = review_context["market_source_cutoff"]
+            if not isinstance(market_source_cutoff, datetime):
+                raise ValueError("PLAN_AI_REVIEW_CONTEXT_INVALID")
+
+            execution_preview: dict[str, Any] | None = None
+            raw_schedule = content.get("order_schedule_spec")
+            if raw_schedule is not None:
+                spec = OrderScheduleSpec.model_validate(raw_schedule)
+                basis_kind = DecisionBasisKind(
+                    str(dict(content["decision_basis"])["kind"])
+                )
+                validate_current_order_schedule_support(basis_kind, spec)
+                if basis_kind is DecisionBasisKind.DIRECT_EXECUTION:
+                    validate_new_direct_execution_schedule(spec)
+                rules = await public_instrument_rules.fetch(instrument_ref)
+                require_current_instrument_rules_source(rules.source)
+                reference_price = None
+                if (
+                    isinstance(spec.price_distribution, SinglePrice)
+                    and spec.price_distribution.limit_price is None
+                ):
+                    reference_price = str(market_context["reference_price"])
+                execution_preview = compile_order_schedule(
+                    spec,
+                    rules,
+                    venue_ref=str(content.get("venue_ref", "BINANCE_USDM")),
+                    instrument_ref=instrument_ref,
+                    direction=Direction(direction),
+                    max_notional=str(
+                        dict(content["requested_limits"])["max_notional"]
+                    ),
+                    schedule_ref=f"review:{record.review_id}",
+                    reference_price=reference_price,
+                    evaluated_at=datetime.now(UTC),
+                ).model_dump(mode="json")
+            review_input = build_plan_ai_review_input(
+                draft=draft,
+                market_context=market_context,
+                market_windows=market_windows,
+                execution_preview=execution_preview,
+                discipline=discipline,
+            )
+        except (InstrumentRulesUnavailable, MarketContextUnavailable) as exc:
+            return planning_api.fail_ai_review(
+                record.review_id,
+                (
+                    "PLAN_AI_REVIEW_CONTEXT_TEMPORARILY_UNAVAILABLE"
+                    if "TIMEOUT" in str(exc).upper()
+                    else "PLAN_AI_REVIEW_CONTEXT_UNAVAILABLE"
+                ),
+            )
+        except (ProjectionUnavailable, ValidationError, ValueError, KeyError):
+            return planning_api.fail_ai_review(
+                record.review_id,
+                "PLAN_AI_REVIEW_CONTEXT_INVALID",
+            )
+        except Exception:
+            return planning_api.fail_ai_review(
+                record.review_id,
+                "PLAN_AI_REVIEW_CONTEXT_UNAVAILABLE",
+            )
+
+        market_digest = content_digest(
+            {
+                "market_context": market_context,
+                "market_windows": market_windows,
+            }
+        )
+        ai_review_coordinator.start(
+            record=record,
+            review_input=review_input,
+            market_context_digest=market_digest,
+            market_source_cutoff=market_source_cutoff,
+        )
+        return record
+
+    def plan_ai_review_response(record: PlanAiReviewRecord) -> dict[str, Any]:
+        payload = record.model_dump(mode="json")
+        approval_valid_until = plan_ai_review_approval_valid_until(record)
+        payload["approval_valid_until"] = (
+            approval_valid_until.isoformat()
+            if approval_valid_until is not None
+            else None
+        )
+        return payload
+
     @app.get(
         "/api/v1/overview",
         response_model=OverviewResponse,
     )
-    def overview() -> OverviewResponse:
+    def overview(
+        entry_instrument_ref: str | None = None,
+        entry_direction: Literal["LONG", "SHORT"] | None = None,
+    ) -> OverviewResponse:
         try:
-            summary = database.overview()
+            summary = (
+                database.overview(
+                    entry_instrument_ref=entry_instrument_ref,
+                    entry_direction=entry_direction,
+                )
+                if entry_instrument_ref is not None or entry_direction is not None
+                else database.overview()
+            )
         except ProjectionUnavailable:
             raise HTTPException(
                 status_code=503,
@@ -1020,6 +1266,8 @@ def create_app(
                 observed_at=datetime.now(UTC),
                 account_equity=None,
                 attempts=(),
+                entry_instrument_ref=entry_instrument_ref,
+                entry_direction=entry_direction,
             ).model_dump(mode="json")
         account_positions = []
         for position in summary.get("account_positions", []):
@@ -1061,6 +1309,15 @@ def create_app(
             account_snapshot_cutoff=summary.get("account_snapshot_cutoff"),
             account_snapshot_age_seconds=summary.get(
                 "account_snapshot_age_seconds"
+            ),
+            account_observation_failure_at=summary.get(
+                "account_observation_failure_at"
+            ),
+            account_observation_failure_code=summary.get(
+                "account_observation_failure_code"
+            ),
+            account_observation_retry_after_seconds=summary.get(
+                "account_observation_retry_after_seconds"
             ),
             account_ordinary_open_order_count=summary.get(
                 "account_ordinary_open_order_count"
@@ -1151,6 +1408,25 @@ def create_app(
             )
             require_current_market_source(window.source)
             return window
+        except MarketContextUnavailable as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": str(exc)},
+            ) from None
+
+    @app.get(
+        "/api/v1/market-funding-history",
+        response_model=MarketFundingRateHistory,
+    )
+    async def market_funding_history(
+        instrument_ref: str = "BTCUSDT-PERP",
+    ) -> MarketFundingRateHistory:
+        try:
+            history = await public_market_context.fetch_funding_rate_history(
+                instrument_ref,
+            )
+            require_current_market_source(history.source)
+            return history
         except MarketContextUnavailable as exc:
             raise HTTPException(
                 status_code=503,
@@ -1308,20 +1584,194 @@ def create_app(
         )
 
     @app.post(
-        "/api/v1/plans/{plan_id}/fix",
-        response_model=TradePlanVersion,
+        "/api/v1/plans/{plan_id}/ai-review",
+        response_model=PlanAiReviewResponse,
+        status_code=202,
     )
-    def fix_plan(
+    async def request_plan_ai_review(
+        plan_id: str,
+        payload: PlanAiReviewRequest,
+        idempotency_key: IdempotencyKey,
+        if_match: str = Header(alias="If-Match"),
+    ) -> dict[str, Any]:
+        requested_version = expected_version(if_match)
+        current_draft = domain_call(lambda: planning_api.get_plan(plan_id))
+        if int(current_draft["draft_version"]) != requested_version:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "PLAN_VERSION_CONFLICT"},
+            )
+        try:
+            review_context = await collect_plan_ai_review_context(current_draft)
+        except MarketContextUnavailable as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": (
+                        "PLAN_AI_REVIEW_CONTEXT_TEMPORARILY_UNAVAILABLE"
+                        if "TIMEOUT" in str(exc).upper()
+                        else "PLAN_AI_REVIEW_CONTEXT_UNAVAILABLE"
+                    )
+                },
+            ) from None
+        except ProjectionUnavailable:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "PLAN_AI_REVIEW_CONTEXT_UNAVAILABLE"},
+            ) from None
+        except (ValidationError, ValueError):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "PLAN_AI_REVIEW_CONTEXT_INVALID"},
+            ) from None
+        except Exception:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "PLAN_AI_REVIEW_CONTEXT_UNAVAILABLE"},
+            ) from None
+        raw_record = domain_call(
+            lambda: planning_api.request_ai_review(
+                plan_id,
+                idempotency_key=idempotency_key,
+                expected_version=requested_version,
+                configuration=payload.configuration,
+                review_evidence_cutoff=review_context["market_source_cutoff"],
+                observed_at=datetime.now(UTC),
+            )
+        )
+        record = PlanAiReviewRecord.model_validate(raw_record)
+        prepared = await prepare_plan_ai_review(record, review_context)
+        return plan_ai_review_response(prepared)
+
+    @app.get(
+        "/api/v1/plans/{plan_id}/ai-review/latest",
+        response_model=PlanAiReviewResponse | None,
+    )
+    def latest_plan_ai_review(plan_id: str) -> dict[str, Any] | None:
+        raw = domain_call(lambda: planning_api.latest_ai_review(plan_id))
+        if raw is None:
+            return None
+        return plan_ai_review_response(PlanAiReviewRecord.model_validate(raw))
+
+    @app.get(
+        "/api/v1/plan-ai-reviews/{review_id}",
+        response_model=PlanAiReviewResponse,
+    )
+    def plan_ai_review(review_id: str) -> dict[str, Any]:
+        raw = domain_call(lambda: planning_api.get_ai_review(review_id))
+        return plan_ai_review_response(PlanAiReviewRecord.model_validate(raw))
+
+    @app.websocket("/api/v1/plan-ai-reviews/{review_id}/stream")
+    async def plan_ai_review_stream(
+        websocket: WebSocket,
+        review_id: str,
+    ) -> None:
+        origin = websocket.headers.get("origin")
+        if websocket.headers.get("authorization") is not None:
+            await websocket.close(
+                code=1008,
+                reason="AUTHORIZATION_HEADER_FORBIDDEN",
+            )
+            return
+        if origin is None or not allowed_local_origin(origin, role_settings.app.port):
+            await websocket.close(code=1008, reason="LOCAL_ORIGIN_REQUIRED")
+            return
+        await websocket.accept()
+        last_updated_at: datetime | None = None
+        try:
+            while True:
+                record = await asyncio.to_thread(
+                    lambda: PlanAiReviewRecord.model_validate(
+                        planning_api.get_ai_review(review_id)
+                    )
+                )
+                if last_updated_at != record.updated_at:
+                    await websocket.send_json(plan_ai_review_response(record))
+                    last_updated_at = record.updated_at
+                if record.status in {
+                    PlanAiReviewStatus.APPROVED,
+                    PlanAiReviewStatus.REJECTED,
+                    PlanAiReviewStatus.FAILED,
+                }:
+                    return
+                await asyncio.sleep(0.4)
+        except WebSocketDisconnect:
+            return
+        except Exception:
+            try:
+                await websocket.close(
+                    code=1011,
+                    reason="PLAN_AI_REVIEW_STREAM_UNAVAILABLE",
+                )
+            except RuntimeError:
+                pass
+
+    @app.post(
+        "/api/v1/plans/{plan_id}/submit-and-start",
+        response_model=ActivationCreateResponse,
+        status_code=201,
+    )
+    async def submit_and_start_plan(
         plan_id: str,
         idempotency_key: IdempotencyKey,
         if_match: str = Header(alias="If-Match"),
     ) -> dict[str, Any]:
+        """Start one draft atomically; failures retain the editable draft."""
+
+        replay = domain_call(
+            lambda: planning_api.submit_and_start_replay(
+                plan_id,
+                idempotency_key=idempotency_key,
+            )
+        )
+        if replay is not None:
+            return replay
+        if (
+            settings.release.profile == "BINANCE_DEMO"
+            and current_executor_status()["status"] != "READY"
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "EXECUTOR_NOT_READY"},
+            )
+        observed_at = datetime.now(UTC)
+        preview = domain_call(
+            lambda: planning_api.submit_and_start_preview(
+                plan_id,
+                idempotency_key=idempotency_key,
+                expected_version=expected_version(if_match),
+                observed_at=observed_at,
+            )
+        )
+        if preview.get("runtime_compatible") is not True:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": preview.get("runtime_incompatibility_reason")
+                    or "PLAN_RUNTIME_INCOMPATIBLE"
+                },
+            )
+        if preview.get("product_build_consistent") is not True:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "PLAN_PRODUCT_BUILD_INCOMPATIBLE"},
+            )
+        schedule = await compile_activation_schedule(
+            preview,
+            refresh_rules=True,
+        )
+        if schedule is not None and not schedule.valid:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "ORDER_SCHEDULE_INVALID"},
+            )
         return domain_call(
-            lambda: planning_api.fix_plan(
+            lambda: planning_api.submit_and_start(
                 plan_id,
                 idempotency_key=idempotency_key,
                 expected_version=expected_version(if_match),
                 observed_at=datetime.now(UTC),
+                order_schedule_snapshot=schedule,
             )
         )
 
@@ -1949,6 +2399,7 @@ def create_app(
         accepted = (
             segments in (["overview"], ["plans"], ["plans", "new"], ["reviews"], ["settings"])
             or (len(segments) == 3 and segments[0] == "plans" and segments[2] == "activate")
+            or (len(segments) == 3 and segments[0] == "plans" and segments[2] == "edit")
             or (len(segments) == 2 and segments[0] in {"activations", "reviews"})
         )
         if not accepted or requested_path.startswith("api/"):

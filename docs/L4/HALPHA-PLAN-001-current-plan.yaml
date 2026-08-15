@@ -1,7 +1,7 @@
 document_id: HALPHA-PLAN-001
 level: L4
 language: zh-CN
-as_of: 2026-08-12
+as_of: 2026-08-14
 
 current_summary: >-
   Halpha 当前产品契约提供 Demo、带单员公域合约实盘和个人合约实盘三个固定且隔离的交易上下文，
@@ -11,7 +11,7 @@ current_summary: >-
 
 current_product_boundary:
   outcome: >-
-    支持计划配置与固定、一次激活、持续监控、动作执行、保护、退出、核对、复盘和用户接管的产品闭环。
+    支持计划草稿配置、一次提交并启动、持续监控、动作执行、保护、退出、核对、复盘和用户接管的产品闭环。
   includes:
     - DEMO 产品闭环
     - LIVE_READ_ONLY 公开观察与隔离的私有账户观察形状
@@ -44,7 +44,7 @@ current_decisions:
 current_facts:
   source:
     repository: 当前 Git 工作区
-    checked_at: 2026-08-12
+    checked_at: 2026-08-14
   evidence_limit: >-
     仓库验证只能证明当前代码和非秘密配置形状；本文件不把仓库外状态表述为 Git 当前事实，
     也不从历史提交推断这些状态。
@@ -59,9 +59,9 @@ current_facts:
       - LIVE_WRITE
     plan_lifecycle:
       - DRAFT
-      - FIXED
-      - ACTIVATED
-    programmatic_plan_api: 与工作台共用完整 schema、领域路由和创建至激活链路
+      - RUNNING
+      - ENDED
+    programmatic_plan_api: 与工作台共用完整 schema、领域路由和草稿至提交并启动链路
   external_facts:
     repository_status: NOT_RECORDED
     source_of_truth: 各权威外部边界
@@ -86,11 +86,12 @@ current_strategy:
   boundary: 策略定义产品能力，不记录仓库外实例事实
 
 current_iteration:
-  focus: 完成账户级组合风险纪律，并补足浮亏同向加仓拒绝与冻结分批计划例外的执行前复核
+  focus: 消除 AI 审核把草稿旧证据截止点与当前行情混用而产生的非技术性拒绝，并明确区分 AI 结论、系统失败和审核依据过期
   result: >-
-    组合风险纪律的设计、配置、预览、激活、总览和类型化前端已切换为同一语义；浮亏同向加仓在激活与最终提交前均受共享判定器限制，
-    例外只能由冻结多档快照精确证明；
-    未形成真实账户交易所变更请求。
+    每次 AI 审核先由服务端采集当前公开行情和纪律，再在同一事务中把本次市场截止点写入草稿并创建精确审核身份；
+    审核输入含连续 1 分钟、15 分钟和 4 小时行情窗口，提示词不得把系统重绑后的截止点当作用户的过期理由。
+    当前实现把批准市场依据有效期固定为 5 分钟；到期后的历史批准仍可读，但提交并启动以 PLAN_AI_REVIEW_EXPIRED 拒绝，界面明确显示为非 AI 拒绝。
+    已完成后端、前端构建和审核输入单元验证；Demo 端到端审核与提交验证仍在进行，不把仓库外运行结果写成本文件事实。
 
 real_account_trading:
   design_owner: docs/L3/HALPHA-ENG-002-real-trade-core-technology-stack-and-build-boundaries.zh-CN.md

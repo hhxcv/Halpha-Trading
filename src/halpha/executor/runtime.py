@@ -843,6 +843,74 @@ class ProductExecutorRuntime:
         if sink is not None:
             sink(event, fields)
 
+    def _record_account_observation_failure(
+        self,
+        *,
+        reason_code: str,
+        retry_after_seconds: float | None,
+    ) -> None:
+        """Keep one safe operational cause for a stale account snapshot.
+
+        This record is diagnostic only.  It never changes the fail-closed
+        discipline decision, and the projection ignores it once a newer
+        complete account snapshot has been persisted.
+        """
+
+        connection = getattr(self, "_connection", None)
+        settings = getattr(self, "_settings", None)
+        release = getattr(settings, "release", None)
+        environment_id = getattr(release, "environment_id", None)
+        account_ref = getattr(release, "account_id", None)
+        if (
+            connection is None
+            or not isinstance(environment_id, str)
+            or not environment_id
+            or not isinstance(account_ref, str)
+            or not account_ref
+        ):
+            return
+        safe_reason = (
+            reason_code
+            if re.fullmatch(r"[A-Z][A-Z0-9_]{2,127}", reason_code)
+            else "ACCOUNT_SNAPSHOT_REFRESH_FAILED"
+        )
+        retry_after = (
+            retry_after_seconds
+            if isinstance(retry_after_seconds, (int, float))
+            and retry_after_seconds >= 0
+            else None
+        )
+        try:
+            connection.execute(
+                """
+                INSERT INTO halpha.account_observation_failure (
+                    environment_id,
+                    account_ref,
+                    failure_at,
+                    reason_code,
+                    retry_after_seconds
+                ) VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (environment_id, account_ref) DO UPDATE
+                SET failure_at = EXCLUDED.failure_at,
+                    reason_code = EXCLUDED.reason_code,
+                    retry_after_seconds = EXCLUDED.retry_after_seconds
+                """,
+                (
+                    environment_id,
+                    account_ref,
+                    datetime.now(UTC),
+                    safe_reason,
+                    retry_after,
+                ),
+            )
+        except Exception as exc:
+            # The account fact result remains authoritative.  Failure to save
+            # this optional UI diagnostic must not weaken or stop the gate.
+            self._record_runtime_event(
+                "account_snapshot_failure_status_persist_failed",
+                reason=type(exc).__name__,
+            )
+
     def _start_runtime_heartbeat(
         self,
         *,
@@ -2712,6 +2780,14 @@ class ProductExecutorRuntime:
             try:
                 fact = await observer.observe()
             except AccountObservationError as exc:
+                next_interval_seconds = max(
+                    interval_seconds,
+                    exc.retry_after_seconds or 0.0,
+                )
+                self._record_account_observation_failure(
+                    reason_code=exc.reason_code,
+                    retry_after_seconds=next_interval_seconds,
+                )
                 if not exc.retryable:
                     self._handle_component_failure(
                         "account_snapshot_refresh_failed",
@@ -2719,16 +2795,16 @@ class ProductExecutorRuntime:
                         exc,
                     )
                     self._require_no_fatal_component_failure()
-                next_interval_seconds = max(
-                    interval_seconds,
-                    exc.retry_after_seconds or 0.0,
-                )
                 self._record_runtime_event(
                     "account_snapshot_refresh_failed",
                     reason_code=exc.reason_code,
                     retry_after_seconds=next_interval_seconds,
                 )
             except Exception as exc:
+                self._record_account_observation_failure(
+                    reason_code="ACCOUNT_SNAPSHOT_REFRESH_FAILED_UNEXPECTED",
+                    retry_after_seconds=None,
+                )
                 self._handle_component_failure(
                     "account_snapshot_refresh_failed",
                     "account-observer",

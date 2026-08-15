@@ -2225,6 +2225,71 @@ def test_account_observer_retries_network_failure_and_recovers_in_place() -> Non
     ]
 
 
+def test_account_observation_failure_persists_a_safe_latest_reason() -> None:
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    class Connection:
+        @staticmethod
+        def execute(query: str, parameters: tuple[object, ...]) -> None:
+            calls.append((query, parameters))
+
+    runtime = object.__new__(ProductExecutorRuntime)
+    runtime._connection = Connection()
+    runtime._settings = SimpleNamespace(
+        release=SimpleNamespace(
+            environment_id="demo-main",
+            account_id="demo-account",
+        )
+    )
+    runtime._runtime_event_sink = None
+
+    runtime._record_account_observation_failure(
+        reason_code="ACCOUNT_SNAPSHOT_QUERY_FAILED_HTTPERROR",
+        retry_after_seconds=30.0,
+    )
+
+    assert len(calls) == 1
+    query, parameters = calls[0]
+    assert "INSERT INTO halpha.account_observation_failure" in query
+    assert "ON CONFLICT (environment_id, account_ref) DO UPDATE" in query
+    assert parameters[:2] == ("demo-main", "demo-account")
+    assert parameters[3:] == (
+        "ACCOUNT_SNAPSHOT_QUERY_FAILED_HTTPERROR",
+        30.0,
+    )
+
+
+def test_account_observation_failure_status_is_non_authoritative() -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+
+    class BrokenConnection:
+        @staticmethod
+        def execute(_query: str, _parameters: tuple[object, ...]) -> None:
+            raise RuntimeError("diagnostic table unavailable")
+
+    runtime = object.__new__(ProductExecutorRuntime)
+    runtime._connection = BrokenConnection()
+    runtime._settings = SimpleNamespace(
+        release=SimpleNamespace(
+            environment_id="demo-main",
+            account_id="demo-account",
+        )
+    )
+    runtime._runtime_event_sink = lambda event, fields: events.append((event, fields))
+
+    runtime._record_account_observation_failure(
+        reason_code="ACCOUNT_SNAPSHOT_QUERY_FAILED_HTTPERROR",
+        retry_after_seconds=None,
+    )
+
+    assert events == [
+        (
+            "account_snapshot_failure_status_persist_failed",
+            {"reason": "RuntimeError"},
+        )
+    ]
+
+
 def test_account_observer_stops_on_nonretryable_persistence_failure() -> None:
     stop = threading.Event()
     events: list[tuple[str, dict[str, object]]] = []

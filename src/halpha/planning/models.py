@@ -171,11 +171,12 @@ class RequestedLimits(PlanningModel):
 class PlanDecisionContext(PlanningModel):
     """Human-readable decision record; never an executable trading condition."""
 
-    rationale: str = Field(min_length=1, max_length=2000)
-    evidence: str = Field(min_length=1, max_length=2000)
-    limitations: str = Field(min_length=1, max_length=2000)
-    # Optional defaults keep immutable historical plans readable.  Current
-    # new-risk API admission requires the complete experiment fields below.
+    # Drafts preserve unfinished user input as-is.  The admission gate below
+    # remains the single definition of when the record is complete enough to
+    # be reviewed, fixed, or activated.
+    rationale: str | None = Field(default=None, max_length=2000)
+    evidence: str | None = Field(default=None, max_length=2000)
+    limitations: str | None = Field(default=None, max_length=2000)
     intent: PlanDecisionIntent | None = None
     setup_family: PlanSetupFamily | None = None
     playbook_ref: str | None = Field(
@@ -222,9 +223,9 @@ class PlanDecisionContext(PlanningModel):
     @property
     def experiment_complete(self) -> bool:
         return (
-            self.intent is not None
+            self.rationale is not None
+            and self.intent is not None
             and self.setup_family is not None
-            and self.invalidation is not None
             and self.evidence_cutoff is not None
         )
 
@@ -238,10 +239,10 @@ def new_risk_decision_context_incompatibility(
 
     if decision_context is None or not decision_context.experiment_complete:
         return "PLAN_DECISION_EXPERIMENT_INCOMPLETE"
-    if decision_basis_kind is DecisionBasisKind.DIRECT_EXECUTION:
-        if decision_context.playbook_ref is None:
-            return "PLAN_DECISION_PLAYBOOK_REF_REQUIRED"
-    elif decision_context.playbook_ref is not None:
+    if (
+        decision_basis_kind is DecisionBasisKind.STRATEGY_SIGNAL
+        and decision_context.playbook_ref is not None
+    ):
         return "PLAN_DECISION_PLAYBOOK_REF_UNEXPECTED"
     return None
 
@@ -431,6 +432,7 @@ class TradePlanVersion(PlanningModel):
     plan_name: str | None = None
     created_at: datetime | None = None
     creator_kind: PlanCreatorKind | None = None
+    ai_review_ref: str | None = None
     decision_context: PlanDecisionContext | None = None
     decision_basis: FixedDecisionBasis
     order_schedule_spec: OrderScheduleSpec | None = None

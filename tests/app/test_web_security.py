@@ -9,11 +9,13 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from starlette.websockets import WebSocketDisconnect
 
-from halpha.app.planning_api import PostgreSQLPlanningApi
+from halpha.app.planning_api import PlanCreatePayload, PostgreSQLPlanningApi
 from halpha.public_market import (
     MarketBar,
     MarketContext,
     MarketContextProvider,
+    MarketFundingRateHistory,
+    MarketFundingRateSample,
     MarketInterval,
     MarketWindow,
 )
@@ -76,10 +78,17 @@ class FakeProjection:
         self.activations = activations or []
         self.projected_executor_status = executor_status
         self.overview_overrides = overview_overrides or {}
+        self.overview_targets: list[tuple[str | None, str | None]] = []
 
-    def overview(self) -> dict[str, Any]:
+    def overview(
+        self,
+        *,
+        entry_instrument_ref: str | None = None,
+        entry_direction: str | None = None,
+    ) -> dict[str, Any]:
         if not self.available:
             raise ProjectionUnavailable("DATABASE_UNAVAILABLE")
+        self.overview_targets.append((entry_instrument_ref, entry_direction))
         return {
             "database_available": True,
             "server_fact_cutoff": "2026-07-17T00:00:00Z",
@@ -175,6 +184,26 @@ class FakeMarketContext:
                     volume="12.5",
                 ),
             ),
+        )
+
+    async def fetch_funding_rate_history(
+        self,
+        instrument_ref: str,
+    ) -> MarketFundingRateHistory:
+        assert instrument_ref == "BTCUSDT-PERP"
+        return MarketFundingRateHistory(
+            instrument_ref=instrument_ref,
+            source="BINANCE_DEMO_PUBLIC",
+            source_cutoff=datetime(2026, 7, 20, 16, tzinfo=UTC),
+            samples=tuple(
+                MarketFundingRateSample(
+                    settled_at=datetime(2026, 7, 18 + index // 3, (index % 3) * 8, tzinfo=UTC),
+                    funding_rate="0.0001",
+                )
+                for index in range(6)
+            ),
+            average_funding_rate="0.0001",
+            average_interval_seconds=28_800,
         )
 
 
@@ -320,29 +349,13 @@ def _programmatic_direct_plan_payload(
     }
 
 
-def test_programmatic_direct_plan_requires_a_stable_playbook_ref(
-    tmp_path: Path,
-) -> None:
-    client = make_client(tmp_path)
-    token = csrf(client)
+def test_direct_plan_accepts_the_simplified_record_without_a_playbook_ref() -> None:
     payload = _programmatic_direct_plan_payload()
     payload["decision_context"].pop("playbook_ref")
 
-    response = client.post(
-        "/api/v1/plans",
-        headers={
-            "Origin": ORIGIN,
-            "X-CSRFToken": token,
-            "Idempotency-Key": "direct-plan-missing-playbook",
-        },
-        json=payload,
-    )
+    validated = PlanCreatePayload.model_validate(payload)
 
-    assert response.status_code == 422
-    assert any(
-        "PLAN_DECISION_PLAYBOOK_REF_REQUIRED" in detail["msg"]
-        for detail in response.json()["detail"]
-    )
+    assert validated.decision_context.playbook_ref is None
 
 
 def test_read_surface_is_available_without_login(tmp_path: Path) -> None:
@@ -370,6 +383,22 @@ def test_overview_exposes_new_risk_discipline_without_return_target_tracking(
     assert payload["new_risk_discipline"]["blocker_codes"] == [
         "ACCOUNT_EQUITY_SNAPSHOT_UNAVAILABLE"
     ]
+
+
+def test_overview_can_scope_discipline_capacity_to_the_direct_entry_target(
+    tmp_path: Path,
+) -> None:
+    projection = FakeProjection()
+    overview = make_client(tmp_path, projection=projection).get(
+        "/api/v1/overview",
+        params={
+            "entry_instrument_ref": "BTCUSDT-PERP",
+            "entry_direction": "LONG",
+        },
+    )
+
+    assert overview.status_code == 200
+    assert projection.overview_targets == [("BTCUSDT-PERP", "LONG")]
 
 
 def test_overview_returns_typed_account_positions_and_orders(
@@ -535,7 +564,7 @@ def test_apps_use_port_scoped_csrf_and_report_atomic_context_targets(
         ("POST", "/api/v1/plans"),
         ("PUT", "/api/v1/plans/plan-ro"),
         ("DELETE", "/api/v1/plans/plan-ro"),
-        ("POST", "/api/v1/plans/plan-ro/fix"),
+        ("POST", "/api/v1/plans/plan-ro/submit-and-start"),
         ("POST", "/api/v1/activations"),
         ("POST", "/api/v1/activations/activation-ro/exit"),
         ("PUT", "/api/v1/reviews/review-ro"),
@@ -793,6 +822,9 @@ def test_strategy_and_status_reads_need_no_session(tmp_path: Path) -> None:
             "end_at": "2026-07-20T00:01:00Z",
         },
     )
+    funding_history = client.get(
+        "/api/v1/market-funding-history?instrument_ref=BTCUSDT-PERP"
+    )
     naive_market_window = client.get(
         "/api/v1/market-window",
         params={
@@ -839,6 +871,9 @@ def test_strategy_and_status_reads_need_no_session(tmp_path: Path) -> None:
     assert market.json()["stop_reference_interval"] == "1h"
     assert market_window.status_code == 200
     assert market_window.json()["bars"][0]["close"] == "101"
+    assert funding_history.status_code == 200
+    assert funding_history.json()["average_funding_rate"] == "0.0001"
+    assert len(funding_history.json()["samples"]) == 6
     assert naive_market_window.status_code == 422
     assert naive_market_window.json()["detail"]["code"] == "MARKET_WINDOW_TIMEZONE_REQUIRED"
 
@@ -1597,7 +1632,7 @@ def test_openapi_marks_the_shared_programmatic_plan_operations(tmp_path: Path) -
         ("/api/v1/plans", "post"),
         ("/api/v1/plans/{plan_id}", "put"),
         ("/api/v1/plans/{plan_id}", "delete"),
-        ("/api/v1/plans/{plan_id}/fix", "post"),
+        ("/api/v1/plans/{plan_id}/submit-and-start", "post"),
         ("/api/v1/plan-versions/{plan_version_id}/activation-preview", "post"),
         ("/api/v1/activations", "post"),
     )
@@ -2080,6 +2115,111 @@ def test_activation_rejects_before_mutation_when_executor_is_not_ready(
 
     assert response.status_code == 409
     assert response.json()["detail"] == {"code": "EXECUTOR_NOT_READY"}
+
+
+def test_submit_and_start_creates_only_one_final_activation_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        PostgreSQLPlanningApi,
+        "submit_and_start_replay",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def preview(
+        _self: PostgreSQLPlanningApi,
+        plan_id: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        captured["preview_plan_id"] = plan_id
+        captured["preview_expected_version"] = kwargs["expected_version"]
+        return _direct_activation_preview("run-snapshot-001")
+
+    def submit(
+        _self: PostgreSQLPlanningApi,
+        plan_id: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        captured["submit_plan_id"] = plan_id
+        captured["submit_expected_version"] = kwargs["expected_version"]
+        captured["schedule"] = kwargs["order_schedule_snapshot"]
+        return {
+            "activation": _mock_activation("activation-submit-and-start-001"),
+            "venue_write_created": False,
+            "runtime_real_write_gate": "CLOSED",
+        }
+
+    monkeypatch.setattr(PostgreSQLPlanningApi, "submit_and_start_preview", preview)
+    monkeypatch.setattr(PostgreSQLPlanningApi, "submit_and_start", submit)
+    client = make_client(tmp_path, instrument_rules_provider=FakeInstrumentRules())
+    token = csrf(client)
+
+    response = client.post(
+        "/api/v1/plans/draft-submit-and-start-001/submit-and-start",
+        headers={
+            "Origin": ORIGIN,
+            "X-CSRFToken": token,
+            "Idempotency-Key": "submit-and-start-001",
+            "If-Match": "1",
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["activation"]["activation_id"] == (
+        "activation-submit-and-start-001"
+    )
+    assert captured["preview_plan_id"] == "draft-submit-and-start-001"
+    assert captured["submit_plan_id"] == "draft-submit-and-start-001"
+    assert captured["preview_expected_version"] == 1
+    assert captured["submit_expected_version"] == 1
+    assert captured["schedule"].valid is True
+
+
+def test_submit_and_start_rejection_does_not_call_the_final_persistence_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        PostgreSQLPlanningApi,
+        "submit_and_start_replay",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def reject_preview(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise ValueError("NEW_RISK_DAILY_LOSS_STOP_REACHED")
+
+    monkeypatch.setattr(
+        PostgreSQLPlanningApi,
+        "submit_and_start_preview",
+        reject_preview,
+    )
+    monkeypatch.setattr(
+        PostgreSQLPlanningApi,
+        "submit_and_start",
+        lambda *_args, **_kwargs: pytest.fail(
+            "rejected submission must not persist a run snapshot or activation"
+        ),
+    )
+    client = make_client(tmp_path)
+    token = csrf(client)
+
+    response = client.post(
+        "/api/v1/plans/draft-rejected-001/submit-and-start",
+        headers={
+            "Origin": ORIGIN,
+            "X-CSRFToken": token,
+            "Idempotency-Key": "submit-and-start-rejected-001",
+            "If-Match": "1",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "NEW_RISK_DAILY_LOSS_STOP_REACHED"
+    }
 
 
 def test_activation_rejects_a_semantically_incompatible_fixed_plan(

@@ -356,6 +356,47 @@ def test_current_is_read_only_and_does_not_acquire_executor_mutex(
     ]
 
 
+def test_verify_is_read_only_and_checks_the_runtime_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+    _patch_migration_runtime(monkeypatch, events=events)
+    monkeypatch.setattr(
+        migrate,
+        "acquire_executor_maintenance_mutex",
+        lambda **_kwargs: pytest.fail("verify must not acquire the Executor mutex"),
+    )
+    monkeypatch.setattr(
+        migrate,
+        "require_current_schema",
+        lambda _connection: events.append("verify_schema"),
+    )
+
+    assert (
+        migrate.main(
+            [
+                "--config",
+                str(EXAMPLE),
+                "demo",
+                "verify",
+            ]
+        )
+        == 0
+    )
+
+    assert events == [
+        "runtime",
+        ("migration_target", False),
+        "create_engine",
+        "connect",
+        "connection_enter",
+        ("execute", "SET TRANSACTION READ ONLY"),
+        "verify_schema",
+        "connection_exit",
+        "dispose",
+    ]
+
+
 def test_mutating_migration_does_not_connect_when_executor_mutex_conflicts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

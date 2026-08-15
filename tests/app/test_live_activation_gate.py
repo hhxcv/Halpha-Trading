@@ -31,7 +31,10 @@ from halpha.planning.order_policies import (
     TakeProfitLadderSpec,
     TakeProfitLevel,
 )
-from halpha.planning.models import PlanDecisionContext
+from halpha.planning.models import (
+    PlanDecisionContext,
+    new_risk_decision_context_incompatibility,
+)
 from halpha.planning.order_schedule import (
     AmountDistribution,
     EntryProgram,
@@ -313,7 +316,7 @@ def test_new_plan_requires_a_complete_decision_context() -> None:
         PlanCreatePayload.model_validate(values)
 
 
-def test_new_risk_plan_requires_a_falsifiable_experiment_record() -> None:
+def test_new_risk_draft_keeps_an_incomplete_experiment_record_for_later_completion() -> None:
     values = _direct_payload(_direct_schedule()).model_dump(mode="json")
     values["decision_context"] = {
         "rationale": "Generic direction guess.",
@@ -321,11 +324,12 @@ def test_new_risk_plan_requires_a_falsifiable_experiment_record() -> None:
         "limitations": "Future path unknown.",
     }
 
-    with pytest.raises(
-        ValidationError,
-        match="PLAN_DECISION_EXPERIMENT_INCOMPLETE",
-    ):
-        PlanCreatePayload.model_validate(values)
+    payload = PlanCreatePayload.model_validate(values)
+
+    assert new_risk_decision_context_incompatibility(
+        decision_basis_kind=payload.decision_basis.kind,
+        decision_context=payload.decision_context,
+    ) == "PLAN_DECISION_EXPERIMENT_INCOMPLETE"
 
 
 def test_demo_flow_check_cannot_be_labelled_as_profit_seeking() -> None:
@@ -725,6 +729,16 @@ def test_activation_preview_returns_the_fixed_protection_and_exit_terms(
             model_dump=lambda **_kwargs: None,
         ),
     )
+    monkeypatch.setattr(
+        api,
+        "_require_approved_version_ai_review",
+        lambda *_args: {
+            "review_id": "review-approved",
+            "status": "APPROVED",
+            "decision": "APPROVE",
+            "draft_content_digest": "c" * 64,
+        },
+    )
 
     preview = api.activation_preview("plan-version-live-001")
 
@@ -782,6 +796,10 @@ def test_plan_list_marks_old_build_provenance_but_keeps_runtime_compatibility(
                     "valid_from": NOW.isoformat(),
                     "valid_until": "2026-07-18T13:00:00+00:00",
                 },
+                "activation-001",
+                "RUNNING",
+                NOW,
+                NOW,
                 "plan-version-001",
                 NOW,
                 "d" * 64,
@@ -793,6 +811,18 @@ def test_plan_list_marks_old_build_provenance_but_keeps_runtime_compatibility(
                 list(fixed_basis.allowed_action_profiles),
                 None,
                 VALIDATION_DECISION_CONTEXT,
+                "review-001",
+                {
+                    "review_id": "review-001",
+                    "status": "APPROVED",
+                    "decision": "APPROVE",
+                    "reason": "The fixed plan is internally consistent.",
+                    "suggestions": [],
+                    "configuration": {
+                        "model": "gpt-5.6-terra",
+                        "reasoning_effort": "medium",
+                    },
+                },
             )
         ]
     )
@@ -801,6 +831,8 @@ def test_plan_list_marks_old_build_provenance_but_keeps_runtime_compatibility(
     plans = api.list_plans()
 
     assert plans[0]["fixed_product_build_id"] == "b" * 64
+    assert plans[0]["status"] == "RUNNING"
+    assert plans[0]["activation_id"] == "activation-001"
     assert plans[0]["fixed_valid_until"] == NOW.isoformat()
     assert plans[0]["product_build_consistent"] is False
     assert plans[0]["runtime_compatible"] is True
@@ -811,6 +843,18 @@ def test_plan_list_marks_old_build_provenance_but_keeps_runtime_compatibility(
     assert plans[0]["plan_name"] == "AI short breakout"
     assert plans[0]["created_at"] == NOW.isoformat()
     assert plans[0]["creator_kind"] == "AI"
+    assert plans[0]["ai_review_ref"] == "review-001"
+    assert plans[0]["ai_review"] == {
+        "review_id": "review-001",
+        "status": "APPROVED",
+        "decision": "APPROVE",
+        "reason": "The fixed plan is internally consistent.",
+        "suggestions": [],
+        "configuration": {
+            "model": "gpt-5.6-terra",
+            "reasoning_effort": "medium",
+        },
+    }
 
 
 def test_live_activation_uses_the_plan_amount_without_opening_the_gate(

@@ -52,8 +52,23 @@ function syntheticDirectDraft(planId: string, draftVersion: number, planName: st
     draft_version: draftVersion,
     content: {
       plan_name: planName,
+      account_ref: "demo-owner",
+      allowed_actions: ["ENTER", "PROTECT", "REDUCE", "EXIT", "CANCEL"],
+      authority_class: "TRADING",
       created_at: "2026-07-23T10:00:00.000Z",
       creator_kind: "HUMAN",
+      environment_id: "demo",
+      environment_kind: "DEMO",
+      decision_context: {
+        intent: "PROFIT_SEEKING",
+        setup_family: "BREAKOUT_CONTINUATION",
+        rationale: "闭合价格确认突破，保护位有效且计划退出空间覆盖风险后执行。",
+        evidence: "SYSTEM_MANAGED_MARKET_CONTEXT",
+        evidence_cutoff: "2026-07-23T10:00:00.000Z",
+        invalidation: "SYSTEM_MANAGED_TYPED_PLAN_BOUNDARIES",
+        limitations: "SYSTEM_MANAGED_EXECUTION_AND_MARKET_LIMITATIONS",
+        playbook_ref: null,
+      },
       decision_basis: {
         kind: "DIRECT_EXECUTION",
         decision_basis_ref: "DIRECT_EXECUTION@1",
@@ -107,6 +122,7 @@ function syntheticDirectDraft(planId: string, draftVersion: number, planName: st
       venue_ref: "BINANCE_USDM",
       instrument_ref: "BTCUSDT-PERP",
       direction: "LONG",
+      position_alignment: null,
       target_exposure: "500",
       requested_limits: {
         max_margin: "500",
@@ -115,9 +131,58 @@ function syntheticDirectDraft(planId: string, draftVersion: number, planName: st
       },
       valid_from: "2026-07-23T10:00:00.000Z",
       valid_until: "2026-07-23T11:00:00.000Z",
+      terms: {},
     },
     content_digest: String(draftVersion).repeat(64),
     updated_at: "2026-07-23T10:00:00.000Z",
+  };
+}
+
+function syntheticPlanAiReview(
+  status: "QUEUED" | "RUNNING" | "APPROVED" | "REJECTED" | "FAILED",
+  draftVersion: number,
+  contentDigest: string,
+  reviewId = `review-${draftVersion}`,
+  failureCode: string | null = null,
+  planId = "ai-review-e2e",
+) {
+  const now = new Date().toISOString();
+  return {
+    review_id: reviewId,
+    environment_id: "demo",
+    plan_id: planId,
+    draft_version: draftVersion,
+    draft_content_digest: contentDigest,
+    prompt_version: "HALPHA_PLAN_AI_REVIEW_V4",
+    configuration: {
+      model: "gpt-5.6-terra",
+      reasoning_effort: "medium",
+    },
+    status,
+    market_context_digest: "a".repeat(64),
+    market_source_cutoff: now,
+    decision: status === "APPROVED" ? "APPROVE" : status === "REJECTED" ? "REJECT" : null,
+    reason: status === "APPROVED"
+      ? "入场、保护与自动退出边界一致，最大预计亏损处于当前纪律额度内。"
+      : status === "REJECTED"
+        ? "当前交易理由不足以支持修改后的追价边界，费用后收益风险关系不成立。"
+        : null,
+    suggestions: status === "REJECTED"
+      ? ["降低入场价格或重新设置保护位", "确保费用后目标至少覆盖计划风险"]
+      : [],
+    progress_message: status === "QUEUED"
+      ? "等待 Codex 审核资源"
+      : status === "RUNNING"
+        ? "正在核对保护、退出与当前纪律"
+        : "审核已完成",
+    public_output: status === "RUNNING"
+      ? "已读取计划与行情上下文，正在核对最大亏损和费用后收益风险关系…"
+      : "",
+    failure_code: failureCode,
+    created_at: now,
+    started_at: status === "QUEUED" ? null : now,
+    completed_at: ["APPROVED", "REJECTED", "FAILED"].includes(status) ? now : null,
+    updated_at: now,
   };
 }
 
@@ -210,6 +275,27 @@ async function routeReadyDemoExecutor(
       },
     });
   });
+  await page.route("**/api/v1/market-funding-history?**", async (route) => {
+    const sourceCutoff = new Date().toISOString();
+    await route.fulfill({
+      contentType: "application/json",
+      json: {
+        instrument_ref: "BTCUSDT-PERP",
+        source: "BINANCE_DEMO_PUBLIC",
+        source_cutoff: sourceCutoff,
+        samples: [
+          { settled_at: "2026-07-20T00:00:00Z", funding_rate: "0.0001" },
+          { settled_at: "2026-07-20T08:00:00Z", funding_rate: "0.0001" },
+          { settled_at: "2026-07-20T16:00:00Z", funding_rate: "0.0001" },
+        ],
+        average_funding_rate: "0.0001",
+        average_interval_seconds: 28_800,
+      },
+    });
+  });
+  await page.route("**/api/v1/strategies", async (route) => {
+    await route.fulfill({ contentType: "application/json", json: [] });
+  });
   await page.route("**/api/v1/settings/status", async (route) => {
     const now = new Date().toISOString();
     await route.fulfill({
@@ -264,7 +350,10 @@ async function routeReadyDemoExecutor(
   });
 }
 
-async function routeValidOrderSchedulePreview(page: Page) {
+async function routeValidOrderSchedulePreview(
+  page: Page,
+  responseDelayMs: () => number = () => 0,
+) {
   await page.route("**/api/v1/order-schedules/preview", async (route) => {
     const request = route.request();
     if (request.method() !== "POST") {
@@ -346,6 +435,10 @@ async function routeValidOrderSchedulePreview(page: Page) {
     const entryFee = effectiveNotional * entryFeeBps / 10_000;
     const exitFee = totalQuantity * stopPrice * exitFeeBps / 10_000;
     const sourceCutoff = new Date().toISOString();
+    const delay = responseDelayMs();
+    if (delay > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
     await route.fulfill({
       contentType: "application/json",
       json: {
@@ -539,7 +632,7 @@ async function addBrowserScopedCsrfCookie(page: Page) {
 
 async function openDirectMilestone(
   page: Page,
-  milestone: "1 入场" | "2 保护" | "3 退出" | "4 核对",
+  milestone: "1 入场" | "2 保护" | "3 退出" | "4 核对" | "5 AI审核",
 ) {
   const navigation = page.getByRole("navigation", { name: "计划创建步骤" });
   await expect(navigation).toBeVisible({ timeout: 15_000 });
@@ -547,7 +640,7 @@ async function openDirectMilestone(
   const button = navigation.getByRole("button", {
     name: new RegExp(`${milestoneLabel}$`),
   });
-  for (let step = 0; step < 4 && !await button.isEnabled(); step += 1) {
+  for (let step = 0; step < 5 && !await button.isEnabled(); step += 1) {
     const nextButton = page.getByRole("button", { name: "下一步", exact: true });
     await expect(nextButton).toBeEnabled({ timeout: 20_000 });
     await nextButton.click();
@@ -558,9 +651,6 @@ async function openDirectMilestone(
 }
 
 async function completeDirectDecisionRecord(page: Page) {
-  await page.getByRole("textbox", { name: "交易剧本标识" })
-    .fill("E2E_DIRECT_EXECUTION_V1");
-
   const intent = page.getByRole("combobox", { name: "本次目的" });
   await intent.click();
   await page.getByRole("option", { name: "盈利导向交易" }).click();
@@ -569,20 +659,20 @@ async function completeDirectDecisionRecord(page: Page) {
   await setupFamily.click();
   await page.getByRole("option", { name: "突破延续" }).click();
 
-  await page.getByRole("textbox", { name: "可证伪交易假设" })
-    .fill("闭合价格确认突破后，价格应延续至预设方向。");
-  await page.getByRole("textbox", { name: "入场前证据" })
-    .fill("当前闭合 K 线、盘口与价格边界均在计划允许范围内。");
-  await page.getByRole("textbox", { name: "假设失效与放弃条件" })
-    .fill("突破确认失效、价格越过预设边界或保护无法建立时放弃入场。");
-  await page.getByRole("textbox", { name: "已知局限" })
-    .fill("样本不足，滑点、手续费与行情变化仍可能使结果偏离预期。");
+  await page.getByRole("textbox", { name: "交易理由" })
+    .fill("闭合价格确认突破，保护位有效且计划退出空间覆盖风险后执行；若入场边界失效则放弃本次交易。");
 }
 
 async function openDirectReview(page: Page) {
   await openDirectMilestone(page, "4 核对");
   await expect(page.getByRole("heading", { name: "计划概要" })).toBeVisible();
   await completeDirectDecisionRecord(page);
+}
+
+async function openDirectAiReview(page: Page) {
+  await openDirectReview(page);
+  await openDirectMilestone(page, "5 AI审核");
+  await expect(page.getByRole("heading", { name: "AI 交易审核" })).toBeVisible();
 }
 
 function rectsIntersect(left: LayoutRect, right: LayoutRect, tolerance = 0.5) {
@@ -890,12 +980,320 @@ test("direct shortcut reaches a launch-ready workspace once its decision record 
   await expect(page.getByLabel("计划名称")).toHaveValue(/^BTCUSDT 直接执行 .+/);
   await expect(page.getByLabel("计划有效分钟")).toHaveValue("60");
   await expect(page.getByRole("button", {
-    name: "创建并启动 Demo",
+    name: "提交并启动",
     exact: true,
-  })).toBeEnabled({ timeout: 20_000 });
+  })).toBeDisabled({ timeout: 20_000 });
   await expect(page.getByRole("heading", { name: "计划概要" }).locator(".."))
     .toContainText("TP1 2R / 100%");
   expect(attemptedTradingWrites).toEqual([]);
+});
+
+test("direct AI review shows live progress, binds approval, invalidates edits, and blocks rejection", async ({ page }, testInfo) => {
+  test.skip(
+    testInfo.project.name === "chromium-narrow",
+    "The stateful review flow is covered on desktop; narrow layout remains covered by the workspace layout test.",
+  );
+  const firstDigest = "d".repeat(64);
+  const secondDigest = "e".repeat(64);
+  let draftVersion = 1;
+  let reviewDraftVersion = 1;
+  let reviewDigest = firstDigest;
+  let reviewSubmissionCount = 0;
+  let currentReview: ReturnType<typeof syntheticPlanAiReview> | null = null;
+  const consoleErrors: string[] = [];
+  const pageErrors: string[] = [];
+  const evidenceDirectory = process.env.HALPHA_BROWSER_EVIDENCE_DIR;
+  const captureEvidence = async (name: string) => {
+    const body = await page.screenshot({
+      fullPage: true,
+      ...(evidenceDirectory ? { path: `${evidenceDirectory}/${name}` } : {}),
+    });
+    await testInfo.attach(name, { body, contentType: "image/png" });
+  };
+  page.on("console", (message) => {
+    if (message.type() === "error") consoleErrors.push(message.text());
+  });
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+
+  await page.setViewportSize({ width: 1672, height: 918 });
+
+  await routeCurrentDemoMarketStream(page);
+  await routeCurrentDemoMarketWindow(page);
+  await routeCurrentDemoMarketContext(page);
+  await routeReadyDemoExecutor(page);
+  await page.route(/\/api\/v1\/overview(?:\?.*)?$/, async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      json: {
+        new_risk_discipline: {
+          status: "ALLOWED",
+          new_risk_allowed: true,
+          blocker_codes: [],
+          available_notional_capacity: "1000",
+          max_plan_loss: "100",
+          minimum_reward_risk_ratio: "1",
+          open_risk_limit: "200",
+          open_risk_committed: "0",
+        },
+      },
+    });
+  });
+  await page.route(/\/api\/v1\/plans(?:\?.*)?$/, async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.continue();
+      return;
+    }
+    const requestPayload = await route.request().postDataJSON() as { plan_name?: string };
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      json: {
+        ...syntheticDirectDraft(
+          "ai-review-e2e",
+          1,
+          requestPayload.plan_name ?? "AI 审核交互验证",
+        ),
+        content_digest: firstDigest,
+      },
+    });
+  });
+  await page.route(/\/api\/v1\/plans\/ai-review-e2e(?:\?.*)?$/, async (route) => {
+    if (route.request().method() === "GET") {
+      await route.fulfill({
+        contentType: "application/json",
+        json: {
+          ...syntheticDirectDraft("ai-review-e2e", draftVersion, "AI 审核交互验证"),
+          content_digest: draftVersion === 1 ? firstDigest : secondDigest,
+        },
+      });
+      return;
+    }
+    if (route.request().method() !== "PUT") {
+      await route.continue();
+      return;
+    }
+    draftVersion = 2;
+    await route.fulfill({
+      contentType: "application/json",
+      json: {
+        ...syntheticDirectDraft("ai-review-e2e", 2, "AI 审核交互验证"),
+        content_digest: secondDigest,
+      },
+    });
+  });
+  await page.route("**/api/v1/plans/ai-review-e2e/ai-review/latest", async (route) => {
+    await route.fulfill({ contentType: "application/json", json: currentReview });
+  });
+  await page.route("**/api/v1/plans/ai-review-e2e/ai-review", async (route) => {
+    reviewSubmissionCount += 1;
+    const payload = route.request().postDataJSON() as { draft_version?: number };
+    reviewDraftVersion = payload.draft_version ?? draftVersion;
+    reviewDigest = reviewDraftVersion === 1 ? firstDigest : secondDigest;
+    currentReview = reviewSubmissionCount === 1
+      ? syntheticPlanAiReview("QUEUED", reviewDraftVersion, reviewDigest, "review-1")
+      : reviewSubmissionCount === 2
+        ? syntheticPlanAiReview("REJECTED", reviewDraftVersion, reviewDigest, "review-2")
+        : syntheticPlanAiReview(
+          "FAILED",
+          reviewDraftVersion,
+          reviewDigest,
+          "review-3",
+          "PLAN_AI_REVIEW_CONTEXT_TEMPORARILY_UNAVAILABLE",
+        );
+    await route.fulfill({
+      status: 202,
+      contentType: "application/json",
+      json: currentReview,
+    });
+  });
+  await page.routeWebSocket("**/api/v1/plan-ai-reviews/review-1/stream", (socket) => {
+    const running = syntheticPlanAiReview("RUNNING", reviewDraftVersion, reviewDigest, "review-1");
+    setTimeout(() => {
+      currentReview = running;
+      socket.send(JSON.stringify(running));
+    }, 100);
+    setTimeout(() => {
+      const approved = syntheticPlanAiReview("APPROVED", reviewDraftVersion, reviewDigest, "review-1");
+      currentReview = approved;
+      socket.send(JSON.stringify(approved));
+    }, 2_500);
+  });
+
+  await page.goto("/plans/new?mode=direct");
+  await openDirectReview(page);
+  await page.keyboard.press("Escape");
+  await page.getByRole("heading", { name: "交易判断" }).click();
+  await captureEvidence("plan-review-simplified.png");
+  await openDirectMilestone(page, "5 AI审核");
+  await expect(page.getByRole("heading", { name: "AI 交易审核" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "提交 AI 审核", exact: true })).toBeEnabled();
+  await page.getByRole("button", { name: "提交 AI 审核", exact: true }).click();
+
+  await expect(page.getByTestId("plan-ai-review-live-output")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText("正在核对保护、退出与当前纪律", { exact: true })).toBeVisible();
+  await captureEvidence("ai-review-running.png");
+
+  const approved = page.getByTestId("plan-ai-review-approved");
+  await expect(approved).toBeVisible({ timeout: 10_000 });
+  await expect(approved).toContainText("AI 审核结论：批准");
+  await expect(approved).toContainText("AI 审核理由");
+  // The final command is now a single submit action.  A live quote/preview
+  // refresh must not turn this approved draft into a stale review.
+  await expect(page.getByRole("button", { name: "提交并启动", exact: true })).toBeEnabled();
+  await page.waitForTimeout(1_200);
+  await expect(page.getByTestId("plan-ai-review-approved")).toBeVisible();
+  await expect(page.getByRole("button", { name: "提交并启动", exact: true })).toBeEnabled();
+  await captureEvidence("ai-review-approved.png");
+
+  await openDirectMilestone(page, "4 核对");
+  await page.getByRole("textbox", { name: "交易理由" })
+    .fill("修改后的交易理由改变了入场依据，需要重新审核当前草稿。");
+  await openDirectMilestone(page, "5 AI审核");
+  await expect(page.getByTestId("plan-ai-review-stale")).toBeVisible();
+  await expect(page.getByRole("button", { name: "提交并启动", exact: true })).toBeDisabled();
+  await captureEvidence("ai-review-stale.png");
+
+  await page.getByRole("button", { name: "按当前计划重新提交 AI 审核", exact: true }).click();
+  const rejected = page.getByTestId("plan-ai-review-rejected");
+  await expect(rejected).toBeVisible({ timeout: 10_000 });
+  await expect(rejected).toContainText("AI 审核结论：拒绝");
+  await expect(rejected).toContainText("AI 审核理由");
+  await expect(rejected).toContainText("费用后收益风险关系不成立");
+  await expect(rejected).toContainText("降低入场价格或重新设置保护位");
+  await expect(page.getByRole("button", { name: "提交并启动", exact: true })).toBeDisabled();
+  await captureEvidence("ai-review-rejected.png");
+  await page.getByRole("button", { name: "按当前计划重新提交 AI 审核", exact: true }).click();
+  const failed = page.getByTestId("plan-ai-review-failed");
+  await expect(failed).toBeVisible({ timeout: 10_000 });
+  await expect(failed).toContainText("非 AI 审核结论");
+  await expect(failed).toContainText("审核未完成");
+  await expect(failed).toContainText("本次审核未产生 AI 的“批准”或“拒绝”结论");
+  await expect(failed).toContainText("行情数据连接暂时超时");
+  await expect(failed).not.toContainText("AI 审核结论：拒绝");
+  await captureEvidence("ai-review-failed.png");
+  expect(draftVersion).toBe(2);
+  expect(reviewSubmissionCount).toBe(3);
+  expect(consoleErrors).toEqual([]);
+  expect(pageErrors).toEqual([]);
+});
+
+test("direct configuration allocates and autosaves an editable draft", async ({ page }, testInfo) => {
+  test.skip(
+    testInfo.project.name === "chromium-narrow",
+    "The persistence lifecycle is covered on desktop; narrow layout shares the same save control.",
+  );
+  const planId = "autosave-direct-e2e";
+  let draftVersion = 1;
+  let createCount = 0;
+  let updateCount = 0;
+  let savedName = "BTCUSDT 自动保存草稿";
+
+  await routeCurrentDemoMarketStream(page);
+  await routeCurrentDemoMarketWindow(page);
+  await routeCurrentDemoMarketContext(page);
+  await routeReadyDemoExecutor(page);
+  await routeValidOrderSchedulePreview(page);
+  await page.route(/\/api\/v1\/plans(?:\?.*)?$/, async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.continue();
+      return;
+    }
+    createCount += 1;
+    const payload = route.request().postDataJSON() as { plan_name?: string };
+    savedName = payload.plan_name ?? savedName;
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      json: syntheticDirectDraft(planId, draftVersion, savedName),
+    });
+  });
+  await page.route(`**/api/v1/plans/${planId}`, async (route) => {
+    if (route.request().method() === "PUT") {
+      updateCount += 1;
+      draftVersion += 1;
+      const payload = route.request().postDataJSON() as { plan_name?: string };
+      savedName = payload.plan_name ?? savedName;
+    }
+    await route.fulfill({
+      contentType: "application/json",
+      json: syntheticDirectDraft(planId, draftVersion, savedName),
+    });
+  });
+
+  await page.goto("/plans/new?mode=direct");
+  await expect(page.getByRole("button", { name: "保存草稿", exact: true })).toBeEnabled({ timeout: 15_000 });
+  await expect(page).toHaveURL(new RegExp(`/plans/${planId}/edit`), { timeout: 15_000 });
+  await expect.poll(() => createCount).toBe(1);
+  await expect(page.getByText("草稿已保存", { exact: false })).toBeVisible();
+
+  const name = page.getByRole("textbox", { name: "计划名称" });
+  await name.fill("自动保存后的草稿名称");
+  await expect.poll(() => updateCount, { timeout: 10_000 }).toBe(1);
+  await expect(page.getByText("草稿已保存", { exact: false })).toBeVisible();
+  await expect(page.getByRole("button", { name: "保存草稿", exact: true })).toBeEnabled();
+  await testInfo.attach("direct-draft-autosave.png", {
+    body: await page.screenshot({ fullPage: true }),
+    contentType: "image/png",
+  });
+});
+
+test("plan creation entry explains a blocked new-risk discipline without disabling draft preparation", async ({ page }, testInfo) => {
+  await routeReadyDemoExecutor(page);
+  await page.route(/\/api\/v1\/overview(?:\?.*)?$/, async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      json: {
+        new_risk_discipline: {
+          status: "BLOCKED",
+          new_risk_allowed: false,
+          blocker_codes: ["NEW_RISK_DAILY_LOSS_STOP_REACHED"],
+          day_window_started_at: "2026-08-12T16:00:00Z",
+          week_window_started_at: "2026-08-10T16:00:00Z",
+          rolling_drawdown_lookback_days: 30,
+        },
+      },
+    });
+  });
+  await page.route(/\/api\/v1\/plans(?:\?.*)?$/, async (route) => {
+    if (route.request().method() === "GET") {
+      await route.fulfill({ contentType: "application/json", json: [] });
+      return;
+    }
+    await route.continue();
+  });
+  await page.route(/\/api\/v1\/activations(?:\?.*)?$/, async (route) => {
+    if (route.request().method() === "GET") {
+      await route.fulfill({ contentType: "application/json", json: [] });
+      return;
+    }
+    await route.continue();
+  });
+  await page.route("**/api/v1/strategies", async (route) => {
+    await route.fulfill({ contentType: "application/json", json: [] });
+  });
+
+  await page.goto("/plans");
+
+  const notice = page.getByRole("alert").filter({
+    hasText: "新增风险纪律未通过",
+  });
+  await expect(notice).toContainText("当日已实现亏损已触发新增风险停止");
+  await expect(notice).toContainText("2026-08-14 00:00:00 UTC+8");
+  await expect(notice).toContainText("不是恢复承诺");
+  await expect(notice).toContainText("创建入口仍可用于准备或保存草稿");
+  await expect(page.getByRole("button", { name: "直接执行", exact: true })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "选择策略", exact: true })).toBeEnabled();
+  const evidenceDirectory = process.env.HALPHA_BROWSER_EVIDENCE_DIR;
+  const body = await page.screenshot({
+    fullPage: true,
+    ...(evidenceDirectory
+      ? { path: `${evidenceDirectory}/discipline-entry.png` }
+      : {}),
+  });
+  await testInfo.attach("discipline-entry.png", {
+    body,
+    contentType: "image/png",
+  });
 });
 
 test("current plan card keeps its detail entry and visualizes a paused plan consistently", async ({ page }, testInfo) => {
@@ -1121,12 +1519,13 @@ test("current plan card keeps its detail entry and visualizes a paused plan cons
 
 test("protection milestone offers explainable stop references without silently changing the plan", async ({ page }, testInfo) => {
   const attemptedTradingWrites: string[] = [];
+  let previewDelayMs = 0;
   await addBrowserScopedCsrfCookie(page);
   await routeCurrentDemoMarketStream(page);
   await routeCurrentDemoMarketWindow(page);
   await routeCurrentDemoMarketContext(page);
   await routeReadyDemoExecutor(page);
-  await routeValidOrderSchedulePreview(page);
+  await routeValidOrderSchedulePreview(page, () => previewDelayMs);
   page.on("request", (request) => {
     const pathname = new URL(request.url()).pathname;
     if (
@@ -1155,17 +1554,15 @@ test("protection milestone offers explainable stop references without silently c
   await openDirectMilestone(page, "2 保护");
 
   const recommendations = page.getByTestId("initial-stop-recommendations");
-  await expect(recommendations.getByText("推荐止损位置", { exact: true })).toBeVisible();
+  await expect(recommendations.getByText("止损候选", { exact: true })).toBeVisible();
   await expect(page.getByTestId("initial-stop-recommendation-swing_obv"))
     .toContainText("量价摆动位");
   await expect(page.getByTestId("initial-stop-recommendation-structure_atr"))
     .toContainText("近期结构位");
   await expect(page.getByTestId("initial-stop-recommendation-trend_atr"))
     .toContainText("趋势波动带");
-  await expect(recommendations).toContainText("当前未接入可信清算分布");
-
   await page.getByRole("button", { name: "1h止损参考" }).click();
-  await expect(recommendations).toContainText("1h 截止");
+  await expect(recommendations).toContainText("1h K 线 · 截止");
   const swingLogic = page.getByRole("button", { name: "量价摆动位止损逻辑" });
   await swingLogic.hover();
   await expect(page.getByRole("tooltip")).toContainText("1h 摆动结构");
@@ -1181,9 +1578,22 @@ test("protection milestone offers explainable stop references without silently c
   const adoptSwing = page.getByRole("button", {
     name: /采用量价摆动位 64,900\.0 USDT/,
   });
+  previewDelayMs = 600;
   await adoptSwing.click();
+  await page.waitForTimeout(250);
+  await expect(recommendations).toBeVisible();
+  await expect(page.getByTestId("initial-stop-recommendation-swing_obv"))
+    .toBeVisible();
   await expect(stopDistance).not.toHaveValue(before);
   await expect(adoptSwing).toBeDisabled();
+  await expect(adoptSwing).toHaveCSS("background-color", "rgb(255, 212, 59)");
+  const alternativeAdopt = page.getByTestId("initial-stop-recommendation-structure_atr")
+    .locator("button").last();
+  await expect(alternativeAdopt).toBeVisible();
+  expect((await adoptSwing.boundingBox())?.width).toBe(
+    (await alternativeAdopt.boundingBox())?.width,
+  );
+  previewDelayMs = 0;
   await expect(page.getByTestId("initial-stop-projection"))
     .toContainText("全档成交预计均价");
   await expect(page.getByTestId("initial-stop-projection"))
@@ -1246,7 +1656,7 @@ test("direct review blocks launch when the live price has already crossed a fixe
     "当前标记价 65,001.0 USDT 已达到或跌破入场失效价 65,100.0 USDT",
   );
   await expect(page.getByRole("button", {
-    name: "创建并启动 Demo",
+    name: "提交并启动",
     exact: true,
   })).toBeDisabled();
   await expect(page.getByRole("button", {
@@ -1260,9 +1670,9 @@ test("direct review blocks launch when the live price has already crossed a fixe
 
   await expect(boundaryAlert).toHaveCount(0);
   await expect(page.getByRole("button", {
-    name: "创建并启动 Demo",
+    name: "提交并启动",
     exact: true,
-  })).toBeEnabled();
+  })).toBeDisabled();
 });
 
 test("direct review keeps the Demo launch action visible when the executor is unavailable", async ({ page }) => {
@@ -1276,11 +1686,11 @@ test("direct review keeps the Demo launch action visible when the executor is un
   await openDirectReview(page);
 
   await expect(page.getByRole("button", {
-    name: "创建并启动 Demo",
+    name: "提交并启动",
     exact: true,
   })).toBeVisible();
   await expect(page.getByRole("button", {
-    name: "创建并启动 Demo",
+    name: "提交并启动",
     exact: true,
   })).toBeDisabled();
   await expect(page.getByText("Demo 执行暂不可用：应用与执行器版本不一致。", {
@@ -1317,7 +1727,7 @@ test("direct plan creation does not consume or repeat review performance", async
   await expect(page.getByRole("region", { name: "费用后收益门槛" })).toHaveCount(0);
   await expect(page.getByText("图表只编辑计划草稿", { exact: false })).toHaveCount(0);
   await expect(page.getByText("快速启动会连续保存草稿", { exact: false })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "创建并启动 Demo" })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "提交并启动" })).toBeDisabled();
   expect(reviewRequestCount).toBe(0);
 });
 
@@ -2234,13 +2644,27 @@ test("review summary stays compact while trade records retain classification and
   await page.keyboard.press("Escape");
 });
 
-test("one Demo launch click reuses the existing save, fix, preview, and activation contracts", async ({ page }, testInfo) => {
+test("one Demo submit-and-start command creates the run snapshot and activation without an intermediate page", async ({ page }, testInfo) => {
   test.skip(
     testInfo.project.name === "chromium-narrow",
-    "Quick-start orchestration is viewport-independent and is covered once on desktop.",
+    "Submit-and-start orchestration is viewport-independent and is covered once on desktop.",
   );
   const calls: string[] = [];
   const idempotencyKeys: string[] = [];
+  const quickDraft = syntheticDirectDraft(
+    "synthetic-quick-plan",
+    1,
+    "直接提交并启动 E2E",
+  );
+  const quickReview = syntheticPlanAiReview(
+    "APPROVED",
+    quickDraft.draft_version,
+    quickDraft.content_digest,
+    "synthetic-quick-review",
+    null,
+    quickDraft.plan_id,
+  );
+  let quickReviewRequested = false;
   await routeCurrentDemoMarketStream(page);
   await routeReadyDemoExecutor(page);
   await page.route(/\/api\/v1\/plans(?:\?.*)?$/, async (route) => {
@@ -2254,74 +2678,317 @@ test("one Demo launch click reuses the existing save, fix, preview, and activati
     await route.fulfill({
       status: 201,
       contentType: "application/json",
-      body: JSON.stringify({
-        plan_id: "synthetic-quick-plan",
-        draft_version: 1,
-      }),
+      body: JSON.stringify(quickDraft),
     });
   });
-  await page.route("**/api/v1/plans/synthetic-quick-plan/fix", async (route) => {
-    calls.push("FIX_PLAN");
-    idempotencyKeys.push(await route.request().headerValue("idempotency-key") ?? "");
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({
-        plan_version_id: "synthetic-quick-version",
-      }),
-    });
-  });
-  await page.route(
-    "**/api/v1/plan-versions/synthetic-quick-version/activation-preview",
-    async (route) => {
-      calls.push("ACTIVATION_PREVIEW");
+  await page.route("**/api/v1/plans/synthetic-quick-plan", async (route) => {
+    if (route.request().method() === "GET" || route.request().method() === "PUT") {
       await route.fulfill({
-        status: 200,
         contentType: "application/json",
-        body: JSON.stringify({
-          product_build_consistent: true,
-          executor_status: "READY",
-          order_schedule_snapshot: { valid: true },
-          expected_schedule_digest: "a".repeat(64),
-        }),
+        body: JSON.stringify(quickDraft),
       });
-    },
-  );
-  await page.route(/\/api\/v1\/activations(?:\?.*)?$/, async (route) => {
-    const request = route.request();
-    if (request.method() !== "POST") {
-      await route.continue();
       return;
     }
-    calls.push("CREATE_ACTIVATION");
-    idempotencyKeys.push(await request.headerValue("idempotency-key") ?? "");
+    await route.continue();
+  });
+  await page.route("**/api/v1/plans/synthetic-quick-plan/ai-review/latest", async (route) => {
+    await route.fulfill(quickReviewRequested
+      ? { contentType: "application/json", body: JSON.stringify(quickReview) }
+      : { status: 404, contentType: "application/json", body: JSON.stringify({ detail: { code: "PLAN_AI_REVIEW_NOT_FOUND" } }) });
+  });
+  await page.route("**/api/v1/plans/synthetic-quick-plan/ai-review", async (route) => {
+    calls.push("AI_REVIEW");
+    quickReviewRequested = true;
+    await route.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify(quickReview) });
+  });
+  await page.route("**/api/v1/plans/synthetic-quick-plan/submit-and-start", async (route) => {
+    calls.push("SUBMIT_AND_START");
+    idempotencyKeys.push(await route.request().headerValue("idempotency-key") ?? "");
+    await new Promise((resolve) => setTimeout(resolve, 150));
     await route.fulfill({
       status: 201,
       contentType: "application/json",
       body: JSON.stringify({
         activation: { activation_id: "synthetic-quick-activation" },
+        runtime_real_write_gate: "CLOSED",
+        venue_write_created: false,
       }),
     });
   });
 
   await page.goto("/plans/new?mode=direct");
-  await openDirectReview(page);
+  await openDirectAiReview(page);
+  await expect(page.getByRole("button", { name: "提交 AI 审核", exact: true })).toBeEnabled({ timeout: 20_000 });
+  await page.getByRole("button", { name: "提交 AI 审核", exact: true }).click();
+  await expect(page.getByTestId("plan-ai-review-approved")).toBeVisible({ timeout: 20_000 });
   const launch = page.getByRole("button", {
-    name: "创建并启动 Demo",
+    name: "提交并启动",
     exact: true,
   });
   await expect(launch).toBeEnabled({ timeout: 20_000 });
   await launch.click();
+  await expect(page.getByRole("button", { name: "正在复核并启动…", exact: true })).toBeVisible();
 
   await expect(page).toHaveURL(/\/activations\/synthetic-quick-activation$/);
   expect(calls).toEqual([
     "SAVE_DRAFT",
-    "FIX_PLAN",
-    "ACTIVATION_PREVIEW",
-    "CREATE_ACTIVATION",
+    "AI_REVIEW",
+    "SUBMIT_AND_START",
   ]);
-  expect(idempotencyKeys).toHaveLength(3);
+  expect(idempotencyKeys).toHaveLength(2);
   expect(idempotencyKeys.every(Boolean)).toBe(true);
+});
+
+test("direct submit-and-start leaves the same editable draft after a discipline rejection", async ({ page }, testInfo) => {
+  const calls: string[] = [];
+  const consoleErrors: string[] = [];
+  const pageErrors: string[] = [];
+  const rejectedDraft = syntheticDirectDraft(
+    "discipline-quick-plan",
+    1,
+    "纪律拒绝提交并启动 E2E",
+  );
+  const approvedReview = syntheticPlanAiReview(
+    "APPROVED",
+    rejectedDraft.draft_version,
+    rejectedDraft.content_digest,
+    "discipline-quick-review",
+    null,
+    rejectedDraft.plan_id,
+  );
+  let approvedReviewRequested = false;
+  let disciplineRejectedAtActivation = false;
+  page.on("console", (message) => {
+    if (message.type() === "error") {
+      consoleErrors.push(message.text());
+    }
+  });
+  page.on("pageerror", (error) => {
+    pageErrors.push(error.message);
+  });
+  await routeCurrentDemoMarketStream(page);
+  await routeReadyDemoExecutor(page);
+  await page.route(/\/api\/v1\/overview(?:\?.*)?$/, async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        new_risk_discipline: {
+          status: disciplineRejectedAtActivation ? "BLOCKED" : "ALLOWED",
+          new_risk_allowed: !disciplineRejectedAtActivation,
+          blocker_codes: disciplineRejectedAtActivation
+            ? ["NEW_RISK_DAILY_LOSS_STOP_REACHED"]
+            : [],
+          available_notional_capacity: disciplineRejectedAtActivation ? null : "1000",
+          max_plan_loss: "100",
+          open_risk_limit: "200",
+          open_risk_committed: "0",
+          day_window_started_at: "2026-08-12T16:00:00Z",
+          week_window_started_at: "2026-08-10T16:00:00Z",
+          rolling_drawdown_lookback_days: 30,
+        },
+      }),
+    });
+  });
+  await page.route("**/api/v1/decision-evidence/preview", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      json: {
+        capital_scaling_authority: false,
+        comparable_trade_count: 0,
+        decision_basis_ref: "DIRECT_EXECUTION@1",
+        direction: "LONG",
+        evidence_grade: "VALIDATION_INTENT",
+        excluded_review_count: 0,
+        exclusions: {},
+        instrument_ref: "BTCUSDT-PERP",
+        intent: "VALIDATION",
+        limitations: [],
+        matched_review_count: 0,
+        metrics: {
+          average_net_pnl: null,
+          best_trade_net_pnl: null,
+          commission: "0",
+          current_streak_count: 0,
+          current_streak_kind: null,
+          flat: 0,
+          gross_loss: "0",
+          gross_profit: "0",
+          largest_loss_share_percent: null,
+          largest_win_share_percent: null,
+          longest_losing_streak: 0,
+          longest_winning_streak: 0,
+          losses: 0,
+          maximum_drawdown: "0",
+          net_pnl: "0",
+          net_pnl_without_best_trade: null,
+          net_pnl_without_worst_trade: null,
+          notional_return_percent: null,
+          profit_factor: null,
+          total_entry_notional: "0",
+          trade_count: 0,
+          wins: 0,
+          worst_trade_net_pnl: null,
+        },
+        parameter_digest: "c".repeat(64),
+        playbook_ref: "E2E_DIRECT_EXECUTION_V1",
+        repeatability: {
+          average_r_multiple: null,
+          bootstrap_block_length: null,
+          bootstrap_resamples: 0,
+          capital_scaling_authority: false,
+          confidence_level_percent: "95",
+          early_segment_net_r: null,
+          early_segment_trade_count: 0,
+          limitations: [],
+          live_promotion_authority: false,
+          mean_r_lower_confidence_bound: null,
+          minimum_profit_factor: "1",
+          minimum_trade_count: 0,
+          net_r_multiple: null,
+          net_r_without_best_trade: null,
+          policy_version: "E2E",
+          reason_codes: [],
+          recent_segment_net_r: null,
+          recent_segment_trade_count: 0,
+          risk_basis_trade_count: 0,
+          status: "NOT_APPLICABLE_VALIDATION",
+        },
+        repeated_sample_floor: 0,
+        sample_identity_digest: null,
+        sample_review_refs: [],
+        sample_traceability_complete: false,
+        setup_family: "OTHER",
+        source: "CURRENT_COMPLETED_REVIEWS",
+        source_cutoff: null,
+      },
+    });
+  });
+  await page.route(/\/api\/v1\/plans(?:\?.*)?$/, async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.continue();
+      return;
+    }
+    calls.push("SAVE_DRAFT");
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify(rejectedDraft),
+    });
+  });
+  await page.route("**/api/v1/plans/discipline-quick-plan", async (route) => {
+    if (route.request().method() === "GET" || route.request().method() === "PUT") {
+      await route.fulfill({ contentType: "application/json", body: JSON.stringify(rejectedDraft) });
+      return;
+    }
+    await route.continue();
+  });
+  await page.route("**/api/v1/plans/discipline-quick-plan/ai-review/latest", async (route) => {
+    await route.fulfill(approvedReviewRequested
+      ? { contentType: "application/json", body: JSON.stringify(approvedReview) }
+      : { status: 404, contentType: "application/json", body: JSON.stringify({ detail: { code: "PLAN_AI_REVIEW_NOT_FOUND" } }) });
+  });
+  await page.route("**/api/v1/plans/discipline-quick-plan/ai-review", async (route) => {
+    calls.push("AI_REVIEW");
+    approvedReviewRequested = true;
+    await route.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify(approvedReview) });
+  });
+  await page.route("**/api/v1/plans/discipline-quick-plan/submit-and-start", async (route) => {
+    calls.push("SUBMIT_AND_START");
+    disciplineRejectedAtActivation = true;
+    await route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({
+        detail: { code: "NEW_RISK_DAILY_LOSS_STOP_REACHED" },
+      }),
+    });
+  });
+
+  await page.goto("/plans/new?mode=direct");
+  await openDirectAiReview(page);
+  await page.getByRole("button", { name: "提交 AI 审核", exact: true }).click();
+  await expect(page.getByTestId("plan-ai-review-approved")).toBeVisible({ timeout: 20_000 });
+  await page.getByRole("button", { name: "提交并启动", exact: true }).click();
+
+  const rejection = page.getByRole("alert").filter({
+    hasText: "当前账户纪律拒绝提交并启动",
+  });
+  await expect(rejection).toContainText("草稿仍可修改");
+  await expect(page.getByText("提交并启动 Demo 被新增风险纪律拒绝")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "保存草稿", exact: true })).toBeVisible();
+  await expect(page.getByText("已固定", { exact: false })).toHaveCount(0);
+  expect(calls).toEqual([
+    "SAVE_DRAFT",
+    "AI_REVIEW",
+    "SUBMIT_AND_START",
+  ]);
+  expect(
+    consoleErrors.filter((message) => (
+      !message.includes("status of 409 (Conflict)")
+      && !message.includes("status of 404 (Not Found)")
+    )),
+  ).toEqual([]);
+  expect(pageErrors).toEqual([]);
+  await testInfo.attach("discipline-rejection.png", {
+    body: await page.screenshot({ fullPage: true }),
+    contentType: "image/png",
+  });
+  await testInfo.attach("discipline-rejection-detail.png", {
+    body: await rejection.screenshot(),
+    contentType: "image/png",
+  });
+});
+
+test("direct configuration keeps a snapshot refresh failure compact and names a known connection cause", async ({ page }, testInfo) => {
+  const evidenceDirectory = process.env.HALPHA_BROWSER_EVIDENCE_DIR;
+  await routeCurrentDemoMarketStream(page);
+  await routeCurrentDemoMarketWindow(page);
+  await routeCurrentDemoMarketContext(page);
+  await routeReadyDemoExecutor(page);
+  await routeValidOrderSchedulePreview(page);
+  await page.route(/\/api\/v1\/overview(?:\?.*)?$/, async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      json: {
+        account_snapshot_status: "STALE",
+        account_snapshot_age_seconds: 91,
+        account_observation_failure_at: "2026-08-15T07:00:00Z",
+        account_observation_failure_code: "ACCOUNT_SNAPSHOT_QUERY_FAILED_OSERROR",
+        account_observation_retry_after_seconds: 30,
+        new_risk_discipline: {
+          status: "UNKNOWN",
+          new_risk_allowed: false,
+          blocker_codes: ["ACCOUNT_EQUITY_SNAPSHOT_STALE"],
+          available_notional_capacity: null,
+          max_plan_loss: null,
+          open_risk_limit: null,
+          open_risk_committed: null,
+          rolling_drawdown_lookback_days: 30,
+        },
+      },
+    });
+  });
+
+  await page.goto("/plans/new?mode=direct");
+
+  await expect(page.getByText("纪律上限不可用", { exact: true })).toBeVisible({
+    timeout: 15_000,
+  });
+  await expect(page.getByText("当前交易纪律阻止新增风险", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("账户权益事实已过期", { exact: true })).toHaveCount(0);
+  const submit = page.getByRole("button", { name: "提交并启动", exact: true });
+  await expect(submit).toBeDisabled();
+  await submit.locator("..").hover();
+  await expect(page.getByRole("tooltip")).toContainText("交易所账户查询连接失败");
+  await testInfo.attach("account-observation-failure-compact.png", {
+    body: await page.screenshot({
+      fullPage: true,
+      ...(evidenceDirectory
+        ? { path: `${evidenceDirectory}/account-observation-failure-compact.png` }
+        : {}),
+    }),
+    contentType: "image/png",
+  });
 });
 
 test("direct execution milestones compose entry and exit capabilities without hidden residue", async ({ page }) => {
@@ -3628,6 +4295,168 @@ test("direct execution keeps the K-line chart as the primary annotated workspace
   await page.waitForTimeout(300);
   expect(attemptedPlanCreates).toEqual([]);
   await expect(page).toHaveURL(/\/plans\/new$/);
+});
+
+test("direct execution binds funding, loss preview, and discipline capacity before launch", async ({ page }, testInfo) => {
+  const targetedDisciplineRequests: string[] = [];
+  await routeCurrentDemoMarketStream(page);
+  await routeCurrentDemoMarketWindow(page);
+  await routeCurrentDemoMarketContext(page);
+  await routeReadyDemoExecutor(page);
+  await routeValidOrderSchedulePreview(page);
+  await page.route(/\/api\/v1\/overview(?:\?.*)?$/, async (route) => {
+    const url = new URL(route.request().url());
+    const target = `${url.searchParams.get("entry_instrument_ref") ?? ""}:${url.searchParams.get("entry_direction") ?? ""}`;
+    if (target !== ":") targetedDisciplineRequests.push(target);
+    await route.fulfill({
+      contentType: "application/json",
+      json: {
+        new_risk_discipline: {
+          status: "ALLOWED",
+          new_risk_allowed: true,
+          blocker_codes: [],
+          account_snapshot_ref: "discipline-snapshot",
+          account_snapshot_cutoff: "2026-08-12T15:30:00Z",
+          risk_equity: "1000",
+          available_notional_capacity: "900",
+          max_plan_loss: "100",
+          open_risk_limit: "200",
+          open_risk_committed: "0",
+          open_risk_after_proposal: "0",
+          gross_exposure_limit: "2000",
+          gross_exposure: "100",
+          gross_exposure_after_proposal: "100",
+          instrument_ref: "BTCUSDT-PERP",
+          instrument_exposure_limit: "1000",
+          instrument_exposure: "100",
+          instrument_exposure_after_proposal: "100",
+          correlation_cluster: "MAJORS",
+          correlated_exposure_limit: "1500",
+          correlated_exposure: "100",
+          correlated_exposure_after_proposal: "100",
+          daily_loss_limit: "75",
+          daily_loss_measure: "0",
+          weekly_loss_limit: "200",
+          weekly_loss_measure: "0",
+          rolling_peak_equity: "1000",
+          rolling_drawdown: "0",
+          rolling_drawdown_fraction: "0",
+          rolling_drawdown_limit_fraction: "0.04",
+          rolling_drawdown_lookback_days: 30,
+          open_new_risk_activation_count: 0,
+          day_window_started_at: "2026-08-12T16:00:00Z",
+          week_window_started_at: "2026-08-09T16:00:00Z",
+          evaluated_at: "2026-08-12T15:30:00Z",
+        },
+      },
+    });
+  });
+
+  await page.goto("/plans/new?mode=direct");
+  const capitalLimit = page.getByLabel("资金上限（USDT）");
+  await expect(page.getByText("允许 900 USDT", { exact: true })).toBeVisible({
+    timeout: 15_000,
+  });
+  await expect.poll(() => targetedDisciplineRequests).toContain("BTCUSDT-PERP:LONG");
+  await expect(capitalLimit).toHaveValue("900", { timeout: 15_000 });
+  await expect(page.getByLabel("按交易纪律比例设定资金上限"))
+    .toHaveAttribute("aria-valuenow", "100");
+  await expect(page.getByTestId("direct-discipline-summary")).toContainText("最大预计亏损");
+  await expect(page.getByTestId("direct-discipline-summary")).toContainText("收益 / 风险（R）");
+  await expect(page.getByText("当前计划没有市场入场条件", { exact: false })).toHaveCount(0);
+  await capitalLimit.scrollIntoViewIfNeeded();
+  await page.screenshot({
+    path: `../build/qualification/browser/direct-discipline-allowed-${testInfo.project.name}.png`,
+  });
+
+  const long = page.getByRole("button", { name: "做多", exact: true });
+  const short = page.getByRole("button", { name: "做空", exact: true });
+  await expect(long).toHaveAttribute("aria-pressed", "true");
+  await short.click();
+  await expect(short).toHaveAttribute("aria-pressed", "true");
+  await expect(long).toHaveAttribute("aria-pressed", "false");
+  await expect.poll(() => targetedDisciplineRequests).toContain("BTCUSDT-PERP:SHORT");
+
+  if (testInfo.project.name === "chromium-desktop") {
+    const marketContext = page.getByTestId("direct-execution-market-context");
+    const planEditor = page.getByLabel("直接执行快速配置");
+    const [marketBox, editorBox] = await Promise.all([
+      marketContext.boundingBox(),
+      planEditor.boundingBox(),
+    ]);
+    expect(marketBox).not.toBeNull();
+    expect(editorBox).not.toBeNull();
+    expect(Math.abs(marketBox!.y - editorBox!.y)).toBeLessThanOrEqual(1);
+    expect(marketBox!.x + marketBox!.width).toBeLessThanOrEqual(editorBox!.x + 1);
+  }
+
+  await capitalLimit.fill("901");
+  await expect(capitalLimit).toHaveAttribute("aria-invalid", "true");
+  await expect(page.getByText("超过当前纪律允许的 900 USDT。", { exact: true })).toBeVisible();
+  await page.screenshot({
+    path: `../build/qualification/browser/direct-discipline-exceeded-${testInfo.project.name}.png`,
+  });
+  await openDirectReview(page);
+  await expect(page.getByRole("button", { name: "保存草稿", exact: true })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "提交并启动", exact: true })).toBeDisabled();
+  await testInfo.attach(`direct-discipline-cap-${testInfo.project.name}.png`, {
+    body: await page.screenshot({ fullPage: true }),
+    contentType: "image/png",
+  });
+});
+
+test("strategy configuration applies the same targeted discipline ceiling", async ({ page }) => {
+  const targetedDisciplineRequests: string[] = [];
+  await routeReadyDemoExecutor(page);
+  await page.route("**/api/v1/strategies", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      json: [{
+        strategy_id: "E2E_DISCIPLINE_STRATEGY",
+        display_name: "纪律容量验证策略",
+        strategy_version: "1.0.0",
+        parameter_schema_version: "1.0.0",
+        supported_directions: ["LONG", "SHORT"],
+        applicable_scenarios: "确定性浏览器验证",
+        value_logic: "按固定边界形成策略计划。",
+        execution_behavior: "由策略信号触发。",
+        economic_scope: {
+          allowed_plan_intents: ["VALIDATION"],
+          profitability_evidence: "NO_POSITIVE_EXPECTANCY_EVIDENCE",
+          evidence_limit: "仅用于纪律配置回归。",
+        },
+        plan_key_parameters: [],
+      }],
+    });
+  });
+  await page.route(/\/api\/v1\/overview(?:\?.*)?$/, async (route) => {
+    const url = new URL(route.request().url());
+    const target = `${url.searchParams.get("entry_instrument_ref") ?? ""}:${url.searchParams.get("entry_direction") ?? ""}`;
+    if (target !== ":") targetedDisciplineRequests.push(target);
+    await route.fulfill({
+      contentType: "application/json",
+      json: {
+        new_risk_discipline: {
+          status: "ALLOWED",
+          new_risk_allowed: true,
+          blocker_codes: [],
+          available_notional_capacity: "900",
+          max_plan_loss: "400",
+          open_risk_limit: "600",
+          open_risk_committed: "0",
+        },
+      },
+    });
+  });
+
+  await page.goto("/plans/new");
+  await page.getByRole("button", { name: "配置流程验证", exact: true }).click();
+  const tradeAmount = page.getByLabel("交易金额（USDT）");
+  await expect(tradeAmount).toHaveValue("500");
+  await expect.poll(() => targetedDisciplineRequests).toContain("BTCUSDT-PERP:LONG");
+  await expect(tradeAmount).toHaveAttribute("aria-invalid", "true");
+  await expect(page.getByText("超过当前交易纪律允许的 400 USDT。", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "保存计划", exact: true })).toBeDisabled();
 });
 
 test("direct execution chart keeps its fixed empty state when K-line history fails", async ({ page }) => {

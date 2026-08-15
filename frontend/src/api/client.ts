@@ -8,6 +8,7 @@ export type AccountPositionOperationPreview = components["schemas"]["AccountPosi
 export type SettingsStatus = components["schemas"]["SettingsStatusResponse"];
 export type MarketContext = components["schemas"]["MarketContext"];
 export type MarketWindow = components["schemas"]["MarketWindow"];
+export type MarketFundingRateHistory = components["schemas"]["MarketFundingRateHistory"];
 export type MarketInterval = MarketWindow["interval"];
 export type MarketWindowPurpose = "EXECUTION_REVIEW";
 export type PlanCreatePayload = components["schemas"]["PlanCreatePayload"];
@@ -58,6 +59,8 @@ export type SystemStopRelease = components["schemas"]["SystemStopReleaseResponse
 export type TestEmailResult = components["schemas"]["TestEmailResponse"];
 export type PlanDeleteResult = components["schemas"]["PlanDeleteResponse"];
 export type PlanVersion = components["schemas"]["TradePlanVersion"];
+export type PlanAiReview = components["schemas"]["PlanAiReviewResponse"];
+export type PlanAiReviewConfiguration = components["schemas"]["PlanAiReviewConfiguration"];
 export type Receipt = components["schemas"]["ReceiptResponse"];
 export type Review = components["schemas"]["ReviewResponse"];
 export type ExecutionFeeEvidence = components["schemas"]["ExecutionFeeEvidenceResponse"];
@@ -145,11 +148,38 @@ export async function getSettingsStatus(): Promise<SettingsStatus> {
 }
 
 export async function getOverview(): Promise<Overview> {
-  const { data, error, response } = await api.GET("/api/v1/overview");
-  if (!data) {
-    throw new ApiFailure(response.status, errorCode(error, "OVERVIEW_FAILED"));
+  return getOverviewForEntry();
+}
+
+export async function getOverviewForEntry(
+  target?: {
+    entryInstrumentRef?: string;
+    entryDirection?: "LONG" | "SHORT";
+  },
+): Promise<Overview> {
+  try {
+    const { data, error, response } = await api.GET("/api/v1/overview", {
+      params: target ? {
+        query: {
+          entry_instrument_ref: target.entryInstrumentRef,
+          entry_direction: target.entryDirection,
+        },
+      } : undefined,
+    });
+    if (!data) {
+      throw new ApiFailure(
+        response?.status ?? 0,
+        errorCode(error, "OVERVIEW_FAILED"),
+        error,
+      );
+    }
+    return data;
+  } catch (error) {
+    if (error instanceof ApiFailure) throw error;
+    // A rejected fetch means the browser could not reach the local workbench;
+    // it is distinct from a server-declared stale account snapshot.
+    throw new ApiFailure(0, "OVERVIEW_CONNECTION_FAILED");
   }
-  return data;
 }
 
 export async function previewAccountPositionOperation(
@@ -201,6 +231,21 @@ export async function getMarketContext(
     },
   });
   if (!data) throw new ApiFailure(response.status, errorCode(error, "MARKET_CONTEXT_FAILED"));
+  return data;
+}
+
+export async function getMarketFundingRateHistory(
+  instrumentRef: string,
+): Promise<MarketFundingRateHistory> {
+  const { data, error, response } = await api.GET("/api/v1/market-funding-history", {
+    params: { query: { instrument_ref: instrumentRef } },
+  });
+  if (!data) {
+    throw new ApiFailure(
+      response.status,
+      errorCode(error, "MARKET_FUNDING_HISTORY_FAILED"),
+    );
+  }
   return data;
 }
 
@@ -304,16 +349,103 @@ export async function updatePlan(
   return data;
 }
 
-export async function fixPlan(
+export async function requestPlanAiReview(
   planId: string,
   draftVersion: number,
   idempotencyKey: string,
-): Promise<PlanVersion> {
-  const { data, error, response } = await api.POST("/api/v1/plans/{plan_id}/fix", {
-    params: { path: { plan_id: planId }, header: { "Idempotency-Key": idempotencyKey, "If-Match": String(draftVersion) } },
-    headers: csrfHeader(),
-  });
-  if (!data) throw new ApiFailure(response.status, errorCode(error, "PLAN_FIX_FAILED"));
+  configuration: PlanAiReviewConfiguration,
+): Promise<PlanAiReview> {
+  const { data, error, response } = await api.POST(
+    "/api/v1/plans/{plan_id}/ai-review",
+    {
+      params: {
+        path: { plan_id: planId },
+        header: {
+          "Idempotency-Key": idempotencyKey,
+          "If-Match": String(draftVersion),
+        },
+      },
+      body: { configuration },
+      headers: csrfHeader(),
+    },
+  );
+  if (!data) {
+    throw new ApiFailure(
+      response.status,
+      errorCode(error, "PLAN_AI_REVIEW_REQUEST_FAILED"),
+      error,
+    );
+  }
+  return data;
+}
+
+export async function getPlanAiReview(reviewId: string): Promise<PlanAiReview> {
+  const { data, error, response } = await api.GET(
+    "/api/v1/plan-ai-reviews/{review_id}",
+    { params: { path: { review_id: reviewId } } },
+  );
+  if (!data) {
+    throw new ApiFailure(
+      response.status,
+      errorCode(error, "PLAN_AI_REVIEW_FAILED"),
+      error,
+    );
+  }
+  return data;
+}
+
+export async function getLatestPlanAiReview(
+  planId: string,
+): Promise<PlanAiReview | null> {
+  const { data, error, response } = await api.GET(
+    "/api/v1/plans/{plan_id}/ai-review/latest",
+    { params: { path: { plan_id: planId } } },
+  );
+  if (data === undefined) {
+    throw new ApiFailure(
+      response.status,
+      errorCode(error, "PLAN_AI_REVIEW_LATEST_FAILED"),
+      error,
+    );
+  }
+  return data;
+}
+
+export function planAiReviewStreamUrl(reviewId: string): string {
+  const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${scheme}//${window.location.host}/api/v1/plan-ai-reviews/${encodeURIComponent(reviewId)}/stream`;
+}
+
+/**
+ * The normal final command.  The server keeps the plan editable if any
+ * admission check fails, and only persists its executor snapshot together
+ * with a successful activation.
+ */
+export async function submitAndStartPlan(
+  planId: string,
+  draftVersion: number,
+  idempotencyKey: string,
+): Promise<ActivationCreateResult> {
+  const { data, error, response } = await api.POST(
+    "/api/v1/plans/{plan_id}/submit-and-start",
+    {
+      params: {
+        path: { plan_id: planId },
+        header: {
+          "Idempotency-Key": idempotencyKey,
+          "If-Match": String(draftVersion),
+        },
+      },
+      headers: csrfHeader(),
+    },
+  );
+  if (!data) {
+    throw new ApiFailure(
+      response.status,
+      errorCode(error, "PLAN_SUBMIT_AND_START_FAILED"),
+      error,
+    );
+  }
   return data;
 }
 

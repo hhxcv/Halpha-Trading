@@ -396,7 +396,7 @@ describe("order schedule chart model", () => {
       price: 65750,
     });
     expect(annotations.priceAnnotations[2]?.detail).toContain("有效 6.575 USDT");
-    expect(annotations.priceAnnotations[2]?.detail).toContain("归一化前 65,750.0…");
+    expect(annotations.priceAnnotations[2]?.detail).toContain("归一化前 65,750.0");
     expect(annotations.priceAnnotations[2]?.detail).not.toContain("032369082222");
     expect(annotations.priceAnnotations[3]).toMatchObject({
       label: "预计止损触发价",

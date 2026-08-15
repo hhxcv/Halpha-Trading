@@ -1,13 +1,13 @@
 import { Box, Typography } from "@mui/material";
 import type { ReactNode } from "react";
 
-import { marketToneClassName, type MarketTone } from "../marketColors";
+import { financialToneClassName, marketToneClassName, type FinancialTone, type MarketTone } from "../marketColors";
 
 export type FactGridItem = {
   label: string;
   value: ReactNode;
   note?: string;
-  tone?: MarketTone;
+  tone?: MarketTone | FinancialTone;
 };
 
 export default function FactGrid({
@@ -38,6 +38,9 @@ export default function FactGrid({
     >
       {facts.map((fact, index) => {
         const last = index === facts.length - 1;
+        const toneClassName = fact.tone === "up" || fact.tone === "down"
+          ? marketToneClassName(fact.tone)
+          : financialToneClassName(fact.tone);
         const lastColumnSpan = last && remainder > 0
           ? columns - remainder + 1
           : 1;
@@ -53,7 +56,7 @@ export default function FactGrid({
           >
             <Typography component="dt" variant="caption" color="text.secondary">{fact.label}</Typography>
             <Box component="dd" sx={{ m: 0, mt: dense ? .5 : .75 }}>
-              <Typography component="span" className={`mono ${marketToneClassName(fact.tone) ?? ""}`} sx={{ display: "block", fontSize: 13, fontWeight: 650, overflowWrap: "anywhere" }}>
+              <Typography component="span" className={`mono ${toneClassName ?? ""}`} sx={{ display: "block", fontSize: 13, fontWeight: 650, overflowWrap: "anywhere" }}>
                 {fact.value}
               </Typography>
               {fact.note && (

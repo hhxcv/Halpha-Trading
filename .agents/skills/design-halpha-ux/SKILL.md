@@ -35,6 +35,10 @@ Answer only what changes the layout or interaction:
 
 Optimize for repeated expert use, fast comparison, numeric accuracy, keyboard access, stable positions and clear state—not marketing appearance or onboarding prose.
 
+For financial facts, retain the economic sign while using the active K-line palette: profit and received funding use the up color with `+`; losses, stop-risk, projected loss, fees and paid funding use the down color with `−`. Zero and unknown remain neutral. Render default `Asia/Shanghai` times without a `UTC+8` suffix; label a time zone only when it differs from the default. Review changed pages for both sign and color rather than relying on either signal alone.
+
+For ordinary selected choices, use the structural theme family specified by UX L2/L3 and the frontend theme source; do not repurpose semantic information, warning, success or error colors as a generic selected state. Use the exact theme structural fill and higher weight without a decorative selection outline. Direction controls are the exception: they retain no structural fill and use the active K-line red/green text and outline.
+
 ### 3. Choose Visual Direction Only When Needed
 
 Read [Benchmarking Professional Trading UX](references/benchmarking-professional-trading-ux.md) only for a substantial redesign or unresolved interaction pattern. Compare the smallest relevant set of current first-party references; do not create a benchmark matrix when one direct precedent answers the question.

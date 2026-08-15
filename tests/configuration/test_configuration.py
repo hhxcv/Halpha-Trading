@@ -126,12 +126,21 @@ def test_new_risk_discipline_is_bounded() -> None:
     assert settings.new_risk_discipline.max_open_risk_fraction == "0.025"
     assert settings.new_risk_discipline.daily_loss_stop_fraction == "0.015"
     assert settings.new_risk_discipline.weekly_loss_stop_fraction == "0.04"
+    assert settings.new_risk_discipline.minimum_reward_risk_ratio == "1"
     policy = settings.new_risk_discipline.model_dump(mode="json")
     policy["max_plan_loss_fraction"] = "0.01"
     with pytest.raises(ConfigurationError, match="CONFIGURATION_INVALID"):
         load_settings(
             EXAMPLE,
             constructor_values={"new_risk_discipline": policy},
+        )
+
+    reward_risk = settings.new_risk_discipline.model_dump(mode="json")
+    reward_risk["minimum_reward_risk_ratio"] = "0.9"
+    with pytest.raises(ConfigurationError, match="CONFIGURATION_INVALID"):
+        load_settings(
+            EXAMPLE,
+            constructor_values={"new_risk_discipline": reward_risk},
         )
 
 @pytest.mark.parametrize(

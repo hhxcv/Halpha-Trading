@@ -19,6 +19,7 @@ import win32security
 import winerror
 
 from halpha.configuration import HalphaSettings
+from halpha.database.schema_version import SchemaVersionError
 from halpha.windows_deployment import (
     SHARED_BACKUP_TASK,
     SHARED_BACKUP_USER,
@@ -727,11 +728,13 @@ class RuntimeController:
         config_path: Path,
         *,
         task_service_factory: Callable[[], Any] = _scheduled_task_service,
+        schema_readiness: Callable[[], None] | None = None,
     ) -> None:
         self._root = repository_root.resolve()
         self._settings = settings
         self._config_path = config_path.resolve()
         self._task_service_factory = task_service_factory
+        self._schema_readiness = schema_readiness
         deployment = windows_deployment(settings.release.venue_account_type.value)
         self._deployment = deployment
         peers = peer_windows_deployments(settings.release.venue_account_type.value)
@@ -756,6 +759,49 @@ class RuntimeController:
         }
         if not deployment.owns_shared_backup:
             self._peer_task_names["peer:backup"] = SHARED_BACKUP_TASK
+
+    def database_schema_status(self) -> dict[str, str]:
+        """Return a safe, read-only schema readiness result for this context."""
+
+        if self._schema_readiness is None:
+            # Unit-level callers can exercise task mechanics without a local
+            # database. The production CLI always supplies the verifier.
+            return {"status": "NOT_CHECKED"}
+        try:
+            self._schema_readiness()
+        except SchemaVersionError as exc:
+            reason = str(exc)
+            return {
+                "status": (
+                    "UNAVAILABLE"
+                    if reason == "DATABASE_SCHEMA_VERSION_UNAVAILABLE"
+                    else "NOT_CURRENT"
+                ),
+                "reason": reason,
+            }
+        except Exception as exc:
+            return {
+                "status": "UNAVAILABLE",
+                "reason": (
+                    "DATABASE_SCHEMA_READINESS_FAILED "
+                    f"type={type(exc).__name__}"
+                ),
+            }
+        return {"status": "CURRENT"}
+
+    def _require_database_schema_current(self) -> None:
+        readiness = self.database_schema_status()
+        status = readiness["status"]
+        if status in {"CURRENT", "NOT_CHECKED"}:
+            return
+        reason = readiness["reason"]
+        if status == "NOT_CURRENT":
+            raise RuntimeControlError(
+                f"DATABASE_SCHEMA_NOT_CURRENT reason={reason}"
+            )
+        raise RuntimeControlError(
+            f"DATABASE_SCHEMA_READINESS_UNAVAILABLE reason={reason}"
+        )
 
     def _expected_task_sid(self, service: str) -> str:
         windows = self._settings.windows
@@ -943,6 +989,8 @@ class RuntimeController:
             raise RuntimeControlError(
                 "OBSERVATION_SESSION_NOT_AVAILABLE_FOR_CONTINUOUS_ACCOUNT_OBSERVER"
             )
+        if target in {"app", "executor", "product"}:
+            self._require_database_schema_current()
         if target == "product":
             services = (
                 # Restore the execution and protection loop before waiting for the
@@ -1039,6 +1087,8 @@ class RuntimeController:
             services = (target,)
         else:
             raise RuntimeControlError(f"SERVICE_TARGET_UNSUPPORTED target={target}")
+        if enabled:
+            self._require_database_schema_current()
         results: dict[str, object] = {}
         for service in services:
             task = self._task(service)
