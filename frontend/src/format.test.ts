@@ -35,10 +35,10 @@ import {
 } from "./format";
 
 describe("deterministic workbench formatting", () => {
-  it("uses the global Chinese UTC+8 display configuration", () => {
+  it("uses the global Chinese default display time zone without a redundant suffix", () => {
     expect(USER_VISIBLE_TIME_LOCALE).toBe("zh-CN");
     expect(USER_VISIBLE_TIME_ZONE).toBe("Asia/Shanghai");
-    expect(USER_VISIBLE_TIME_ZONE_LABEL).toBe("UTC+8");
+    expect(USER_VISIBLE_TIME_ZONE_LABEL).toBe("");
   });
 
   it("keeps basis-point values decision-readable", () => {
@@ -47,16 +47,16 @@ describe("deterministic workbench formatting", () => {
     expect(basisPoints("-12.3456")).toBe("-12.34");
   });
 
-  it("converts Z timestamps to the user-visible UTC+8 time zone", () => {
+  it("converts Z timestamps to the user-visible default time zone", () => {
     expect(formatUserVisibleTime("2026-07-17T00:00:00Z"))
-      .toBe("2026-07-17 08:00:00 UTC+8");
+      .toBe("2026-07-17 08:00:00");
   });
 
-  it("normalizes timestamp offsets before displaying UTC+8", () => {
+  it("normalizes timestamp offsets before displaying the default time zone", () => {
     expect(formatUserVisibleTime("2026-07-17T12:34:56+09:00"))
-      .toBe("2026-07-17 11:34:56 UTC+8");
+      .toBe("2026-07-17 11:34:56");
     expect(formatUserVisibleTime("2026-07-16T19:30:00-05:00"))
-      .toBe("2026-07-17 08:30:00 UTC+8");
+      .toBe("2026-07-17 08:30:00");
   });
 
   it("formats compact plan-card times without repeating the global zone label", () => {
@@ -158,7 +158,7 @@ describe("deterministic workbench formatting", () => {
   });
 
   it("uses venue precision for prices and quantities with bounded fallbacks", () => {
-    expect(tradingPrice("64122.832369082222", "0.1")).toBe("64,122.8…");
+    expect(tradingPrice("64122.832369082222", "0.1")).toBe("64,122.8");
     expect(tradingPrice("64122.8", "0.1")).toBe("64,122.8");
     expect(tradingPrice("12", "0.01")).toBe("12.00");
     expect(tradingQuantity("0.123456789", "0.001")).toBe("0.123…");
@@ -176,15 +176,15 @@ describe("deterministic workbench formatting", () => {
     expect(quoteCurrencyAmount("5000")).toBe("5,000.00");
   });
 
-  it("keeps small fee and spread estimates visible without long decimals", () => {
-    expect(quoteCurrencyEstimate("0.00119995")).toBe("0.001199");
-    expect(quoteCurrencyEstimate("0.945597")).toBe("0.945597");
-    expect(quoteCurrencyEstimate("1.891194444")).toBe("1.891194");
+  it("keeps quote-currency estimates at two decimal places", () => {
+    expect(quoteCurrencyEstimate("0.00119995")).toBe("0.00");
+    expect(quoteCurrencyEstimate("0.945597")).toBe("0.94");
+    expect(quoteCurrencyEstimate("1.891194444")).toBe("1.89");
   });
 
   it("keeps market fallback displays bounded while preserving useful precision", () => {
     expect(marketPrice("64178.5")).toBe("64,178.50");
-    expect(marketPrice("0.123456789")).toBe("0.12345678…");
+    expect(marketPrice("0.123456789")).toBe("0.12");
   });
 
   it("subtracts decimal market facts without binary floating-point artifacts", () => {

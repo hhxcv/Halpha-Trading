@@ -71,7 +71,6 @@ import {
   createActivation,
   completeReview,
   deletePlan,
-  fixPlan,
   getActivation,
   getActivations,
   getActivationTimeline,
@@ -111,7 +110,11 @@ import {
 import { submitActivationControlWithFreshRiskReducingRetry } from "./api/controlSubmission";
 import PageHeader from "./components/PageHeader";
 import FactGrid from "./components/FactGrid";
-import TradingDisciplineStrip from "./components/TradingDisciplineStrip";
+import TradingDisciplineStrip, {
+  NewRiskDisciplineBlockNotice,
+  newRiskDisciplineBlockerCodesFromFailureCode,
+} from "./components/TradingDisciplineStrip";
+import PlanAiReviewRecord from "./components/PlanAiReviewRecord";
 import ReviewEntrySetupEvidencePanel from "./components/ReviewEntrySetupEvidencePanel";
 import ReviewPricePathEvidencePanel from "./components/ReviewPricePathEvidencePanel";
 import type { OrderChartPriceAnnotation } from "./components/orderScheduleChartModel";
@@ -176,10 +179,11 @@ import {
 import {
   applyMarketColorScheme,
   DEFAULT_MARKET_COLOR_SCHEME,
+  FinancialToneText,
   MarketToneText,
+  financialToneForSignedValue,
   marketToneClassName,
   marketToneForDirection,
-  marketToneForSignedValue,
   readMarketColorScheme,
   saveMarketColorScheme,
   type MarketColorScheme,
@@ -191,6 +195,7 @@ import {
   marketEnvironmentScopeKey,
   usePublicMarketStream,
 } from "./marketStream";
+import { formatFundingRatePercent } from "./fundingEstimate";
 import {
   clearPersistentRequestIdentity,
   persistentRequestIdentity,
@@ -249,21 +254,6 @@ const DIRECT_EXECUTION_KIND = "DIRECT_EXECUTION";
 const DIRECT_EXECUTION_LABEL = "直接执行订单计划";
 const NewPlanPage = lazy(() => import("./pages/NewPlanPage"));
 
-function currentFundingRatePercent(value: string): string {
-  const rate = Number(value);
-  if (!Number.isFinite(rate)) return "未知";
-  const percent = rate * 100;
-  const normalized = percent.toFixed(4).replace(/\.?0+$/, "");
-  return `${percent > 0 ? "+" : ""}${normalized || "0"}%`;
-}
-
-function currentFundingDirectionText(value: string, direction: string): string {
-  const rate = Number(value);
-  if (!Number.isFinite(rate) || rate === 0) return "当前费率为 0";
-  const selectedSidePays = (rate > 0 && direction === "LONG")
-    || (rate < 0 && direction === "SHORT");
-  return selectedSidePays ? "当前方向跨结算时点支付" : "当前方向跨结算时点收取";
-}
 const OrderScheduleChart = lazy(() => import("./components/OrderScheduleChart"));
 const ReviewPriceChart = lazy(() => import("./components/ReviewCharts").then((module) => ({ default: module.ReviewPriceChart })));
 const PlanPnlChart = lazy(() => import("./components/ReviewCharts").then((module) => ({ default: module.PlanPnlChart })));
@@ -424,7 +414,7 @@ function positionAlignmentOperationLabel(value: unknown): string {
 
 function directEntryConditionDetail(value: unknown): string {
   const spec = orderScheduleSpecOf(value);
-  if (Object.keys(spec).length === 0) return "正在读取已固定条件";
+  if (Object.keys(spec).length === 0) return "正在读取运行计划条件";
   const conditions = recordOf(spec.entry_conditions);
   const clauses = recordsOf(conditions.items).flatMap((condition) => {
     const kind = valueOf(condition, "kind");
@@ -455,7 +445,7 @@ function directEntryConditionDetail(value: unknown): string {
     }
     return [];
   });
-  if (clauses.length === 0) return "启动后按已确认计划入场";
+  if (clauses.length === 0) return "启动后按已提交计划入场";
   const operator = valueOf(conditions, "operator", "ALL") === "ANY"
     ? "任一条件成立"
     : "以下条件同时成立";
@@ -471,7 +461,7 @@ function runtimeConditionLabel(condition: RuntimeEntryConditionState): string {
 }
 
 function runtimeConditionRule(condition: RuntimeEntryConditionState): string {
-  if (condition.kind === "DECISION_BASIS_READY") return "直接执行计划已确认";
+  if (condition.kind === "DECISION_BASIS_READY") return "直接执行计划已提交";
   if (condition.kind === "MARK_PRICE") {
     return `${condition.comparator === "GTE" ? "≥" : "≤"} ${marketPrice(condition.threshold)} USDT`;
   }
@@ -816,7 +806,7 @@ function signedUsdt(value: unknown): string {
   const normalized = Math.abs(amount) < 0.0000005 ? 0 : amount;
   return `${new Intl.NumberFormat("zh-CN", {
     minimumFractionDigits: 2,
-    maximumFractionDigits: 6,
+    maximumFractionDigits: 2,
     signDisplay: "exceptZero",
   }).format(normalized)} USDT`;
 }
@@ -825,7 +815,7 @@ function signedSettledUsdt(value: unknown): string {
   const amount = finiteNumber(value);
   if (amount === null) return "未知";
   const normalized = Math.abs(amount) < 0.000000005 ? 0 : amount;
-  const absolute = quoteAmount(String(Math.abs(normalized)));
+  const absolute = quoteCurrencyAmount(String(Math.abs(normalized)));
   return `${normalized > 0 ? "+" : normalized < 0 ? "-" : ""}${absolute} USDT`;
 }
 
@@ -969,9 +959,9 @@ function PlanPnlPanel({
         </Tooltip>
         {displayedPnl !== undefined && displayedPnl !== null && (
           <Typography className="mono" variant="body2" sx={{ fontWeight: 750 }}>
-            <MarketToneText tone={marketToneForSignedValue(displayedPnl)}>
+            <FinancialToneText tone={financialToneForSignedValue(displayedPnl)}>
               {completed ? signedSettledUsdt(tradeResult.net_pnl) : signedUsdt(displayedPnl)}
-            </MarketToneText>
+            </FinancialToneText>
           </Typography>
         )}
       </Stack>
@@ -1025,7 +1015,7 @@ function usdt(value: unknown): string {
   if (amount === null) return "未知";
   return `${new Intl.NumberFormat("zh-CN", {
     minimumFractionDigits: 2,
-    maximumFractionDigits: 6,
+    maximumFractionDigits: 2,
   }).format(amount)} USDT`;
 }
 
@@ -1104,7 +1094,7 @@ const planRuntimeIncompatibilityLabels: Record<string, string> = {
   PLAN_STRATEGY_RUNTIME_INCOMPATIBLE: "固定策略实现与当前运行时不一致",
   PLAN_STRATEGY_PARAMETERS_CORRUPT: "固定策略参数摘要无法核对",
   PLAN_STRATEGY_PARAMETERS_INCOMPATIBLE: "固定策略参数已不受当前实现支持",
-  PLAN_FIXED_CONTENT_UNREADABLE: "固定计划内容无法完整读取",
+  PLAN_FIXED_CONTENT_UNREADABLE: "运行快照内容无法完整读取",
 };
 
 const protectionStateLabels: Record<string, string> = {
@@ -1826,7 +1816,7 @@ function RuntimeDeadlineProgress({
           <Typography variant="caption">计划自动退出</Typography>
           {terminal ? (
             <Typography variant="caption" sx={{ fontWeight: 750 }}>
-              {hasEntryFill ? "计划已结束" : "未入场，未启动"}
+              {hasEntryFill ? "计划已结束" : "未入场，计划已结束"}
             </Typography>
           ) : exitHandoff ? (
             <Typography variant="caption" color="warning.main" sx={{ fontWeight: 750 }}>
@@ -1859,20 +1849,10 @@ function RuntimeDeadlineProgress({
   );
 }
 
-function planConfirmationError(error: unknown): string {
-  if (isUnknownMutationResult(error)) {
-    return "结果未知；再次确认会沿用同一请求身份核对原结果，不会创建替代请求";
-  }
-  const code = error instanceof ApiFailure ? error.code : "结果未知";
-  if (code === "PARAMETER_OUT_OF_RANGE") return "策略参数超出页面标注范围，请编辑后重试";
-  if (code === "TAKE_PROFIT_ORDER_INVALID") return "止盈二必须大于止盈一，请编辑后重试";
-  return `${code}，请刷新当前计划后重试`;
-}
-
 function planDeletionError(error: unknown): string {
   const code = error instanceof ApiFailure ? error.code : "结果未知";
   if (code === "PLAN_VERSION_CONFLICT") return "草稿已变化，请关闭弹窗并刷新后重试";
-  if (code === "PLAN_DRAFT_FIXED") return "计划已经确认，不能再删除草稿";
+  if (code === "PLAN_ALREADY_STARTED") return "计划已经启动，不能再删除草稿";
   if (code === "PLAN_NOT_FOUND") return "草稿已不存在，请刷新计划列表";
   return `草稿未删除：${code}`;
 }
@@ -2279,23 +2259,6 @@ const positionAlignmentReadinessLabels: Record<string, string> = {
   POSITION_ALIGNMENT_SCOPE_CONFLICT: "同一账户与合约已有运行中的计划责任",
 };
 
-const newRiskDisciplineBlockerLabels: Record<string, string> = {
-  ACCOUNT_EQUITY_SNAPSHOT_UNAVAILABLE: "账户权益事实不可用",
-  ACCOUNT_EQUITY_SNAPSHOT_STALE: "账户权益事实已过期",
-  ACCOUNT_EQUITY_SNAPSHOT_TIME_INVALID: "账户权益事实时间异常",
-  ACCOUNT_RISK_EQUITY_NOT_POSITIVE: "风险权益不为正数",
-  ACCOUNT_TRADING_DISABLED: "交易所账户当前不允许交易",
-  NEW_RISK_PROPOSED_LOSS_INVALID: "计划最大允许损失不可读",
-  NEW_RISK_PLAN_LOSS_LIMIT_EXCEEDED: "本计划最大允许损失超过单计划上限",
-  NEW_RISK_PROPOSED_DIRECTION_INVALID: "计划交易方向不可读",
-  NEW_RISK_ENTRY_DIRECTION_INVALID: "待提交入场方向不可读",
-  NEW_RISK_LOSING_POSITION_ADD_PROHIBITED: "同品种同向持仓浮亏，禁止追加仓位",
-  NEW_RISK_DAILY_BUDGET_EXCEEDED: "本计划将超过当日风险尝试额度",
-  NEW_RISK_WEEKLY_BUDGET_EXCEEDED: "本计划将超过本周风险尝试额度",
-  NEW_RISK_DAILY_ATTEMPT_LIMIT_REACHED: "当日新增风险尝试次数已到上限",
-  NEW_RISK_CONCURRENT_ACTIVATION_LIMIT_REACHED: "已有新增风险计划尚未闭合",
-};
-
 function AccountPositionOperationDialog({
   position,
   status,
@@ -2510,7 +2473,7 @@ function AccountPositionOperationDialog({
             <Alert severity={preview.activation_allowed ? "success" : "warning"} variant="outlined">
               {preview.activation_allowed
                 ? operation === "ADD"
-                  ? "当前预检允许进入独立新增风险计划；后续仍须固定、预览激活并重读账户事实。"
+                  ? "当前预检允许进入独立新增风险计划；提交并启动时仍会重读账户事实。"
                   : "当前预检允许创建并确认处置计划；激活时仍会重读账户事实，Executor 提交前还会再次核对。"
                 : operation === "ADD"
                   ? "已形成独立新增风险计划预填，但当前不能激活或提交交易所。以下条件必须先解决。"
@@ -2854,7 +2817,7 @@ function OverviewPage() {
                             </TableCell>
                             <TableCell className="mono" align="right">
                               {Number.isFinite(unrealizedPnl)
-                                ? <MarketToneText tone={marketToneForSignedValue(unrealizedPnl)}>{signedUsdt(unrealizedPnl)}</MarketToneText>
+                                ? <FinancialToneText tone={financialToneForSignedValue(unrealizedPnl)}>{signedUsdt(unrealizedPnl)}</FinancialToneText>
                                 : "—"}
                             </TableCell>
                             <TableCell sx={{ whiteSpace: "nowrap" }}>
@@ -3241,8 +3204,8 @@ function OverviewPage() {
                 )}
                 <FactGrid facts={[
                   { label: "已计算交易", value: `${recentClosedTrades.length} 笔` },
-                  { label: "合计净结果", value: signedUsdt(recentNetPnl), tone: marketToneForSignedValue(recentNetPnl) },
-                  { label: "平均净结果", value: signedUsdt(recentAverageNetPnl), tone: marketToneForSignedValue(recentAverageNetPnl) },
+                  { label: "合计净结果", value: signedUsdt(recentNetPnl), tone: financialToneForSignedValue(recentNetPnl) },
+                  { label: "平均净结果", value: signedUsdt(recentAverageNetPnl), tone: financialToneForSignedValue(recentAverageNetPnl) },
                 ]} />
                 <Stack spacing={1.25} sx={{ mt: 2 }}>
                   {recentClosedTrades.map((review) => {
@@ -3263,7 +3226,7 @@ function OverviewPage() {
                             <Typography sx={{ fontWeight: 750 }}>{planName}</Typography>
                           )}
                           <Typography sx={{ fontWeight: 750 }}>
-                            {instrumentRef || "交易对象待恢复"} · <MarketToneText tone={marketToneForDirection(direction)}>{translatedLabel(directionLabels, direction)}</MarketToneText> · <MarketToneText tone={marketToneForSignedValue(result.net_pnl)}>{signedUsdt(result.net_pnl)}</MarketToneText>
+                            {instrumentRef || "交易对象待恢复"} · <MarketToneText tone={marketToneForDirection(direction)}>{translatedLabel(directionLabels, direction)}</MarketToneText> · <FinancialToneText tone={financialToneForSignedValue(result.net_pnl)}>{signedUsdt(result.net_pnl)}</FinancialToneText>
                           </Typography>
                           <Typography variant="body2" color="text.secondary">
                             {directExecution
@@ -3273,8 +3236,8 @@ function OverviewPage() {
                             {tradeAmount ? ` · 计划上限 ${usdt(tradeAmount)}` : ""}
                           </Typography>
                           <Typography variant="caption" color="text.secondary">
-                            {formatUserVisibleTime(valueOf(review, "fact_cutoff"))} · 手续费 {usdt(result.commission)}
-                            {result.funding_included === true ? ` · 资金费 ${signedUsdt(result.funding)}` : ""}
+                            {formatUserVisibleTime(valueOf(review, "fact_cutoff"))} · 手续费 <FinancialToneText tone={financialToneForSignedValue(-1)}>{signedUsdt(-Math.abs(Number(result.commission)))}</FinancialToneText>
+                            {result.funding_included === true ? <> · 资金费 <FinancialToneText tone={financialToneForSignedValue(result.funding)}>{signedUsdt(result.funding)}</FinancialToneText></> : ""}
                           </Typography>
                         </Box>
                         <Button size="small" variant="outlined" onClick={() => navigate(`/activations/${valueOf(review, "activation_id")}`)}>查看计划与复盘</Button>
@@ -3444,42 +3407,18 @@ function PlansPage() {
   const environmentScope = `${status.environment_kind}:${status.environment_id}`;
   const [activeTab, setActiveTab] = useState<"CURRENT" | "HISTORY">("CURRENT");
   const [deleteTarget, setDeleteTarget] = useState<PlanSummary | null>(null);
-  const pendingFixIdentityRef = useRef(
-    new Map<string, StableRequestIdentity>(),
-  );
   const query = useQuery({ queryKey: ["plans"], queryFn: getPlans });
+  const overviewQuery = useQuery({
+    queryKey: ["overview"],
+    queryFn: getOverview,
+    refetchInterval: 5_000,
+  });
   const activationsQuery = useQuery({
     queryKey: ["activations"],
     queryFn: getActivations,
     refetchInterval: 30_000,
   });
   const strategiesQuery = useQuery({ queryKey: ["strategies"], queryFn: getStrategies });
-  const fixMutation = useMutation({
-    mutationFn: ({
-      planId,
-      version,
-      idempotencyKey,
-    }: {
-      planId: string;
-      version: number;
-      idempotencyKey: string;
-    }) => fixPlan(planId, version, idempotencyKey),
-    onSuccess: async (_result, attempt) => {
-      pendingFixIdentityRef.current.delete(attempt.planId);
-      clearPersistentRequestIdentity(
-        `${environmentScope}:FIX_PLAN:${attempt.planId}`,
-      );
-      await queryClient.invalidateQueries({ queryKey: ["plans"] });
-    },
-    onError: (error, attempt) => {
-      if (!isUnknownMutationResult(error)) {
-        pendingFixIdentityRef.current.delete(attempt.planId);
-        clearPersistentRequestIdentity(
-          `${environmentScope}:FIX_PLAN:${attempt.planId}`,
-        );
-      }
-    },
-  });
   const deleteMutation = useMutation({
     mutationFn: (plan: PlanSummary) => deletePlan(plan.plan_id, plan.draft_version),
     onSuccess: async (_result, deletedPlan) => {
@@ -3491,6 +3430,10 @@ function PlansPage() {
     },
   });
   const plans = query.data ?? [];
+  const planEntryDiscipline = overviewQuery.data?.new_risk_discipline;
+  const planEntryDisciplineConsequence = liveReadOnly
+    ? "当前入口也处于只读公开行情模式，不能创建或保存计划；即使日后恢复可写，提交并启动仍会以服务端当前事实重新核对。"
+    : "创建入口仍可用于准备或保存草稿；提交并启动会再次核对服务端当前事实，不能借此预留或绕过新增风险容量。";
   const {
     currentActivations,
     currentPlans,
@@ -3512,22 +3455,6 @@ function PlansPage() {
     ),
     [plans],
   );
-  const confirmPlan = (plan: PlanSummary) => {
-    const requestIdentity = persistentRequestIdentity(
-      pendingFixIdentityRef.current.get(plan.plan_id) ?? null,
-      `${environmentScope}:FIX_PLAN:${plan.plan_id}`,
-      JSON.stringify({
-        planId: plan.plan_id,
-        draftVersion: plan.draft_version,
-      }),
-    );
-    pendingFixIdentityRef.current.set(plan.plan_id, requestIdentity);
-    fixMutation.mutate({
-      planId: plan.plan_id,
-      version: plan.draft_version,
-      idempotencyKey: requestIdentity.idempotencyKey,
-    });
-  };
   const renderActiveActivation = (activation: ActivationSummary) => {
     const planName = activation.plan_name?.trim()
       || `运行计划 · ${shortDigest(activation.activation_id)}`;
@@ -3697,6 +3624,15 @@ function PlansPage() {
                 </Box>
               </Box>
             )}
+            {sourcePlan && !positionDisposition ? (
+              <PlanAiReviewRecord
+                review={sourcePlan.ai_review}
+                reviewRef={sourcePlan.ai_review_ref}
+                required={Boolean(sourcePlan.ai_review_ref)}
+                compact
+                sx={{ mt: 1.25 }}
+              />
+            ) : null}
             {isPaused && (
               <Typography variant="body2" color="warning.main" sx={{ mt: 1 }}>
                 执行器连接中断后，新的入场已暂停；现有止损、止盈和退出不受影响。可在详情中恢复。
@@ -3735,28 +3671,29 @@ function PlansPage() {
       value: formatPlanKeyParameter(definition, planParameters[definition.parameter_key]),
     })) ?? [];
     const previousProductBuild = Boolean(
-      plan.plan_version_id && plan.product_build_consistent === false,
+      plan.status !== "DRAFT" && plan.product_build_consistent === false,
     );
     const runtimeIncompatible = plan.runtime_compatible === false;
-    const expired = Boolean(plan.fixed_valid_until && Date.parse(plan.fixed_valid_until) <= Date.now());
-    const latestActivation = plan.plan_version_id
-      ? latestActivationMap.get(plan.plan_version_id)
-      : undefined;
-    const completedActivation = latestActivation?.lifecycle === "COMPLETED";
-    const unavailable = runtimeIncompatible || (expired && !completedActivation);
-    const historical = Boolean(
-      plan.plan_version_id
-      && (runtimeIncompatible || expired || completedActivation),
+    const expired = Boolean(
+      plan.status !== "DRAFT"
+      && plan.valid_until
+      && Date.parse(plan.valid_until) <= Date.now(),
     );
-    const planState = completedActivation
-      ? "计划已结束"
-      : runtimeIncompatible
-        ? "当前运行不兼容"
-        : expired
-        ? "计划已过期"
-        : plan.plan_version_id
-          ? "已确认计划"
-          : "可编辑草稿";
+    const latestActivation = plan.activation_id
+      ? (activationsQuery.data ?? []).find(
+        (activation) => activation.activation_id === plan.activation_id,
+      )
+      : plan.plan_version_id
+        ? latestActivationMap.get(plan.plan_version_id)
+        : undefined;
+    const completedActivation = plan.status === "ENDED";
+    const unavailable = runtimeIncompatible || (expired && !completedActivation);
+    const historical = plan.status === "ENDED";
+    const planState = plan.status === "DRAFT"
+      ? "草稿"
+      : plan.status === "RUNNING"
+        ? "运行中"
+        : "已结束";
     const planName = plan.plan_name?.trim() || `未命名计划 · ${shortDigest(plan.plan_id)}`;
     const creatorLabel = plan.creator_kind === "AI"
       ? "AI 创建"
@@ -3768,8 +3705,8 @@ function PlansPage() {
       : "创建时间未知";
     const detailPath = latestActivation
       ? `/activations/${latestActivation.activation_id}`
-      : plan.plan_version_id
-        ? `/plans/${plan.plan_version_id}/activate`
+      : plan.activation_id
+        ? `/activations/${plan.activation_id}`
         : `/plans/${plan.plan_id}/edit`;
     const tradeResult = recordOf(latestActivation?.trade_result);
     const primaryResult = latestActivation?.primary_result ?? "";
@@ -3782,7 +3719,7 @@ function PlansPage() {
       : resultAvailable ? String(netPnl) : null;
     const closureReason = latestActivation
       ? activationSummaryCloseReason(recordOf(latestActivation))
-      : "尚未运行";
+      : completedActivation ? "结束详情待读取" : "尚未运行";
     const orderIntent = positionAlignmentIntent(positionAlignment)
       ?? orderScheduleIntent(
         plan.order_schedule_spec,
@@ -3826,7 +3763,7 @@ function PlansPage() {
           <Typography variant="body2" color="text.secondary">
             {positionDisposition
               ? positionAlignmentOperationLabel(positionAlignment)
-              : directExecution ? DIRECT_EXECUTION_LABEL : strategy?.display_name ?? plan.strategy_id} · <Box component="span" className="mono">{plan.instrument_ref}</Box> · <MarketToneText tone={marketToneForDirection(plan.direction)}>{plan.direction === "LONG" ? "做多" : "做空"}</MarketToneText> · {plan.plan_version_id ? "已确认" : `草稿 v${plan.draft_version}`}
+              : directExecution ? DIRECT_EXECUTION_LABEL : strategy?.display_name ?? plan.strategy_id} · <Box component="span" className="mono">{plan.instrument_ref}</Box> · <MarketToneText tone={marketToneForDirection(plan.direction)}>{plan.direction === "LONG" ? "做多" : "做空"}</MarketToneText> · {plan.status === "DRAFT" ? `草稿 v${plan.draft_version}` : plan.status === "RUNNING" ? "运行中" : "已结束"}
           </Typography>
           <Typography variant="body2" sx={{ mt: .75, fontWeight: 700 }}>
             {orderIntent ?? "订单意图不可读"}
@@ -3837,7 +3774,7 @@ function PlansPage() {
             最终结果{" "}
             {finalResult === null
               ? completedActivation ? "待核对" : "尚未结束"
-              : <MarketToneText tone={marketToneForSignedValue(finalResult)}><Box component="span" className="mono" sx={{ fontWeight: 750 }}>{signedSettledUsdt(primaryResult === "NO_ACTION" ? "0" : tradeResult.net_pnl)}</Box></MarketToneText>}
+              : <FinancialToneText tone={financialToneForSignedValue(finalResult)}><Box component="span" className="mono" sx={{ fontWeight: 750 }}>{signedSettledUsdt(primaryResult === "NO_ACTION" ? "0" : tradeResult.net_pnl)}</Box></FinancialToneText>}
             {" · "}
             {closureReason}
           </Typography>
@@ -3845,6 +3782,15 @@ function PlansPage() {
             {creatorLabel} · {creationTime}
             {previousProductBuild && plan.runtime_compatible === true ? " · 较早构建确认，当前运行兼容" : ""}
           </Typography>
+          {plan.status !== "DRAFT" && !positionDisposition ? (
+            <PlanAiReviewRecord
+              review={plan.ai_review}
+              reviewRef={plan.ai_review_ref}
+              required={Boolean(plan.ai_review_ref)}
+              compact
+              sx={{ mt: 1 }}
+            />
+          ) : null}
           {runtimeIncompatible && <Typography variant="body2" color="warning.main" sx={{ mt: 1 }}>
             {planRuntimeIncompatibilityLabels[plan.runtime_incompatibility_reason ?? ""] ?? "当前运行时无法安全消费该计划"}；仍可查看原计划或沿用参数新建。
           </Typography>}
@@ -3866,10 +3812,9 @@ function PlansPage() {
             sx={{ justifyContent: "flex-end", "& > *": { minWidth: 0 } }}
           >
             <Button variant="outlined" onClick={openDetails}>查看详情</Button>
-            {!plan.plan_version_id && <Button variant="outlined" color="error" disabled={liveReadOnly || deleteMutation.isPending} onClick={() => { deleteMutation.reset(); setDeleteTarget(plan); }}>删除草稿</Button>}
-            {!plan.plan_version_id && <Button variant="contained" disabled={liveReadOnly || fixMutation.isPending} onClick={() => confirmPlan(plan)}>确认计划</Button>}
-            {plan.plan_version_id && <Button variant="outlined" disabled={liveReadOnly} onClick={() => navigate(`/plans/new?copyFrom=${encodeURIComponent(plan.plan_id)}`)}>沿用参数新建</Button>}
-            {plan.plan_version_id && !unavailable && !completedActivation && <Button variant="contained" disabled={liveReadOnly} onClick={() => navigate(`/plans/${plan.plan_version_id}/activate`)}>{positionDisposition ? "启动处置计划" : directExecution ? "启动订单计划" : "启动策略"}</Button>}
+            {plan.status === "DRAFT" && <Button variant="outlined" disabled={liveReadOnly} onClick={() => navigate(`/plans/${plan.plan_id}/edit`)}>编辑草稿</Button>}
+            {plan.status === "DRAFT" && <Button variant="outlined" color="error" disabled={liveReadOnly || deleteMutation.isPending} onClick={() => { deleteMutation.reset(); setDeleteTarget(plan); }}>删除草稿</Button>}
+            {plan.status !== "DRAFT" && <Button variant="outlined" disabled={liveReadOnly} onClick={() => navigate(`/plans/new?copyFrom=${encodeURIComponent(plan.plan_id)}`)}>沿用参数新建</Button>}
           </Stack>
         </Stack>
       </Box>
@@ -3964,6 +3909,7 @@ function PlansPage() {
             variant="outlined"
             onClick={() => {
               void query.refetch();
+              void overviewQuery.refetch();
               void activationsQuery.refetch();
               void strategiesQuery.refetch();
             }}
@@ -3974,11 +3920,23 @@ function PlansPage() {
       </Stack>
       {liveReadOnly && (
         <Alert severity="info" variant="outlined" sx={{ mb: 2 }}>
-          当前实盘入口为只读公开行情模式；计划事实仅供查看，创建、修改、确认、启动和控制均已关闭。
+          当前实盘入口为只读公开行情模式；计划事实仅供查看，创建、修改、提交并启动和控制均已关闭。
         </Alert>
       )}
+      {overviewQuery.isError && (
+        <Alert severity="warning" variant="outlined" sx={{ mb: 2 }}>
+          账户级新增风险状态当前不可读取。创建入口不能据此放行；恢复完整账户快照后，仍须以提交并启动时的服务端当前事实为准。
+        </Alert>
+      )}
+      {planEntryDiscipline && !planEntryDiscipline.new_risk_allowed && (
+        <Box sx={{ mb: 2 }}>
+          <NewRiskDisciplineBlockNotice
+            discipline={planEntryDiscipline}
+            consequence={planEntryDisciplineConsequence}
+          />
+        </Box>
+      )}
       {strategiesQuery.isError && <Alert severity="warning" sx={{ mb: 2 }}>策略定义当前不可读；计划身份与基础配置仍按计划事实显示，关键参数不做猜测。</Alert>}
-      {fixMutation.isError && <Alert severity="warning" sx={{ mb: 2 }}>确认失败：{planConfirmationError(fixMutation.error)}。</Alert>}
       <Dialog
         open={Boolean(deleteTarget)}
         onClose={() => { if (!deleteMutation.isPending) { setDeleteTarget(null); deleteMutation.reset(); } }}
@@ -4013,7 +3971,10 @@ function PlansPage() {
   );
 }
 
-function PlanActivationRoute() {
+// Retained only to read historical implementation data during a rolling
+// upgrade.  It is deliberately not routed: plans no longer have a separate
+// fixed-but-not-running stage.
+export function LegacyPlanActivationRoute() {
   const { planVersionId = "" } = useParams();
   const navigate = useNavigate();
   const { status } = useOutletContext<FrameContext>();
@@ -4042,6 +4003,13 @@ function PlanActivationRoute() {
   );
   const orderScheduleSpec = recordOf(preview.data?.order_schedule_spec);
   const orderScheduleSnapshot = recordOf(preview.data?.order_schedule_snapshot);
+  const directProjectedMaxLoss = directExecution
+    ? valueOf(
+      recordOf(orderScheduleSnapshot.full_fill_protection_estimate),
+      "maximum_projected_loss",
+      "",
+    )
+    : "";
   const positionAlignment = recordOf(preview.data?.position_alignment);
   const positionDisposition = Object.keys(positionAlignment).length > 0;
   const positionAlignmentReady = preview.data?.position_alignment_ready !== false;
@@ -4071,7 +4039,7 @@ function PlanActivationRoute() {
     const raw = newRiskDiscipline[key];
     return raw === null || raw === undefined
       ? "未知"
-      : `${quoteAmount(String(raw))} USDT`;
+      : `${quoteCurrencyAmount(String(raw))} USDT`;
   };
   const orderInstrumentRules = recordOf(orderScheduleSnapshot.instrument_rules);
   const orderVenuePolicy = recordOf(orderScheduleSpec.venue_policy);
@@ -4183,12 +4151,21 @@ function PlanActivationRoute() {
         pendingActivationIdentityRef.current = null;
         clearPersistentRequestIdentity(activationIdentityScope);
       }
-      if (error instanceof ApiFailure && error.code === "ACTIVATION_PREVIEW_STALE") {
+      if (
+        error instanceof ApiFailure
+        && (
+          error.code === "ACTIVATION_PREVIEW_STALE"
+          || newRiskDisciplineBlockerCodesFromFailureCode(error.code).length > 0
+        )
+      ) {
         void preview.refetch();
         void market.refetch();
       }
     },
   });
+  const mutationNewRiskDisciplineBlockers = mutation.error instanceof ApiFailure
+    ? newRiskDisciplineBlockerCodesFromFailureCode(mutation.error.code)
+    : [];
   const marketSourceMismatch = Boolean(
     market.data
     && !isMarketSourceForEnvironment(
@@ -4236,13 +4213,13 @@ function PlanActivationRoute() {
   return (
     <Box sx={{ width: "min(920px, calc(100% - clamp(32px, 4vw, 48px)))", mx: "auto", py: { xs: 2.5, sm: 3 } }}>
       <PageHeader
-        eyebrow="确认启动计划"
+        eyebrow="旧版启动入口"
         title={planName || "未命名计划"}
         description={positionDisposition
-          ? "该计划只处置已固定的外部持仓基线，并形成精确的 reduce-only 责任。启动时会重读完整账户快照；既有入场不会被记作 Halpha 成交或策略盈亏。"
+          ? "该计划只处置保存的外部持仓基线，并形成精确的 reduce-only 责任。启动时会重读完整账户快照；既有入场不会被记作 Halpha 成交或策略盈亏。"
           : directExecution
-          ? "交易金额和订单计划已固定。启动只让计划进入可运行状态；随后可按固定条件形成入场动作，仍经过当前事实、CAP 与 EXE。启动回执不表示已提交或成交。"
-          : "交易金额已在策略计划中确定。这里仅确认启动固定计划，不再进行资金授权，也不会立即向 Binance 下单。"}
+          ? "交易金额和订单计划已保存。此旧入口已不用于正常流程；计划应从草稿页提交并启动，并继续经过当前事实、CAP 与 EXE。"
+          : "此旧入口已不用于正常流程；计划应从草稿页提交并启动，不进行第二次资金授权，也不会立即向 Binance 下单。"}
       />
       {preview.isPending && <LinearProgress aria-label="正在读取激活复核" />}
       {preview.isError && <Alert severity="error">当前复核事实不可用，不能启动计划。</Alert>}
@@ -4251,7 +4228,7 @@ function PlanActivationRoute() {
           { label: "账户", value: valueOf(preview.data, "account_ref") },
           { label: "交易对象 / 方向", value: `${valueOf(preview.data, "instrument_ref")} / ${translatedLabel(directionLabels, valueOf(preview.data, "direction"))}`, tone: marketToneForDirection(valueOf(preview.data, "direction")) },
           { label: directExecution ? "决策依据" : "策略", value: positionDisposition ? positionAlignmentOperationLabel(positionAlignment) : directExecution ? DIRECT_EXECUTION_LABEL : valueOf(preview.data, "strategy_ref"), note: directExecution ? decisionBasisRef : undefined },
-          { label: positionDisposition ? "处置边界" : "交易金额", value: `${quoteAmount(valueOf(preview.data, "trade_amount"))} USDT` },
+          { label: positionDisposition ? "处置边界" : "交易金额", value: `${quoteCurrencyAmount(valueOf(preview.data, "trade_amount"))} USDT` },
           { label: "有效期", value: formatUserVisibleTime(valueOf(preview.data, "valid_until")) },
           ...(positionDisposition ? [
             { label: "账户快照", value: formatUserVisibleTime(valueOf(positionAlignment, "fact_cutoff")), note: shortDigest(valueOf(positionAlignment, "snapshot_ref")) },
@@ -4270,12 +4247,22 @@ function PlanActivationRoute() {
             { label: "退出", value: `最大 ${valueOf(parameters, "max_hold_bars_15m")} × 15m / TP1 ${Number(valueOf(parameters, "take_profit_1_fraction")) * 100}% @ ${valueOf(parameters, "take_profit_1_r")}R / TP2 @ ${valueOf(parameters, "take_profit_2_r")}R` },
           ]),
           ...(!positionDisposition ? [
-            { label: "单计划风险上限", value: riskDisciplineAmount("max_plan_loss"), note: `本计划申请 ${quoteAmount(valueOf(recordOf(preview.data?.limits), "max_allowed_loss", "0"))} USDT` },
+            {
+              label: "单计划风险上限",
+              value: riskDisciplineAmount("max_plan_loss"),
+              note: "纪律允许的单计划最大损失。",
+            },
+            ...(directExecution && directProjectedMaxLoss ? [{
+              label: "预计最大止损损失",
+              value: `-${quoteCurrencyAmount(directProjectedMaxLoss)} USDT`,
+              note: "按服务端归一化订单、固定止损距离及冻结手续费估算。",
+              tone: "loss" as const,
+            }] : []),
             { label: "组合风险容量", value: `${riskDisciplineAmount("open_risk_after_proposal")} / ${riskDisciplineAmount("open_risk_limit")}`, note: `已启用 ${valueOf(newRiskDiscipline, "open_new_risk_activation_count", "0")} 份新增风险计划；不按订单数限制` },
             { label: "总敞口", value: `${riskDisciplineAmount("gross_exposure_after_proposal")} / ${riskDisciplineAmount("gross_exposure_limit")}`, note: `单品种 ${riskDisciplineAmount("instrument_exposure_after_proposal")} · 相关簇 ${riskDisciplineAmount("correlated_exposure_after_proposal")}` },
             { label: "亏损与回撤停止", value: `日 ${riskDisciplineAmount("daily_loss_measure")} / ${riskDisciplineAmount("daily_loss_limit")}`, note: `周 ${riskDisciplineAmount("weekly_loss_measure")} / ${riskDisciplineAmount("weekly_loss_limit")} · 回撤 ${valueOf(newRiskDiscipline, "rolling_drawdown_fraction", "未知")}` },
           ] : []),
-          ...(liveProfitQualificationRequired && liveProfitQualification ? [
+          ...(status.environment_kind !== "DEMO" && liveProfitQualificationRequired && liveProfitQualification ? [
             {
               label: "Demo 证据准入",
               value: liveProfitPresentation?.label ?? liveProfitQualification.status,
@@ -4309,7 +4296,14 @@ function PlanActivationRoute() {
           ...(liveWrite ? [
             { label: "交易所变更请求", value: valueOf(preview.data, "configured_runtime_real_write_gate") },
           ] : []),
-        ]} />
+          ]} />
+        {!positionDisposition ? (
+          <PlanAiReviewRecord
+            review={preview.data.ai_review}
+            required
+            defaultOpen
+          />
+        ) : null}
         {directExecution && !positionDisposition && hasCompiledSchedule && <Box component="section" sx={{ mt: 3 }}>
           <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ justifyContent: "space-between", alignItems: { xs: "flex-start", sm: "baseline" }, mb: 1.5 }}>
             <Box>
@@ -4326,7 +4320,7 @@ function PlanActivationRoute() {
             { label: "提交方式", value: scheduleSubmissionSummary(orderScheduleSnapshot), note: orderedScheduleLegs.length > 0 ? `首档为计划档 ${Number(orderedScheduleLegs[0]?.leg_index ?? 0) + 1}` : "没有可提交档位" },
             { label: "动态管理", value: orderDynamicSummary(orderScheduleSnapshot) },
             { label: "允许动作", value: allowedActions.map((item) => actionProfileLabels[item] ?? item).join("、") || "不可读" },
-            { label: "服务端归一化", value: `${quoteAmount(valueOf(orderScheduleSnapshot, "effective_total_notional", "0"))} USDT`, note: `${orderedScheduleLegs.length} 档 · ${valueOf(orderInstrumentRules, "source", "规则来源未知")}` },
+            { label: "服务端归一化", value: `${quoteCurrencyAmount(valueOf(orderScheduleSnapshot, "effective_total_notional", "0"))} USDT`, note: `${orderedScheduleLegs.length} 档 · ${valueOf(orderInstrumentRules, "source", "规则来源未知")}` },
           ]} />
           <TableContainer sx={{ mt: 1.5, border: 1, borderColor: "divider", borderRadius: 1.5 }}>
             <Table size="small" aria-label="按真实提交顺序排列的订单档位">
@@ -4361,8 +4355,8 @@ function PlanActivationRoute() {
                 {positionDisposition
                   ? "公开行情仅用于辅助观察；能否启动由最新完整账户快照、精确持仓基线、未结委托和责任冲突共同决定。"
                   : directExecution
-                  ? "只读公开行情用于启动前核对固定价格和当前价差；直接执行仍按已固定条件、当前事实与 CAP / EXE 检查处理。"
-                  : "只读公开行情用于决定是否启动；策略仍只按固定参数和闭合 K 线执行。"}
+                  ? "只读公开行情用于启动前核对计划价格和当前价差；直接执行仍按运行快照条件、当前事实与 CAP / EXE 检查处理。"
+                  : "只读公开行情用于决定是否启动；策略仍只按运行快照参数和闭合 K 线执行。"}
               </Typography>
             </Box>
             <Button variant="outlined" onClick={() => market.refetch()} disabled={market.isFetching}>{market.isFetching ? "正在刷新…" : "刷新行情"}</Button>
@@ -4384,10 +4378,8 @@ function PlanActivationRoute() {
             { label: "买一 / 卖一", value: `${marketPrice(currentMarket.bid_price)} / ${marketPrice(currentMarket.ask_price)} USDT` },
             { label: "买卖价差", value: `${marketPrice(currentSpread)} USDT`, note: Number.isFinite(currentSpreadBps) ? `${currentSpreadBps.toFixed(2)} bps` : undefined },
             { label: "当前资金费率", value: currentFunding
-              ? currentFundingRatePercent(currentFunding.funding_rate)
-              : "实时数据不可用", note: currentFunding
-                ? currentFundingDirectionText(currentFunding.funding_rate, direction)
-                : undefined },
+              ? formatFundingRatePercent(currentFunding.funding_rate)
+              : "实时数据不可用" },
             { label: "下次资金结算", value: currentFunding
               ? formatUserVisibleTime(currentFunding.next_funding_at)
               : "未知", note: "实际结算取决于届时费率和是否仍有持仓" },
@@ -4412,11 +4404,15 @@ function PlanActivationRoute() {
         </Alert>
       )}
       {preview.data && !positionDisposition && !newRiskDisciplineAllowed && (
-        <Alert severity={valueOf(newRiskDiscipline, "status") === "UNKNOWN" ? "warning" : "error"} sx={{ mt: 2 }}>
-          新增风险纪律未通过：{newRiskDisciplineBlockers.map((code) => newRiskDisciplineBlockerLabels[code] ?? code).join("；") || "当前事实无法确认"}。已有计划的保护、撤单、减仓、退出和接管不受影响。
-        </Alert>
+        <Box sx={{ mt: 2 }}>
+          <NewRiskDisciplineBlockNotice
+            discipline={preview.data.new_risk_discipline}
+            blockerCodes={newRiskDisciplineBlockers}
+            consequence="当前计划不能启动；页面不会绕过服务端核对，也不会创建交易所订单。已有计划的保护、撤单、减仓、退出和接管不受影响。"
+          />
+        </Box>
       )}
-      {preview.data && liveProfitQualificationRequired && liveProfitQualification && (
+      {preview.data && status.environment_kind !== "DEMO" && liveProfitQualificationRequired && liveProfitQualification && (
         <Alert
           severity={liveProfitPresentation?.severity ?? "warning"}
           variant="outlined"
@@ -4428,10 +4424,10 @@ function PlanActivationRoute() {
             : `${liveProfitQualificationBlockers.map((code) => liveProfitQualificationBlockerLabels[code] ?? code).join("；") || "当前证据无法确认"}。请在 Demo 重新形成证据包，并由所有者固定仓库外绝对路径和摘要；不能在 Live 页面选择任意文件绕过。`}
         </Alert>
       )}
-      {preview.data && directExecution && !positionDisposition && !directScheduleReady && <Alert severity="error" sx={{ mt: 2 }}>服务端订单计划预览无效或缺少完整摘要，当前不能启动。请返回计划编辑页修正后重新确认。</Alert>}
-      {preview.data && !planNotExpired && <Alert severity="warning" sx={{ mt: 2 }}>计划有效期已经结束，不能再启动；请基于当前事实创建并确认新计划。</Alert>}
+      {preview.data && directExecution && !positionDisposition && !directScheduleReady && <Alert severity="error" sx={{ mt: 2 }}>服务端订单计划预览无效或缺少完整摘要，当前不能启动。请返回计划编辑页修正后重新提交并启动。</Alert>}
+      {preview.data && !planNotExpired && <Alert severity="warning" sx={{ mt: 2 }}>计划有效期已经结束，不能再启动；请基于当前事实创建、审核并提交并启动新计划。</Alert>}
       {preview.data && !currentProductVersion && planRuntimeCompatible && <Alert severity="info" variant="outlined" sx={{ mt: 2 }}>
-        该计划由较早构建确认；固定决策、订单规则与当前运行时已重新校验兼容。启动会形成新的运行快照，不会改写原计划。
+        该计划由较早构建确认；运行快照中的决策和订单规则已重新校验兼容。启动会形成新的运行快照，不会改写原计划。
       </Alert>}
       {preview.data && !planRuntimeCompatible && <Alert severity="error" sx={{ mt: 2 }}>
         {planRuntimeIncompatibilityLabels[runtimeIncompatibilityReason] ?? "当前运行时无法安全消费该计划"}；仍可查看原计划或沿用参数新建。
@@ -4445,7 +4441,17 @@ function PlanActivationRoute() {
             : "真实账户类型不可识别；当前不得启动。"}
       </Alert>}
       {liveWrite && !realAccountReady && <Alert severity="warning" sx={{ mt: 2 }}>当前 App、Executor、实盘变更门或必要证据输入尚未全部一致；当前不能启动真实账户计划。</Alert>}
-      {mutation.isError && <Alert severity="error" sx={{ mt: 2 }}>
+      {mutation.isError && mutationNewRiskDisciplineBlockers.length > 0 && (
+        <Box sx={{ mt: 2 }}>
+          <NewRiskDisciplineBlockNotice
+            discipline={preview.data?.new_risk_discipline}
+            blockerCodes={mutationNewRiskDisciplineBlockers}
+            title="启动被新增风险纪律拒绝"
+            consequence="服务端未接受本次启动；请等待页面刷新后的当前事实，再重新确认。不会创建替代激活或交易所订单。"
+          />
+        </Box>
+      )}
+      {mutation.isError && mutationNewRiskDisciplineBlockers.length === 0 && <Alert severity="error" sx={{ mt: 2 }}>
         {mutation.error instanceof ApiFailure && mutation.error.code === "ACTIVATION_PREVIEW_STALE"
           ? "启动复核已过期，页面正在刷新服务端订单快照与行情；刷新完成后请重新确认启动。"
           : isUnknownMutationResult(mutation.error)
@@ -5376,7 +5382,7 @@ function ActivationRoute() {
         >
           <Typography component="h2" variant="subtitle2">决策记录</Typography>
           <Typography variant="caption" color="text.secondary">
-            随固定计划版本保存；仅用于执行前核对与事后复盘，不构成触发或下单条件。
+            随运行快照保存；仅用于执行前核对与事后复盘，不构成触发或下单条件。
           </Typography>
         </Stack>
         <Box sx={{
@@ -5393,6 +5399,14 @@ function ActivationRoute() {
           </Box>)}
         </Box>
       </Box>}
+      {!positionDisposition ? (
+        <PlanAiReviewRecord
+          review={query.data?.ai_review}
+          reviewRef={query.data?.ai_review_ref}
+          required={Boolean(query.data?.ai_review_ref)}
+          sx={{ mb: 2 }}
+        />
+      ) : null}
       {planDecisionIntent === "VALIDATION" && <Alert severity="info" variant="outlined" sx={{ mb: 2 }}>
         本计划在交易前已记录为机制 / 软件验证。实际盈亏仍计入账户结果；若形成交易且工具问题未实质影响结果，复盘应归为“验证性交易”，不能因盈利改成策略可用样本。未成交则归为“未形成交易”。
       </Alert>}
@@ -5764,7 +5778,7 @@ function ActivationRoute() {
                   : signedUsdt(floatingPnl),
                 tone: terminal || positionFactsAwaitingSameCutoff || floatingPnl === null
                   ? undefined
-                  : marketToneForSignedValue(floatingPnl),
+                  : financialToneForSignedValue(floatingPnl),
               },
               {
                 label: terminalResultUnknown
@@ -5788,16 +5802,20 @@ function ActivationRoute() {
                   : terminal
                   ? terminalNoFill
                     ? undefined
-                    : closedNetAvailable ? marketToneForSignedValue(tradeResult.net_pnl) : undefined
+                    : closedNetAvailable ? financialToneForSignedValue(tradeResult.net_pnl) : undefined
                   : positionFactsAwaitingSameCutoff || attributedMarkedNet === null
                     ? undefined
-                    : marketToneForSignedValue(attributedMarkedNet),
+                    : financialToneForSignedValue(attributedMarkedNet),
               },
             ]).map((item) => (
               <Box key={item.label} sx={{ p: 1.25, borderRadius: 1, bgcolor: "action.hover", minWidth: 0 }}>
                 <Typography variant="caption" color="text.secondary">{item.label}</Typography>
                 <Typography sx={{ fontWeight: 780, overflowWrap: "anywhere" }}>
-                  {item.tone ? <MarketToneText tone={item.tone}>{item.value}</MarketToneText> : item.value}
+                  {item.tone === "up" || item.tone === "down"
+                    ? <MarketToneText tone={item.tone}>{item.value}</MarketToneText>
+                    : item.tone
+                      ? <FinancialToneText tone={item.tone}>{item.value}</FinancialToneText>
+                      : item.value}
                 </Typography>
               </Box>
             ))}
@@ -5807,7 +5825,7 @@ function ActivationRoute() {
                 <Typography component="h2" variant="subtitle2">保护与退出</Typography>
               <Tooltip
                 arrow
-                title="自动止盈和时间退出只有在计划固定时已配置才会执行；“退出订单计划”可从下方稳定控制手动发起，并且只处理本计划可归属持仓与订单。"
+                title="自动止盈和时间退出只有在运行快照中已配置才会执行；“退出订单计划”可从下方稳定控制手动发起，并且只处理本计划可归属持仓与订单。"
               >
                 <IconButton size="small" aria-label="保护与退出路径说明">
                   <InfoOutlined fontSize="small" />
@@ -6001,7 +6019,7 @@ function ActivationRoute() {
         { label: positionDisposition ? "处置边界" : "计划交易金额", value: `${quoteCurrencyAmount(valueOf(capital, "max_notional"))} USDT` },
         ...(!directExecution ? [{
           label: "策略建仓计算参数：允许损失",
-          value: `${quoteAmount(valueOf(capital, "max_allowed_loss"))} USDT`,
+          value: `${quoteCurrencyAmount(valueOf(capital, "max_allowed_loss"))} USDT`,
           note: "仅供策略计算建议仓位；不是止损、最大亏损保证或运行中盈亏熔断",
         }] : []),
         ...(!positionDisposition && fillCount > 0 ? [{
@@ -6012,16 +6030,16 @@ function ActivationRoute() {
               ? "未知"
               : signedUsdt(immediateExitNetWithFunding),
           tone: terminal
-            ? closedNetAvailable ? marketToneForSignedValue(tradeResult.net_pnl) : undefined
+            ? closedNetAvailable ? financialToneForSignedValue(tradeResult.net_pnl) : undefined
             : immediateExitNetWithFunding === null
               ? undefined
-              : marketToneForSignedValue(immediateExitNetWithFunding),
+              : financialToneForSignedValue(immediateExitNetWithFunding),
           note: terminal
             ? tradeResult.funding_included === true
               ? "按本计划成交价差、已归属手续费与资金费计算"
               : "按本计划成交价差与已归属手续费计算；尚无资金费记录"
             : immediateExitEstimate
-              ? `按${positionQuantity > 0 ? "买一" : "卖一"} ${marketPrice(String(immediateExitEstimate.exitPrice))} USDT，扣除预计退出手续费 ${immediateExitEstimate.exitCommission.toFixed(8)} USDT，${attributedFundingConfirmed ? "并计入已归属资金费" : "尚无可确认资金费记录，暂不计资金费"}；不含滑点`
+              ? `按${positionQuantity > 0 ? "买一" : "卖一"} ${marketPrice(String(immediateExitEstimate.exitPrice))} USDT，扣除预计退出手续费 ${quoteCurrencyAmount(immediateExitEstimate.exitCommission)} USDT，${attributedFundingConfirmed ? "并计入已归属资金费" : "尚无可确认资金费记录，暂不计资金费"}；不含滑点`
               : "缺少当前买卖价或入场时冻结的手续费率，不能可靠估算",
         }] : []),
         ...(terminalNoFill ? [{
@@ -6036,7 +6054,7 @@ function ActivationRoute() {
         }] : []),
         {
           label: "已归属手续费",
-          value: `${quoteAmount(valueOf(tradeResult, "commission", "0"))} USDT`,
+          value: `${quoteCurrencyAmount(valueOf(tradeResult, "commission", "0"))} USDT`,
           note: terminalResultUnknown
             ? "尚无已确认成交；订单结果仍待核对"
             : tradeResult.commission_complete === true
@@ -6098,18 +6116,18 @@ function ActivationRoute() {
         <Stack direction={{ xs: "column", sm: "row" }} spacing={1.5} sx={{ justifyContent: "space-between", alignItems: { xs: "stretch", sm: "center" }, mb: 2 }}>
           <Box>
             <Typography variant="h2">等待直接执行条件</Typography>
-            <Typography color="text.secondary" variant="body2" sx={{ mt: .75 }}>本计划不等待策略信号；Executor 按已固定条件、订单档位和当前事实形成动作，并继续经过 CAP 与 EXE。</Typography>
+            <Typography color="text.secondary" variant="body2" sx={{ mt: .75 }}>本计划不等待策略信号；Executor 按运行快照条件、订单档位和当前事实形成动作，并继续经过 CAP 与 EXE。</Typography>
           </Box>
           <Button variant="outlined" onClick={() => market.refetch()} disabled={market.isFetching}>{market.isFetching ? "正在刷新…" : "刷新行情"}</Button>
         </Stack>
         {market.isPending && <LinearProgress aria-label="正在读取激活行情" />}
         {market.isError && currentMarket && <Alert severity="warning" variant="outlined">行情刷新失败；以下保留上次成功行情（截止 {formatUserVisibleTime(currentMarket.source_cutoff)}），可能已经过期，仅用于定位。Executor 不会用页面缓存代替当前事实。</Alert>}
-        {market.isError && !currentMarket && <Alert severity="warning" variant="outlined">当前行情不可用，页面无法定位相对于固定档位的市场位置；Executor 不会因此放宽事实和风险检查。</Alert>}
+        {market.isError && !currentMarket && <Alert severity="warning" variant="outlined">当前行情不可用，页面无法定位相对于运行快照档位的市场位置；Executor 不会因此放宽事实和风险检查。</Alert>}
         {latestNoActionText && <Alert severity={directPreSubmitBlocked ? "warning" : "info"} variant="outlined" sx={{ mb: 2 }}>
           最近一次入场判断没有形成下单动作：{latestNoActionText}（{formatUserVisibleTime(valueOf(latestNoActionEvent, "at"))}）。
           {directPreSubmitBlocked
             ? " Executor 保持失败关闭并等待前置条件恢复，不会绕过校验。"
-            : " 计划仍在有效期内等待固定条件。"}
+            : " 计划仍在有效期内等待运行快照条件。"}
         </Alert>}
         {visibleReferencePrice && <FactGrid facts={[
           { label: "订单计划", value: orderScheduleSummary(orderSchedule) },
@@ -6124,13 +6142,13 @@ function ActivationRoute() {
         <Stack direction={{ xs: "column", sm: "row" }} spacing={1.5} sx={{ justifyContent: "space-between", alignItems: { xs: "stretch", sm: "center" }, mb: 2 }}>
           <Box>
             <Typography variant="h2">{demoImmediateEntry ? "等待验证入场" : "等待入场"}</Typography>
-            <Typography color="text.secondary" variant="body2" sx={{ mt: .75 }}>公开行情每 15 秒更新；策略仍只按闭合 K 线和固定参数判断。</Typography>
+            <Typography color="text.secondary" variant="body2" sx={{ mt: .75 }}>公开行情每 15 秒更新；策略仍只按闭合 K 线和运行快照参数判断。</Typography>
           </Box>
           <Button variant="outlined" onClick={() => market.refetch()} disabled={market.isFetching}>{market.isFetching ? "正在刷新…" : "刷新行情"}</Button>
         </Stack>
         {market.isPending && <LinearProgress aria-label="正在读取激活行情" />}
-        {market.isError && currentMarket && <Alert severity="warning" variant="outlined">行情刷新失败；以下保留上次成功行情（截止 {formatUserVisibleTime(currentMarket.source_cutoff)}），可能已经过期，仅用于定位。Executor 继续按框架收到的当前市场事件和固定规则运行。</Alert>}
-        {market.isError && !currentMarket && <Alert severity="warning" variant="outlined">当前行情不可用，页面不能判断距离入场条件还有多远；Executor 不会因此放宽固定规则。</Alert>}
+        {market.isError && currentMarket && <Alert severity="warning" variant="outlined">行情刷新失败；以下保留上次成功行情（截止 {formatUserVisibleTime(currentMarket.source_cutoff)}），可能已经过期，仅用于定位。Executor 继续按框架收到的当前市场事件和运行快照规则运行。</Alert>}
+        {market.isError && !currentMarket && <Alert severity="warning" variant="outlined">当前行情不可用，页面不能判断距离入场条件还有多远；Executor 不会因此放宽运行快照规则。</Alert>}
         {latestNoActionText && <Alert severity="info" variant="outlined" sx={{ mb: 2 }}>
           最近一次入场意图没有下单：{latestNoActionText}（{formatUserVisibleTime(valueOf(latestNoActionEvent, "at"))}）。策略仍在有效期内等待下一次满足条件的闭合 K 线。
         </Alert>}
@@ -6649,7 +6667,7 @@ function ReviewsPage() {
                   </TableCell>
                   <TableCell className="mono" align="right">{noAction ? "不适用" : positionDisposition ? "外部基线" : finiteNumber(result.entry_notional) === null ? "未知" : usdt(result.entry_notional)}</TableCell>
                   <TableCell className="mono" align="right">
-                    {noAction ? "不适用" : positionDisposition ? "不归属" : resultAvailable ? <MarketToneText tone={marketToneForSignedValue(result.net_pnl)}>{signedUsdt(result.net_pnl)}</MarketToneText> : "未知"}
+                    {noAction ? "不适用" : positionDisposition ? "不归属" : resultAvailable ? <FinancialToneText tone={financialToneForSignedValue(result.net_pnl)}>{signedUsdt(result.net_pnl)}</FinancialToneText> : "未知"}
                     {externalAccountResult && <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>账户结果</Typography>}
                   </TableCell>
                   <TableCell className="mono" align="right">{noAction ? "不适用" : dispositionCostComplete || resultAvailable ? usdt(result.commission) : "未知"}</TableCell>
@@ -6993,6 +7011,15 @@ function ReviewDetails({
           正在查看不可变历史版本 v{valueOf(review, "review_version")}；当前版本为 v{latestReviewVersion}。历史版本不能刷新或修改。
         </Alert>}
 
+        {!embedded && !positionDisposition ? (
+          <PlanAiReviewRecord
+            review={activationQuery.data?.ai_review}
+            reviewRef={activationQuery.data?.ai_review_ref}
+            required={Boolean(activationQuery.data?.ai_review_ref)}
+            sx={{ mb: 2 }}
+          />
+        ) : null}
+
         {!embedded && <Box component="section" sx={{ ...surfaceFrameSx, p: { xs: 1.5, md: 2 }, mb: 2 }}>
           <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ justifyContent: "space-between", alignItems: { sm: "center" }, mb: 1 }}>
             <Box>
@@ -7074,8 +7101,8 @@ function ReviewDetails({
           {factIssueMessages.join("；")}。以上状态冻结于 {formatUserVisibleTime(valueOf(review, "fact_cutoff"))}，不会用 0 或推测值替代。
         </Alert>}
         <FactGrid facts={[
-          { label: externalAccountResult ? "账户净盈亏" : "净盈亏", value: positionDisposition ? "不归属" : tradeExpected && reviewClosed ? signedUsdt(reviewTradeResult.net_pnl) : tradeExpected ? "未知" : "不适用", tone: !positionDisposition && tradeExpected && reviewClosed ? marketToneForSignedValue(reviewTradeResult.net_pnl) : undefined },
-          { label: externalAccountResult ? "账户毛盈亏" : "毛盈亏", value: positionDisposition ? "不归属" : tradeExpected && reviewClosed ? signedUsdt(reviewTradeResult.gross_pnl) : tradeExpected ? "未知" : "不适用", tone: !positionDisposition && tradeExpected && reviewClosed ? marketToneForSignedValue(reviewTradeResult.gross_pnl) : undefined },
+          { label: externalAccountResult ? "账户净盈亏" : "净盈亏", value: positionDisposition ? "不归属" : tradeExpected && reviewClosed ? signedUsdt(reviewTradeResult.net_pnl) : tradeExpected ? "未知" : "不适用", tone: !positionDisposition && tradeExpected && reviewClosed ? financialToneForSignedValue(reviewTradeResult.net_pnl) : undefined },
+          { label: externalAccountResult ? "账户毛盈亏" : "毛盈亏", value: positionDisposition ? "不归属" : tradeExpected && reviewClosed ? signedUsdt(reviewTradeResult.gross_pnl) : tradeExpected ? "未知" : "不适用", tone: !positionDisposition && tradeExpected && reviewClosed ? financialToneForSignedValue(reviewTradeResult.gross_pnl) : undefined },
           { label: "手续费", value: tradeExpected && hasAttributedFills ? usdt(reviewTradeResult.commission) : tradeExpected ? "未知" : "不适用" },
           {
             label: "资金费",
@@ -7296,7 +7323,7 @@ function WorkbenchRoutes({ status }: { status: SettingsStatus }) {
             </Suspense>
           )}
         />
-        <Route path="/plans/:planVersionId/activate" element={<PlanActivationRoute />} />
+        <Route path="/plans/:planVersionId/activate" element={<Navigate to="/plans" replace />} />
         <Route path="/activations/:activationId" element={<ActivationRoute />} />
         <Route path="/reviews" element={<ReviewsPage />} />
         <Route path="/reviews/:reviewId" element={<ReviewRoute />} />

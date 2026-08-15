@@ -1,5 +1,5 @@
 export const USER_VISIBLE_TIME_ZONE = "Asia/Shanghai";
-export const USER_VISIBLE_TIME_ZONE_LABEL = "UTC+8";
+export const USER_VISIBLE_TIME_ZONE_LABEL = "";
 export const USER_VISIBLE_TIME_LOCALE = "zh-CN";
 export const MAX_TRADING_DECIMAL_FRACTION_DIGITS = 8;
 
@@ -164,9 +164,18 @@ export function tradingPrice(
   tickSize?: string | null,
 ): string {
   const precision = fractionDigitsFromIncrement(tickSize);
+  const parsed = Number(value);
+  if (precision !== null && Number.isFinite(parsed)) {
+    return new Intl.NumberFormat("en-US", {
+      minimumFractionDigits: precision,
+      maximumFractionDigits: precision,
+      useGrouping: true,
+    }).format(parsed);
+  }
   return compactDecimal(value, {
     maximumFractionDigits: precision ?? MAX_TRADING_DECIMAL_FRACTION_DIGITS,
     minimumFractionDigits: precision ?? 0,
+    truncatedMarker: "",
   });
 }
 
@@ -218,7 +227,7 @@ export function quoteCurrencyAmount(value: string | number): string {
 export function quoteCurrencyEstimate(value: string | number): string {
   return compactDecimal(value, {
     minimumFractionDigits: 2,
-    maximumFractionDigits: 6,
+    maximumFractionDigits: 2,
     truncatedMarker: "",
   });
 }
@@ -258,7 +267,8 @@ export function formatUserVisibleTime(value: string | null | undefined): string 
   const parts = userVisibleTimeFormatter.formatToParts(parsed);
   const part = (type: Intl.DateTimeFormatPartTypes): string =>
     parts.find((item) => item.type === type)?.value ?? "";
-  return `${part("year")}-${part("month")}-${part("day")} ${part("hour")}:${part("minute")}:${part("second")} ${USER_VISIBLE_TIME_ZONE_LABEL}`;
+  const timestamp = `${part("year")}-${part("month")}-${part("day")} ${part("hour")}:${part("minute")}:${part("second")}`;
+  return USER_VISIBLE_TIME_ZONE_LABEL ? `${timestamp} ${USER_VISIBLE_TIME_ZONE_LABEL}` : timestamp;
 }
 
 export function formatCompactUserVisibleTime(value: string | null | undefined): string {
@@ -291,7 +301,8 @@ export function shortDigest(value: string | null): string {
 export function marketPrice(value: string): string {
   return compactDecimal(value, {
     minimumFractionDigits: 2,
-    maximumFractionDigits: MAX_TRADING_DECIMAL_FRACTION_DIGITS,
+    maximumFractionDigits: 2,
+    truncatedMarker: "",
   });
 }
 

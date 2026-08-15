@@ -94,6 +94,24 @@ VENUE_FACT_HOT_PATH_INDEX_MIGRATION = (
     / "versions"
     / "20260803_0012_venue_fact_hot_path_indexes.py"
 )
+PLAN_AI_REVIEW_MIGRATION = (
+    ROOT
+    / "migrations"
+    / "versions"
+    / "20260813_0013_plan_ai_reviews.py"
+)
+PLAN_AI_REVIEW_CONFIGURATION_MIGRATION = (
+    ROOT
+    / "migrations"
+    / "versions"
+    / "20260813_0014_plan_ai_review_configuration.py"
+)
+ACCOUNT_OBSERVATION_FAILURE_MIGRATION = (
+    ROOT
+    / "migrations"
+    / "versions"
+    / "20260815_0015_account_observation_failures.py"
+)
 
 
 def _revision_module():
@@ -117,7 +135,10 @@ def test_migration_history_is_one_unambiguous_fresh_root() -> None:
         (item.revision, item.down_revision)
         for item in script.walk_revisions()
     ] == [
-        (HEAD_REVISION, "20260802_0011"),
+        (HEAD_REVISION, "20260813_0014"),
+        ("20260813_0014", "20260813_0013"),
+        ("20260813_0013", "20260803_0012"),
+        ("20260803_0012", "20260802_0011"),
         ("20260802_0011", "20260731_0010"),
         ("20260731_0010", "20260729_0009"),
         ("20260729_0009", "20260728_0008"),
@@ -149,6 +170,9 @@ def test_migration_history_is_one_unambiguous_fresh_root() -> None:
             RUNTIME_SCHEMA_GUARD_MIGRATION.name,
             POSITION_ALIGNMENT_MIGRATION.name,
             VENUE_FACT_HOT_PATH_INDEX_MIGRATION.name,
+            PLAN_AI_REVIEW_MIGRATION.name,
+            PLAN_AI_REVIEW_CONFIGURATION_MIGRATION.name,
+            ACCOUNT_OBSERVATION_FAILURE_MIGRATION.name,
         ]
     )
 

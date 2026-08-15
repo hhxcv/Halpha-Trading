@@ -9,6 +9,7 @@ from threading import Thread
 from typing import Sequence
 
 import keyring
+import psycopg
 import uvicorn
 from fastapi import FastAPI
 
@@ -21,6 +22,7 @@ from halpha.configuration import (
     load_settings,
     runtime_log_directory,
 )
+from halpha.database.schema_version import SchemaVersionError, require_current_schema
 from halpha.operational_logging import configure_halpha_logging
 from halpha.process_contract import ProcessRole, preflight
 from halpha.product_build import calculate_product_build_id
@@ -40,6 +42,44 @@ from halpha.windows_runtime import (
 
 
 _GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS = 10
+
+
+def _runtime_schema_failure_log_fields(exc: Exception) -> dict[str, str]:
+    """Keep scheduled App startup failures diagnosable without leaking details."""
+
+    return {
+        "exception_type": type(exc).__name__,
+        "reason_code": (
+            str(exc)
+            if isinstance(exc, SchemaVersionError)
+            else f"APP_RUNTIME_SCHEMA_CHECK_FAILED type={type(exc).__name__}"
+        ),
+    }
+
+
+def _require_current_app_schema(
+    *,
+    database_name: str,
+    database_role_name: str,
+    database_password: str,
+) -> None:
+    """Use the App role's own read capability before binding the listener."""
+
+    try:
+        with psycopg.connect(
+            host="127.0.0.1",
+            port=5432,
+            dbname=database_name,
+            user=database_role_name,
+            password=database_password,
+            connect_timeout=2,
+            autocommit=True,
+        ) as connection:
+            require_current_schema(connection)
+    except SchemaVersionError:
+        raise
+    except Exception:
+        raise SchemaVersionError("DATABASE_SCHEMA_VERSION_UNAVAILABLE") from None
 
 
 def _uvicorn_config(
@@ -99,11 +139,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             role="app",
             secret_values=tuple(secret_values),
         )
+
+        def schema_guard() -> None:
+            _require_current_app_schema(
+                database_name=settings.release.database_name,
+                database_role_name=role_settings.app.database_role_name,
+                database_password=secrets.database_password.get_secret_value(),
+            )
+
+        try:
+            # Scheduled tasks may restart after a source update. Check before
+            # binding the listener so a missing migration becomes a durable,
+            # stable log record instead of an opaque retry loop.
+            schema_guard()
+        except Exception as exc:
+            logger.error(
+                "runtime_schema_check_failed",
+                **_runtime_schema_failure_log_fields(exc),
+            )
+            raise
         web_app = create_app(
             settings,
             secrets,
             repo_root=repository_root(),
             product_build_id=product_build_id,
+            schema_guard=schema_guard,
         )
         gate_status = web_app.state.live_write_gate_status_provider()
         logger.info(
@@ -121,6 +181,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         RuntimeIdentityError,
         SecretResolutionError,
         SourceIdentityError,
+        SchemaVersionError,
         WebConfigurationError,
         WindowsFilesystemError,
         WindowsRuntimeError,

@@ -107,6 +107,7 @@ delivery_enabled = false
 
 [new_risk_discipline]
 max_plan_loss_fraction = "0.0075"
+minimum_reward_risk_ratio = "1"
 max_open_risk_fraction = "0.025"
 max_gross_exposure_fraction = "2"
 max_instrument_exposure_fraction = "1"

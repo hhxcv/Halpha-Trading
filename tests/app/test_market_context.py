@@ -118,6 +118,39 @@ def test_public_market_context_uses_closed_contiguous_bars_and_exact_prices() ->
     assert Decimal(context.short_breakout_gap_pct) == Decimal(22) / Decimal(120) * 100
 
 
+def test_public_market_context_reads_recent_settled_funding_rates_for_local_estimates() -> None:
+    api = FakeMarketApi()
+
+    async def funding_history(symbol: str, limit: int):
+        assert symbol == "BTCUSDT"
+        assert limit == 8
+        base = api.server_time_ms - 7 * 8 * 60 * 60 * 1000
+        return [
+            {
+                "symbol": symbol,
+                "fundingTime": base + index * 8 * 60 * 60 * 1000,
+                "fundingRate": rate,
+            }
+            for index, rate in enumerate(
+                ("0.0001", "0.0002", "-0.0001", "0.0001", "0.0001", "0.0001", "0", "0.0001")
+            )
+        ]
+
+    provider = BinancePublicMarketContext(
+        "BINANCE_DEMO",
+        market_api=api,
+        funding_rate_query=funding_history,
+        observed_at_provider=lambda: _observed_after(api),
+    )
+
+    history = asyncio.run(provider.fetch_funding_rate_history("BTCUSDT-PERP"))
+
+    assert history.source == "BINANCE_DEMO_PUBLIC"
+    assert len(history.samples) == 8
+    assert history.average_funding_rate == "0.000075"
+    assert history.average_interval_seconds == 28_800
+
+
 @pytest.mark.parametrize("interval", ("1m", "5m", "1h", "4h", "1d"))
 def test_public_market_context_calculates_stop_references_on_selected_interval(
     interval: str,
@@ -206,6 +239,34 @@ def test_public_market_context_rejects_incomplete_window() -> None:
         match="MARKET_CONTEXT_READ_FAILED_VALUEERROR",
     ):
         asyncio.run(provider.fetch("BTCUSDT-PERP", 20))
+
+
+def test_public_market_context_retries_a_transient_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FlakyMarketApi(FakeMarketApi):
+        async def query_ticker_book(self, *args, **kwargs):
+            if self.ticker_query_count == 0:
+                self.ticker_query_count += 1
+                raise TimeoutError()
+            return await super().query_ticker_book(*args, **kwargs)
+
+    monkeypatch.setattr(
+        public_market_module,
+        "PUBLIC_MARKET_TRANSIENT_RETRY_DELAY_SECONDS",
+        0,
+    )
+    api = FlakyMarketApi()
+    provider = BinancePublicMarketContext(
+        "BINANCE_DEMO",
+        market_api=api,
+        observed_at_provider=lambda: _observed_after(api),
+    )
+
+    context = asyncio.run(provider.fetch("BTCUSDT-PERP", 20))
+
+    assert context.reference_price == "120"
+    assert api.ticker_query_count == 2
 
 
 @pytest.mark.parametrize("offset_seconds", [31, -6])

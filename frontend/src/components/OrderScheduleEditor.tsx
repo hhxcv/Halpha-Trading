@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Alert,
   Box,
@@ -23,12 +23,14 @@ import {
   Tooltip,
   Typography,
 } from "@mui/material";
+import ErrorOutlined from "@mui/icons-material/ErrorOutlined";
 import InfoOutlined from "@mui/icons-material/InfoOutlined";
 import { useQuery } from "@tanstack/react-query";
 
 import {
   previewOrderSchedule,
   type ExecutionFeeEvidence,
+  type MarketFundingRateHistory,
   type MarketContext,
   type MarketInterval,
   type OrderScheduleCondition,
@@ -42,7 +44,7 @@ import {
 import {
   compactDecimal,
   formatUserVisibleTime,
-  quoteAmount,
+  quoteCurrencyAmount,
   quoteCurrencyEstimate,
   roundedTradingPriceEstimate,
   scaleDecimalByPowerOfTen,
@@ -50,7 +52,11 @@ import {
   tradingPrice,
   tradingQuantity,
 } from "../format";
-import type { MarketColorScheme } from "../marketColors";
+import {
+  financialToneClassName,
+  financialToneForSignedValue,
+  type MarketColorScheme,
+} from "../marketColors";
 import type {
   MarketStreamBar,
   MarketStreamClientStatus,
@@ -70,7 +76,6 @@ import {
   scheduleServerProblems,
   serverScheduleWasAssessed,
   stageHasServerProblem,
-  type ScheduleMilestoneStage,
 } from "./orderScheduleMilestones";
 import {
   approximatelyEqual,
@@ -93,6 +98,12 @@ import {
   withoutDynamicRule,
   withoutGeneratedEventCondition,
 } from "./orderScheduleEditorModel";
+import { lossLimitedDirectEntry } from "../directLossLimit";
+import {
+  estimateFundingCost,
+  formatFundingRatePercent,
+  formatFundingSettlementInterval,
+} from "../fundingEstimate";
 
 export { createDefaultOrderScheduleSpec } from "./orderScheduleEditorModel";
 
@@ -104,6 +115,7 @@ export type OrderScheduleEditorProps = {
   instrumentRef: string;
   direction: OrderScheduleDirection;
   maxNotional: string;
+  maxPlanLoss?: string | null;
   referencePrice: string | null;
   liveReferencePrice?: string | null;
   bidPrice?: string | null;
@@ -117,6 +129,7 @@ export type OrderScheduleEditorProps = {
   feeEvidenceLoading?: boolean;
   feeEvidenceUnavailable?: boolean;
   funding?: MarketStreamFunding | null;
+  fundingHistory?: MarketFundingRateHistory | null;
   chartInterval: MarketInterval;
   onChartIntervalChange: (interval: MarketInterval) => void;
   liveBar: MarketStreamBar | null;
@@ -128,13 +141,23 @@ export type OrderScheduleEditorProps = {
   workspaceHeader?: ReactNode;
   leadingControls?: ReactNode;
   planOptions?: ReactNode;
+  reviewDisciplineSummary?: ReactNode;
+  aiReviewPanel?: ReactNode;
   footerControls?: ReactNode;
+  decisionReviewReady?: boolean;
+  aiReviewApproved?: boolean;
+  milestoneProblems?: ReadonlyArray<ReadonlyArray<string>>;
   onValidationChange?: (ready: boolean) => void;
+  onSubmissionProblemsChange?: (problems: string[]) => void;
   onMaximumProjectedLossChange?: (value: string | null) => void;
+  onEffectiveNotionalChange?: (value: string | null) => void;
+  onRequestedNotionalChange?: (value: string | null) => void;
   onMarketReadinessChange?: (ready: boolean) => void;
 };
 
-type EditorMilestone = 0 | 1 | 2 | 3;
+type EditorMilestone = 0 | 1 | 2 | 3 | 4;
+
+const MAX_SAFE_STOP_DISTANCE_BPS = 10_000;
 
 const fieldGridSx = {
   display: "grid",
@@ -150,6 +173,38 @@ const compactFieldGridSx = {
   gap: 1.25,
   minWidth: 0,
   "& > *": { minWidth: 0 },
+} as const;
+
+const selectedChoiceSx = {
+  color: "var(--halpha-selection-text)",
+  fontWeight: 850,
+  borderColor: "transparent !important",
+  backgroundColor: "var(--halpha-selection) !important",
+  boxShadow: "none",
+} as const;
+
+const outlinedChoiceSx = {
+  "& .MuiToggleButton-root": {
+    minHeight: 36,
+    px: 1.25,
+    py: .5,
+    color: "text.primary",
+    textTransform: "none",
+    fontWeight: 800,
+    borderColor: "divider",
+    bgcolor: "background.paper",
+  },
+  "& .MuiToggleButton-root.Mui-selected": selectedChoiceSx,
+  "& .MuiToggleButton-root.Mui-selected:hover": {
+    backgroundColor: "var(--halpha-selection) !important",
+  },
+} as const;
+
+const configuredRuleSx = {
+  mt: 1.25,
+  pt: 1.25,
+  borderTop: 1,
+  borderColor: "divider",
 } as const;
 
 const POST_ONLY_RETRY_MAX_ATTEMPTS = 5;
@@ -196,7 +251,7 @@ function previewIssueText(
     ? null
     : preview.normalized_legs.find((candidate) => candidate.leg_index === issue.leg_index) ?? null;
   if (issue.code === "ORDER_SCHEDULE_NOTIONAL_BELOW_MINIMUM" && leg) {
-    return `${prefix}标准化后有效金额 ${quoteAmount(leg.effective_notional)} USDT，低于交易所最低 ${quoteAmount(preview.instrument_rules.min_notional)} USDT；请提高该档金额。`;
+    return `${prefix}标准化后有效金额 ${quoteCurrencyAmount(leg.effective_notional)} USDT，低于交易所最低 ${quoteCurrencyAmount(preview.instrument_rules.min_notional)} USDT；请提高该档金额。`;
   }
   return `${prefix}${issueLabels[issue.code] ?? issue.code}`;
 }
@@ -249,8 +304,8 @@ function EditorSection({
             "details[open] > &::after": { transform: "rotate(180deg)" },
           }}
         >
-          <Box sx={{ minWidth: 0 }}>
-            <Typography id={id} component="h2" variant="subtitle2">{title}</Typography>
+          <Box sx={{ minWidth: 0, borderLeft: 3, borderColor: "primary.main", pl: 1 }}>
+            <Typography id={id} component="h2" variant="body2" sx={{ fontWeight: 850 }}>{title}</Typography>
             {summary ? (
               <Typography
                 component="div"
@@ -281,7 +336,9 @@ function EditorSection({
       aria-labelledby={id}
       sx={{ px: 1.5, py: 1.35, borderBottom: 1, borderColor: "divider" }}
     >
-      <Typography id={id} component="h2" variant="subtitle2">{title}</Typography>
+      <Box sx={{ borderLeft: 3, borderColor: "primary.main", pl: 1 }}>
+        <Typography id={id} component="h2" variant="body2" sx={{ fontWeight: 850 }}>{title}</Typography>
+      </Box>
       {description ? (
         <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: .35, mb: 1.25 }}>
           {description}
@@ -294,6 +351,46 @@ function EditorSection({
   );
 }
 
+function ReviewFactRows({
+  rows,
+}: {
+  rows: ReadonlyArray<readonly [string, ReactNode]>;
+}) {
+  return (
+    <Box
+      component="dl"
+      sx={{
+        m: 0,
+        display: "grid",
+        borderTop: 1,
+        borderColor: "divider",
+      }}
+    >
+      {rows.map(([label, display]) => (
+        <Box
+          key={label}
+          sx={{
+            display: "grid",
+            gridTemplateColumns: "84px minmax(0, 1fr)",
+            columnGap: 1,
+            alignItems: "baseline",
+            py: .8,
+            borderBottom: 1,
+            borderColor: "divider",
+          }}
+        >
+          <Typography component="dt" variant="caption" color="text.secondary" sx={{ m: 0 }}>
+            {label}
+          </Typography>
+          <Typography component="dd" variant="body2" sx={{ minWidth: 0, m: 0, fontWeight: 650, lineHeight: 1.45 }}>
+            {display}
+          </Typography>
+        </Box>
+      ))}
+    </Box>
+  );
+}
+
 export default function OrderScheduleEditor({
   value,
   onChange,
@@ -302,6 +399,7 @@ export default function OrderScheduleEditor({
   instrumentRef,
   direction,
   maxNotional,
+  maxPlanLoss = null,
   referencePrice,
   liveReferencePrice,
   chartInterval,
@@ -323,21 +421,33 @@ export default function OrderScheduleEditor({
   feeEvidenceLoading = false,
   feeEvidenceUnavailable = false,
   funding = null,
+  fundingHistory = null,
   workspaceHeader,
   leadingControls,
   planOptions,
+  reviewDisciplineSummary,
+  aiReviewPanel,
   footerControls,
+  decisionReviewReady = true,
+  aiReviewApproved = false,
+  milestoneProblems = [],
   onValidationChange,
+  onSubmissionProblemsChange,
   onMaximumProjectedLossChange,
+  onEffectiveNotionalChange,
+  onRequestedNotionalChange,
   onMarketReadinessChange,
 }: OrderScheduleEditorProps) {
   const environmentScope = `${environmentKind}:${environmentId}`;
   const [activeMilestone, setActiveMilestone] = useState<EditorMilestone>(0);
-  const [furthestMilestoneVisited, setFurthestMilestoneVisited] =
-    useState<EditorMilestone>(0);
+  const emittedSubmissionProblemsRef = useRef<{
+    callback: typeof onSubmissionProblemsChange;
+    values: readonly string[];
+  } | null>(null);
   const [entryCatalogOpen, setEntryCatalogOpen] = useState(false);
   const [protectionCatalogOpen, setProtectionCatalogOpen] = useState(false);
   const [exitCatalogOpen, setExitCatalogOpen] = useState(false);
+  const [fundingEstimateHoldingHours, setFundingEstimateHoldingHours] = useState("24");
   const price = value.price_distribution;
   const amount = value.amount_distribution;
   const venue = value.venue_policy;
@@ -468,7 +578,7 @@ export default function OrderScheduleEditor({
   );
   const protectionLocalReady = stopDistance !== null
     && stopDistance > 0
-    && stopDistance <= 5_000
+    && stopDistance < MAX_SAFE_STOP_DISTANCE_BPS
     && !feeEvidenceLoading
     && !feeEvidenceUnavailable
     && !requiredFeeEvidenceMissing;
@@ -592,52 +702,27 @@ export default function OrderScheduleEditor({
     entryStepReady,
     protectionStepReady,
     exitStepReady,
-    previewReady,
-  ] as const;
-  const milestoneEnabled = [
-    true,
-    entryStepReady,
-    furthestMilestoneVisited >= 1 && entryStepReady && protectionStepReady,
-    furthestMilestoneVisited >= 2
-      && entryStepReady
-      && protectionStepReady
-      && exitStepReady,
+    previewReady && decisionReviewReady,
+    aiReviewApproved,
   ] as const;
   const visitMilestone = (next: EditorMilestone) => {
-    if (!milestoneEnabled[next]) return;
     setActiveMilestone(next);
-    setFurthestMilestoneVisited((current) => (
-      Math.max(current, next) as EditorMilestone
-    ));
   };
-  const previewBlockingReason = localValidation.length > 0
-    ? null
-    : !marketProjectionReady
-      ? "等待当前环境的行情与交易所规则就绪。"
-      : previewStale || preview.isPending || preview.isFetching
-        ? "正在按当前配置校验可执行档位。"
-        : preview.isError
-          ? previewFailureText(preview.error)
-          : null;
-  const serverMilestoneBlockingReason = (stage: ScheduleMilestoneStage) => {
-    if (!serverAssessmentReady) return null;
-    const problem = serverProblems.find((item) => item.stages.includes(stage));
-    return problem
-      ? issueLabels[problem.code] ?? "该步骤未通过服务端校验，请检查当前配置。"
-      : null;
-  };
-  const currentMilestoneBlockingReason = activeMilestone === 0
-    ? entryValidation[0] ?? serverMilestoneBlockingReason(0)
-    : activeMilestone === 1
-      ? protectionLocalReady
-        ? serverMilestoneBlockingReason(1)
-        : requiredFeeEvidenceMissing || feeEvidenceLoading || feeEvidenceUnavailable
-          ? "等待同环境手续费参考，以计算并冻结费用后最大预计亏损。"
-          : "初始止损距离必须大于 0 且不超过 5000 bps。"
-      : activeMilestone === 2
-        ? exitValidation[0]
-          ?? (automaticProfitExitMissing ? null : serverMilestoneBlockingReason(2))
-        : localValidation[0] ?? previewBlockingReason;
+  useEffect(() => {
+    const nextProblems = Array.from(new Set([
+      ...localValidation,
+      ...serverProblems.map((problem) => issueLabels[problem.code] ?? "订单计划未通过服务端校验。"),
+    ]));
+    const previous = emittedSubmissionProblemsRef.current;
+    const hasSameProblems = previous?.values.length === nextProblems.length
+      && previous.values.every((problem, index) => problem === nextProblems[index]);
+    if (previous?.callback === onSubmissionProblemsChange && hasSameProblems) return;
+    emittedSubmissionProblemsRef.current = {
+      callback: onSubmissionProblemsChange,
+      values: nextProblems,
+    };
+    onSubmissionProblemsChange?.(nextProblems);
+  }, [localValidation, onSubmissionProblemsChange, serverProblems]);
   const instrumentRules = preview.data?.instrument_rules;
   const priceTickSize = instrumentRules?.price_tick_size ?? null;
   const quantityStep = venue.order_type === "MARKET"
@@ -658,15 +743,27 @@ export default function OrderScheduleEditor({
     },
     { quantity: 0, notional: 0 },
   ), [previewNormalizedLegs]);
+  // Stop candidates depend on normalized entry legs and the selected market
+  // reference only. A final schedule verdict can fail for an unrelated
+  // condition (for example, a total-notional constraint), but the trader must
+  // still be able to use the candidate prices to repair the plan.
+  const stopRecommendationsReady = marketProjectionReady
+    && entryValidation.length === 0
+    && (previewNormalizedLegs?.length ?? 0) > 0;
   const stopRecommendations = useMemo(
-    () => previewReady
+    () => stopRecommendationsReady
       ? buildInitialStopRecommendations({
         direction,
         market: marketContext,
         previewLegs: previewNormalizedLegs ?? [],
       })
       : [],
-    [direction, marketContext, previewNormalizedLegs, previewReady],
+    [
+      direction,
+      marketContext,
+      previewNormalizedLegs,
+      stopRecommendationsReady,
+    ],
   );
   const selectedStopRecommendation = useMemo(
     () => stopRecommendations.find((recommendation) => approximatelyEqual(
@@ -688,13 +785,105 @@ export default function OrderScheduleEditor({
     }] : [],
     [selectedStopRecommendation, stopReferenceInterval],
   );
-  const visibleStopRecommendationAnnotations = useMemo(
-    () => activeMilestone === 1 ? stopRecommendationAnnotations : [],
-    [activeMilestone, stopRecommendationAnnotations],
-  );
   const fullFillProtectionEstimate = previewReady
     ? preview.data?.full_fill_protection_estimate ?? null
     : null;
+  useEffect(() => {
+    onEffectiveNotionalChange?.(
+      previewReady ? preview.data?.effective_total_notional ?? null : null,
+    );
+  }, [onEffectiveNotionalChange, preview.data?.effective_total_notional, previewReady]);
+  useEffect(() => {
+    onRequestedNotionalChange?.(
+      previewReady ? preview.data?.requested_total_notional ?? null : null,
+    );
+  }, [onRequestedNotionalChange, preview.data?.requested_total_notional, previewReady]);
+  const lossLimitedEntry = lossLimitedDirectEntry({
+    effectiveNotional: preview.data?.effective_total_notional,
+    maximumProjectedLoss: fullFillProtectionEstimate?.maximum_projected_loss,
+    maxPlanLoss,
+  });
+  const maximumDisciplineStopPrice = useMemo(() => {
+    if (!fullFillProtectionEstimate || maxPlanLoss === null) return null;
+    const averageEntry = Number(fullFillProtectionEstimate.average_entry_price);
+    const quantity = Number(fullFillProtectionEstimate.quantity);
+    const entryFee = Number(fullFillProtectionEstimate.estimated_entry_fee);
+    const stop = Number(fullFillProtectionEstimate.stop_price);
+    const exitFee = Number(fullFillProtectionEstimate.estimated_exit_fee);
+    const lossLimit = Number(maxPlanLoss);
+    if (![averageEntry, quantity, entryFee, stop, exitFee, lossLimit].every(Number.isFinite)
+      || averageEntry <= 0 || quantity <= 0 || stop <= 0 || lossLimit <= 0) return null;
+    const exitFeeRate = exitFee / (quantity * stop);
+    const price = direction === "LONG"
+      ? (quantity * averageEntry + entryFee - lossLimit) / (quantity * (1 - exitFeeRate))
+      : (lossLimit + quantity * averageEntry - entryFee) / (quantity * (1 + exitFeeRate));
+    return Number.isFinite(price) && price > 0 ? price : null;
+  }, [direction, fullFillProtectionEstimate, maxPlanLoss]);
+  const maximumDisciplineStopDistanceBps = useMemo(() => {
+    if (!fullFillProtectionEstimate || maximumDisciplineStopPrice === null) return null;
+    const averageEntry = Number(fullFillProtectionEstimate.average_entry_price);
+    if (!Number.isFinite(averageEntry) || averageEntry <= 0) return null;
+    const distance = Math.abs(averageEntry - maximumDisciplineStopPrice)
+      / averageEntry * 10_000;
+    return Number.isFinite(distance) && distance > 0 ? distance : null;
+  }, [fullFillProtectionEstimate, maximumDisciplineStopPrice]);
+  const stopExceedsDisciplineLoss = maximumDisciplineStopPrice !== null
+    && fullFillProtectionEstimate !== null
+    && (direction === "LONG"
+      ? Number(fullFillProtectionEstimate.stop_price) < maximumDisciplineStopPrice
+      : Number(fullFillProtectionEstimate.stop_price) > maximumDisciplineStopPrice);
+  const lossLimitAnnotation = useMemo(() => maximumDisciplineStopPrice === null ? [] : [{
+    id: "halpha-discipline-maximum-stop",
+    role: "STOP_REFERENCE" as const,
+    label: "纪律最大止损",
+    detail: `按单计划最大损失 ${quoteCurrencyEstimate(maxPlanLoss ?? "0")} USDT 与当前预计仓位计算。`,
+    price: maximumDisciplineStopPrice,
+    authority: "SERVER_PREVIEW" as const,
+    lineStyle: "dotted" as const,
+    draggable: false,
+  }], [maxPlanLoss, maximumDisciplineStopPrice]);
+  const visibleStopRecommendationAnnotations = useMemo(
+    () => activeMilestone === 1
+      ? [...stopRecommendationAnnotations, ...lossLimitAnnotation]
+      : [],
+    [activeMilestone, lossLimitAnnotation, stopRecommendationAnnotations],
+  );
+  const protectionLocationRisks = useMemo(() => {
+    if (!marketContext || !fullFillProtectionEstimate) return [];
+    const averageEntry = Number(fullFillProtectionEstimate.average_entry_price);
+    const stopPrice = Number(fullFillProtectionEstimate.stop_price);
+    const atr = Number(marketContext.stop_reference_atr_14);
+    if (![averageEntry, stopPrice, atr].every(Number.isFinite) || atr <= 0) return [];
+    const riskDistance = Math.abs(averageEntry - stopPrice);
+    const items: string[] = [];
+    const riskAtr = riskDistance / atr;
+    if (riskAtr < 0.75) {
+      items.push(`止损距预计均价 ${riskAtr.toFixed(2)} ATR，接近近期常规波动范围。`);
+    }
+    const structurePrice = direction === "LONG"
+      ? Number(marketContext.channel_lower)
+      : Number(marketContext.channel_upper);
+    if (Number.isFinite(structurePrice) && Math.abs(stopPrice - structurePrice) / atr < 0.25) {
+      items.push("止损靠近近期通道边界，可能与结构性流动性聚集位置重合。");
+    }
+    const sameSideReferences = marketContext.stop_references.filter((reference) => (
+      direction === "LONG" ? reference.side === "LOWER" : reference.side === "UPPER"
+    ));
+    if (sameSideReferences.some((reference) => Math.abs(stopPrice - Number(reference.price)) / atr < 0.25)) {
+      items.push("止损靠近当前结构止损参考位，留意扫损后再反转的风险。");
+    }
+    const opposingChannel = direction === "LONG"
+      ? Number(marketContext.channel_upper)
+      : Number(marketContext.channel_lower);
+    const nearestTarget = takeProfitLevels[0]
+      ? averageEntry + (direction === "LONG" ? 1 : -1) * riskDistance * Number(takeProfitLevels[0].trigger_r)
+      : null;
+    if (nearestTarget !== null && Number.isFinite(opposingChannel)
+      && Math.abs(nearestTarget - opposingChannel) / atr < 0.25) {
+      items.push("首个止盈靠近近期通道边界，可能遇到短期阻力或支撑。");
+    }
+    return items;
+  }, [direction, fullFillProtectionEstimate, marketContext, takeProfitLevels]);
   const takeProfitAfterCost = takeProfitAfterCostEstimate({
     initialStopDistanceBps:
       value.protection_policy.initial_stop.distance_bps,
@@ -727,10 +916,10 @@ export default function OrderScheduleEditor({
           ? (
             <Box
               data-testid="after-cost-estimate"
-              sx={{ ...surfaceFrameSx, p: 1.15 }}
+              sx={{ pt: .9, borderTop: 1, borderColor: "divider" }}
             >
               <Typography variant="caption" sx={{ display: "block", mb: .8, fontWeight: 800 }}>
-                费用后风险收益 · 按标准化名义额
+                费用后风险收益
               </Typography>
               <Box
                 component="dl"
@@ -742,35 +931,33 @@ export default function OrderScheduleEditor({
                 }}
               >
                 {[
-                  ["标准化名义额", `${quoteAmount(takeProfitAfterCost.effectiveNotional)} USDT`, `${takeProfitAfterCost.effectiveNotional} USDT`],
-                  ["初始止损风险", `${quoteCurrencyEstimate(takeProfitAfterCost.grossRisk)} USDT`, `${takeProfitAfterCost.grossRisk} USDT`],
-                  ["目标毛收益", `${quoteCurrencyEstimate(takeProfitAfterCost.grossReward)} USDT`, `${takeProfitAfterCost.grossReward} USDT`],
-                  ["预计手续费", `${quoteCurrencyEstimate(takeProfitAfterCost.estimatedFee)} USDT`, `${takeProfitAfterCost.estimatedFee} USDT`],
-                  ["当前盘口成本", `${quoteCurrencyEstimate(takeProfitAfterCost.estimatedSpreadCost)} USDT`, `${takeProfitAfterCost.estimatedSpreadCost} USDT`],
-                  ["费用后目标净收益", `${quoteCurrencyEstimate(takeProfitAfterCost.netReward)} USDT`, `${takeProfitAfterCost.netReward} USDT`],
-                  ["费用后净风险", `${quoteCurrencyEstimate(takeProfitAfterCost.netRisk)} USDT`, `${takeProfitAfterCost.netRisk} USDT`],
-                  ["费用后净盈亏比", `${compactDecimal(takeProfitAfterCost.netRiskReward, { maximumFractionDigits: 2, truncatedMarker: "" })} : 1`, `${takeProfitAfterCost.netRiskReward} : 1`],
-                  ["盈亏平衡", `${compactDecimal(takeProfitAfterCost.breakEvenBps, { maximumFractionDigits: 2, truncatedMarker: "" })} bps`, `${takeProfitAfterCost.breakEvenBps} bps`],
-                ].map(([label, display, exact]) => (
-                  <Box key={label} sx={{ minWidth: 0 }}>
-                    <Typography component="dt" variant="caption" color="text.secondary">
-                      {label}
-                    </Typography>
-                    <Typography
-                      component="dd"
-                      variant="body2"
-                      title={display === exact ? undefined : exact}
-                      sx={{ m: 0, fontWeight: 750, overflowWrap: "anywhere" }}
-                    >
-                      {display}
-                    </Typography>
-                  </Box>
-                ))}
+                { label: "初始止损风险", value: -takeProfitAfterCost.grossRisk, exact: -takeProfitAfterCost.grossRisk },
+                { label: "预计手续费", value: -takeProfitAfterCost.estimatedFee, exact: -takeProfitAfterCost.estimatedFee },
+                { label: "费用后目标净收益", value: takeProfitAfterCost.netReward, exact: takeProfitAfterCost.netReward },
+                { label: "费用后净盈亏比", value: null, exact: takeProfitAfterCost.netRiskReward },
+              ].map((item) => (
+                <Box key={item.label} sx={{ minWidth: 0 }}>
+                  <Typography component="dt" variant="caption" color="text.secondary">
+                    {item.label}
+                  </Typography>
+                  <Typography
+                    component="dd"
+                    variant="body2"
+                    title={item.value === null || item.value === item.exact ? undefined : String(item.exact)}
+                    className={financialToneClassName(item.value === null ? undefined : financialToneForSignedValue(item.value))}
+                    sx={{ m: 0, fontWeight: 750, overflowWrap: "anywhere" }}
+                  >
+                    {item.value === null
+                      ? `${compactDecimal(Number(item.exact), { maximumFractionDigits: 2, truncatedMarker: "" })} : 1`
+                      : `${item.value > 0 ? "+" : ""}${quoteCurrencyEstimate(item.value)} USDT`}
+                  </Typography>
+                </Box>
+              ))}
               </Box>
               <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1 }}>
                 近期实付参考：入场 {takeProfitAfterCost.entryLiquidity === "MAKER" ? "Maker" : "Taker"}
                 {` ${compactDecimal(takeProfitAfterCost.entryFeeRateBps)} bps，退出 Taker ${compactDecimal(takeProfitAfterCost.exitFeeRateBps)} bps；`}
-                样本截至 {formatUserVisibleTime(feeEvidence?.source_cutoff)}。不是当前交易所费率报价；未计资金费与触发后滑点。
+                样本截至 {formatUserVisibleTime(feeEvidence?.source_cutoff)}。
               </Typography>
             </Box>
           )
@@ -779,35 +966,71 @@ export default function OrderScheduleEditor({
               完成有效预览并取得当前盘口后显示费用后风险收益。
             </Typography>
           );
-  const fundingPercent = funding
-    ? scaleDecimalByPowerOfTen(funding.funding_rate, 2)
-    : null;
-  const fundingRate = funding ? Number(funding.funding_rate) : Number.NaN;
-  const selectedSidePays = Number.isFinite(fundingRate)
-    && fundingRate !== 0
-    && ((fundingRate > 0 && direction === "LONG")
-      || (fundingRate < 0 && direction === "SHORT"));
+  const fundingSettlementInterval = formatFundingSettlementInterval(
+    fundingHistory?.average_interval_seconds ?? null,
+  );
+  const fundingEstimate = estimateFundingCost({
+    averageFundingRate: fundingHistory?.average_funding_rate ?? null,
+    averageIntervalSeconds: fundingHistory?.average_interval_seconds ?? null,
+    nextFundingAt: funding?.next_funding_at ?? null,
+    sourceCutoff: funding?.source_cutoff ?? null,
+    holdingHours: fundingEstimateHoldingHours,
+    notional: maxNotional,
+    direction,
+  });
   const fundingPanel = (
-    <Box data-testid="current-funding" sx={{ ...surfaceFrameSx, p: 1.15 }}>
+    <Box data-testid="current-funding" sx={{ pt: .85, borderTop: 1, borderColor: "divider" }}>
       <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
         当前资金费率
       </Typography>
-      {funding && fundingPercent !== null ? (
+      {funding ? (
         <>
-          <Typography className="mono" variant="body2" sx={{ mt: .25, fontWeight: 800 }}>
-            {Number(funding.funding_rate) > 0 ? "+" : ""}
-            {compactDecimal(fundingPercent, { maximumFractionDigits: 4, truncatedMarker: "" })}%
+          <Typography
+            className="mono"
+            variant="body2"
+            sx={{ mt: .25, fontWeight: 800 }}
+          >
+            {formatFundingRatePercent(funding.funding_rate)}
+            {fundingSettlementInterval ? ` / ${fundingSettlementInterval}` : ""}
           </Typography>
           <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: .25 }}>
-            下次 {formatUserVisibleTime(funding.next_funding_at)} · {fundingRate === 0
-              ? "当前费率为 0"
-              : selectedSidePays
-                ? "当前方向跨结算时点支付"
-                : "当前方向跨结算时点收取"}
+            下次结算 {formatUserVisibleTime(funding.next_funding_at)}
           </Typography>
-          <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: .25 }}>
-            当前交易所事实；实际结算取决于届时费率和是否仍有持仓，未计入费用后估算。
-          </Typography>
+          <Box sx={{ mt: 1, pt: 1, borderTop: 1, borderColor: "divider" }}>
+            <Stack direction="row" spacing={1} sx={{ alignItems: "center" }}>
+              <TextField
+                size="small"
+                type="number"
+                label="预计持仓（小时）"
+                value={fundingEstimateHoldingHours}
+                onChange={(event) => setFundingEstimateHoldingHours(event.target.value)}
+                slotProps={{ htmlInput: { min: 0, step: "any" } }}
+                sx={{ width: 150, flexShrink: 0 }}
+              />
+              <Box sx={{ minWidth: 0 }}>
+                <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
+                  预计资金费用
+                </Typography>
+                {fundingEstimate ? (
+                  <Typography
+                    className={`mono ${financialToneClassName(financialToneForSignedValue(fundingEstimate.signedAmount)) ?? ""}`}
+                    variant="body2"
+                    sx={{ fontWeight: 800, whiteSpace: "nowrap" }}
+                  >
+                    {Number(fundingEstimate.signedAmount) > 0 ? "+" : Number(fundingEstimate.signedAmount) < 0 ? "-" : ""}
+                    {quoteCurrencyAmount(String(Math.abs(Number(fundingEstimate.signedAmount))))} USDT
+                  </Typography>
+                ) : (
+                  <Typography variant="body2" color="text.secondary">历史费率不可用</Typography>
+                )}
+              </Box>
+            </Stack>
+            {fundingEstimate && fundingHistory ? (
+              <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: .55 }}>
+                近 {fundingHistory.samples.length} 次均值 {formatFundingRatePercent(fundingHistory.average_funding_rate)}{fundingSettlementInterval ? ` / ${fundingSettlementInterval}` : ""} · 按 {quoteCurrencyAmount(maxNotional)} USDT · 预计 {fundingEstimate.settlements} 次结算
+              </Typography>
+            ) : null}
+          </Box>
         </>
       ) : (
         <Typography variant="body2" sx={{ mt: .25, fontWeight: 750 }}>
@@ -824,7 +1047,10 @@ export default function OrderScheduleEditor({
     onMaximumProjectedLossChange?.(
       fullFillProtectionEstimate?.maximum_projected_loss ?? null,
     );
-  }, [fullFillProtectionEstimate, onMaximumProjectedLossChange]);
+  }, [
+    fullFillProtectionEstimate,
+    onMaximumProjectedLossChange,
+  ]);
 
   const changeOrderType = (orderType: "MARKET" | "LIMIT") => {
     if (orderType === "MARKET") {
@@ -1108,15 +1334,6 @@ export default function OrderScheduleEditor({
     && venue.time_in_force === "GTC"
     && venue.price_match === null
   );
-  const venueSummary = [
-    venue.post_only ? "Maker only" : "",
-    venue.time_in_force ?? "市价",
-    entryProgram.kind === "TIME_SLICED"
-      ? "按时间释放"
-      : entryProgram.kind === "PRICE_LADDER"
-        ? value.submission_order === "HIGH_TO_LOW" ? "高→低" : "低→高"
-        : "",
-  ].filter(Boolean).join(" · ");
   const entryProgramSummary = (() => {
     if (entryProgram.kind === "PRICE_LADDER" && price.kind === "LADDER") {
       return `价格区间分批 · ${price.level_count} 档`;
@@ -1153,17 +1370,17 @@ export default function OrderScheduleEditor({
   }[amount.mode];
   const amountSummary = amount.mode === "CUSTOM"
     ? `${amountModeLabel} · ${amount.custom_notionals.length} 笔`
-    : `${amountModeLabel} · 起始 ${quoteAmount(amount.base_notional)} USDT`;
+    : `${amountModeLabel} · 起始 ${quoteCurrencyAmount(amount.base_notional)} USDT`;
   const conditionReviewDetails = value.entry_conditions.items.flatMap((item) => {
     if (item.kind === "DECISION_BASIS_READY") return [];
     if (item.kind === "MARK_PRICE") {
       return [
-        `标记价 ${item.comparator === "GTE" ? "≥" : "≤"} ${quoteAmount(item.price)} USDT`,
+        `标记价 ${item.comparator === "GTE" ? "≥" : "≤"} ${quoteCurrencyAmount(item.price)} USDT`,
       ];
     }
     if (item.kind === "CLOSED_BAR_PRICE_15M") {
       return [
-        `15m 已闭合 K 线收盘 ${item.comparator === "GTE" ? "≥" : "≤"} ${quoteAmount(item.price)} USDT`,
+        `15m 已闭合 K 线收盘 ${item.comparator === "GTE" ? "≥" : "≤"} ${quoteCurrencyAmount(item.price)} USDT`,
       ];
     }
     if (item.kind === "SPREAD_BPS") {
@@ -1200,10 +1417,10 @@ export default function OrderScheduleEditor({
         : `首次提交后 ${expireRule.after_seconds} 秒未成交即撤销`
       : "",
     shockRule?.invalidation_price
-      ? `标记价 ${direction === "SHORT" ? "≥" : "≤"} ${quoteAmount(shockRule.invalidation_price)} USDT 时取消`
+      ? `标记价 ${direction === "SHORT" ? "≥" : "≤"} ${quoteCurrencyAmount(shockRule.invalidation_price)} USDT 时取消`
       : "",
     shockRule?.opportunity_missed_price
-      ? `标记价 ${direction === "SHORT" ? "≤" : "≥"} ${quoteAmount(shockRule.opportunity_missed_price)} USDT 时视为错过`
+      ? `标记价 ${direction === "SHORT" ? "≤" : "≥"} ${quoteCurrencyAmount(shockRule.opportunity_missed_price)} USDT 时视为错过`
       : "",
     shockRule?.window_seconds && shockRule.adverse_move_bps
       ? `${shockRule.window_seconds} 秒反向${direction === "SHORT" ? "上涨" : "下跌"} ≥ ${compactDecimal(shockRule.adverse_move_bps)} bps 时取消`
@@ -1238,9 +1455,9 @@ export default function OrderScheduleEditor({
         display: "grid",
         gridTemplateColumns: {
           xs: "minmax(0, 1fr)",
-          md: "minmax(0, 1fr) minmax(360px, 34%)",
+          md: "minmax(0, 1fr) minmax(390px, 36%)",
         },
-        gridTemplateRows: { xs: "auto auto auto", md: "auto minmax(0, 1fr)" },
+        gridTemplateRows: { xs: "auto auto", md: "minmax(0, 1fr)" },
         height: { xs: "auto", md: "100%" },
         minHeight: 0,
         overflow: { xs: "visible", md: "hidden" },
@@ -1248,95 +1465,107 @@ export default function OrderScheduleEditor({
       }}
     >
       <Box
-        sx={{
-          minHeight: 54,
-          px: { xs: 1.25, sm: 1.75 },
-          py: 1,
-          display: "flex",
-          gap: 1,
-          alignItems: "center",
-          gridColumn: "1 / -1",
-          borderBottom: 1,
-          borderColor: "divider",
-          overflow: "hidden",
-        }}
-      >
-        {workspaceHeader ?? (
-          <>
-            <Typography component="h1" variant="subtitle1" sx={{ fontWeight: 750, mr: .5 }}>直接执行</Typography>
-            <Chip size="small" variant="outlined" label={instrumentRef || "交易对象未知"} />
-            <Chip size="small" variant="outlined" label={direction === "LONG" ? "做多" : "做空"} />
-            <Chip size="small" variant="outlined" label={`资金上限 ${maxNotional ? quoteAmount(maxNotional) : "未知"} USDT`} />
-          </>
-        )}
-      </Box>
-
-      <Box
+        data-testid="direct-execution-market-context"
         sx={{
           gridColumn: "1",
-          gridRow: "2",
+          gridRow: "1",
           minWidth: 0,
           minHeight: { xs: 0, md: 0 },
-          height: { xs: "auto", md: "100%" },
-          p: { xs: 1, md: 1.25 },
+          display: "flex",
+          flexDirection: "column",
           overflow: { xs: "visible", md: "hidden" },
         }}
       >
-        <OrderScheduleChart
-          key={environmentScope}
-          workspaceMode
-          environmentId={environmentId}
-          environmentKind={environmentKind}
-          instrumentRef={instrumentRef}
-          direction={direction}
-          marketColorScheme={marketColorScheme}
-          interval={chartInterval}
-          onIntervalChange={onChartIntervalChange}
-          liveBar={liveBar}
-          streamStatus={streamStatus}
-          streamGeneration={streamGeneration}
-          priceProjectionReady={marketProjectionReady}
-          priceTickSize={preview.data?.instrument_rules.price_tick_size ?? null}
-          referencePrice={displayReferencePrice}
-          spec={value}
-          previewLegs={previewReady ? (preview.data?.normalized_legs ?? []) : []}
-          fullFillProtectionEstimate={fullFillProtectionEstimate}
-          previewState={previewReady
-            ? "READY"
-            : localValidation.length === 0
-              && marketProjectionReady
-              && (previewStale || preview.isPending || preview.isFetching)
-              ? "PENDING"
-              : "BLOCKED"}
-          additionalPriceAnnotations={visibleStopRecommendationAnnotations}
-          onRangeChange={(lowerPrice, upperPrice) => {
-            if (value.price_distribution.kind !== "LADDER") return;
-            onChange({
-              ...value,
-              price_distribution: {
-                ...value.price_distribution,
-                lower_price: lowerPrice,
-                upper_price: upperPrice,
-              },
-            });
+        <Box
+          data-testid="direct-execution-context-strip"
+          sx={{
+            flex: "0 0 auto",
+            minHeight: 54,
+            px: { xs: 1.25, sm: 1.75 },
+            py: 1,
+            display: "flex",
+            gap: 1,
+            alignItems: "center",
+            borderBottom: 1,
+            borderColor: "divider",
+            overflow: "hidden",
           }}
-          onSingleLimitPriceChange={(limitPrice) => {
-            if (value.price_distribution.kind !== "SINGLE") return;
-            onChange({
-              ...value,
-              price_distribution: {
-                ...value.price_distribution,
-                limit_price: limitPrice,
-              },
-              venue_policy: {
-                ...value.venue_policy,
-                order_type: "LIMIT",
-                price_match: null,
-              },
-            });
+        >
+          {workspaceHeader ?? (
+            <>
+              <Typography component="h1" variant="subtitle1" sx={{ fontWeight: 750, mr: .5 }}>直接执行</Typography>
+              <Chip size="small" variant="outlined" label={instrumentRef || "交易对象未知"} />
+              <Chip size="small" variant="outlined" label={direction === "LONG" ? "做多" : "做空"} />
+              <Chip size="small" variant="outlined" label={`资金上限 ${maxNotional ? quoteCurrencyAmount(maxNotional) : "未知"} USDT`} />
+            </>
+          )}
+        </Box>
+        <Box
+          sx={{
+            minWidth: 0,
+            minHeight: { xs: 0, md: 0 },
+            flex: { xs: "0 0 auto", md: "1 1 auto" },
+            height: { xs: "auto", md: "100%" },
+            p: { xs: 1, md: 1.25 },
+            overflow: { xs: "visible", md: "hidden" },
           }}
-          onMarketReadinessChange={onMarketReadinessChange}
-        />
+        >
+          <OrderScheduleChart
+            key={environmentScope}
+            workspaceMode
+            environmentId={environmentId}
+            environmentKind={environmentKind}
+            instrumentRef={instrumentRef}
+            direction={direction}
+            marketColorScheme={marketColorScheme}
+            interval={chartInterval}
+            onIntervalChange={onChartIntervalChange}
+            liveBar={liveBar}
+            streamStatus={streamStatus}
+            streamGeneration={streamGeneration}
+            priceProjectionReady={marketProjectionReady}
+            priceTickSize={preview.data?.instrument_rules.price_tick_size ?? null}
+            referencePrice={displayReferencePrice}
+            spec={value}
+            previewLegs={previewReady ? (preview.data?.normalized_legs ?? []) : []}
+            fullFillProtectionEstimate={fullFillProtectionEstimate}
+            previewState={previewReady
+              ? "READY"
+              : localValidation.length === 0
+                && marketProjectionReady
+                && (previewStale || preview.isPending || preview.isFetching)
+                ? "PENDING"
+                : "BLOCKED"}
+            additionalPriceAnnotations={visibleStopRecommendationAnnotations}
+            onRangeChange={(lowerPrice, upperPrice) => {
+              if (value.price_distribution.kind !== "LADDER") return;
+              onChange({
+                ...value,
+                price_distribution: {
+                  ...value.price_distribution,
+                  lower_price: lowerPrice,
+                  upper_price: upperPrice,
+                },
+              });
+            }}
+            onSingleLimitPriceChange={(limitPrice) => {
+              if (value.price_distribution.kind !== "SINGLE") return;
+              onChange({
+                ...value,
+                price_distribution: {
+                  ...value.price_distribution,
+                  limit_price: limitPrice,
+                },
+                venue_policy: {
+                  ...venue,
+                  order_type: "LIMIT",
+                  price_match: null,
+                },
+              });
+            }}
+            onMarketReadinessChange={onMarketReadinessChange}
+          />
+        </Box>
       </Box>
 
       <Box
@@ -1344,7 +1573,7 @@ export default function OrderScheduleEditor({
         aria-label="直接执行快速配置"
         sx={{
           gridColumn: { xs: "1", md: "2" },
-          gridRow: { xs: "3", md: "2" },
+          gridRow: { xs: "2", md: "1" },
           minWidth: 0,
           minHeight: 0,
           display: "flex",
@@ -1352,8 +1581,8 @@ export default function OrderScheduleEditor({
           borderLeft: { xs: 0, md: 1 },
           borderTop: { xs: 1, md: 0 },
           borderColor: "divider",
-          bgcolor: "background.paper",
-        }}
+        bgcolor: "background.paper",
+      }}
       >
         <Box
           data-testid="direct-order-config-scroll"
@@ -1373,28 +1602,27 @@ export default function OrderScheduleEditor({
               top: { xs: "96px", md: 0 },
               zIndex: 4,
               display: "grid",
-              gridTemplateColumns: "repeat(4,minmax(0,1fr))",
-              bgcolor: "background.paper",
+              gridTemplateColumns: "repeat(5,minmax(0,1fr))",
+              bgcolor: "background.default",
               borderBottom: 1,
               borderColor: "divider",
             }}
           >
-            {(["入场", "保护", "退出", "核对"] as const).map((label, index) => (
+            {(["入场", "保护", "退出", "核对", "AI审核"] as const).map((label, index) => (
               <Button
                 key={label}
                 type="button"
                 aria-current={activeMilestone === index ? "step" : undefined}
-                disabled={!milestoneEnabled[index]}
                 onClick={() => visitMilestone(index as EditorMilestone)}
                 sx={{
                   minWidth: 0,
-                  minHeight: 48,
+                  minHeight: 46,
                   px: .5,
                   borderRadius: 0,
                   color: activeMilestone === index ? "text.primary" : "text.secondary",
                   borderBottom: 2,
                   borderBottomColor: activeMilestone === index
-                    ? "warning.main"
+                    ? "primary.main"
                     : "transparent",
                   fontWeight: activeMilestone === index ? 800 : 650,
                   fontSize: 12,
@@ -1403,25 +1631,43 @@ export default function OrderScheduleEditor({
                 <Box
                   component="span"
                   sx={{
-                    display: "inline-grid",
-                    placeItems: "center",
-                    width: 20,
-                    height: 20,
-                    mr: .5,
-                    borderRadius: "50%",
-                    bgcolor: activeMilestone === index ? "warning.main" : "action.hover",
-                    color: activeMilestone === index ? "warning.contrastText" : "text.secondary",
-                    fontSize: 11,
+                    display: "inline-flex",
+                    alignItems: "center",
+                    minWidth: 0,
                   }}
                 >
-                  {index < 3
-                    && index !== activeMilestone
-                    && index < furthestMilestoneVisited
-                    && milestoneReady[index]
-                    ? "✓"
-                    : index + 1}
+                  <Box
+                    component="span"
+                    sx={{
+                      display: "inline-grid",
+                      placeItems: "center",
+                      width: 20,
+                      height: 20,
+                      mr: .5,
+                      borderRadius: "50%",
+                      bgcolor: activeMilestone === index ? "primary.main" : "action.hover",
+                      color: activeMilestone === index ? "primary.contrastText" : "text.secondary",
+                      fontSize: 11,
+                    }}
+                  >
+                    {index !== activeMilestone && milestoneReady[index]
+                      ? "✓"
+                      : index + 1}
+                  </Box>
+                  <Box component="span" sx={{ overflow: "hidden", textOverflow: "ellipsis" }}>{label}</Box>
+                  {(() => {
+                    const problems = milestoneProblems[index] ?? [];
+                    const hasProblem = problems.length > 0 || !milestoneReady[index];
+                    const title = problems.length > 0
+                      ? <Box component="ul" sx={{ m: 0, pl: 2, py: .25 }}>{problems.map((problem) => <li key={problem}>{problem}</li>)}</Box>
+                      : "该页仍有待处理配置。";
+                    return hasProblem ? (
+                      <Tooltip title={title} arrow>
+                        <ErrorOutlined color="error" sx={{ fontSize: 15, ml: .35, flex: "0 0 auto" }} />
+                      </Tooltip>
+                    ) : null;
+                  })()}
                 </Box>
-                {label}
               </Button>
             ))}
           </Box>
@@ -1435,7 +1681,6 @@ export default function OrderScheduleEditor({
           <EditorSection
             id="order-schedule-entry-program-title"
             title="入场方案"
-            description="先选择订单在什么时机、以几批进入；具体市价、限价与交易所指令在下方配置。"
           >
             <Box
               role="radiogroup"
@@ -1443,38 +1688,53 @@ export default function OrderScheduleEditor({
               sx={{
                 display: "grid",
                 gridTemplateColumns: "repeat(2,minmax(0,1fr))",
-                gap: .75,
+                overflow: "hidden",
+                border: 1,
+                borderColor: "divider",
+                borderRadius: 1.25,
+                "& > :nth-of-type(odd)": { borderRight: 1, borderRightColor: "divider" },
+                "& > :nth-of-type(-n+2)": { borderBottom: 1, borderBottomColor: "divider" },
               }}
             >
               {([
-                ["ONE_TIME", "一次性入场", "条件满足后提交一笔"],
-                ["PRICE_LADDER", "价格区间分批", "多个价格档依次入场"],
-                ["TIME_SLICED", "时间分批", "按固定时间间隔释放"],
-                ["EVENT_TRIGGERED", "事件触发入场", "价格或短时异动触发"],
-              ] as const).map(([kind, label, detail]) => (
+                ["ONE_TIME", "一次性入场"],
+                ["PRICE_LADDER", "价格阶梯入场"],
+                ["TIME_SLICED", "时间分批"],
+                ["EVENT_TRIGGERED", "事件触发入场"],
+              ] as const).map(([kind, label]) => (
                 <Button
                   key={kind}
                   type="button"
                   role="radio"
                   aria-checked={entryProgram.kind === kind}
-                  variant={entryProgram.kind === kind ? "contained" : "outlined"}
-                  color={entryProgram.kind === kind ? "warning" : "inherit"}
+                  variant="outlined"
+                  color="inherit"
                   onClick={() => changeEntryProgram(kind)}
                   sx={{
-                    minHeight: 58,
-                    px: 1,
-                    py: .75,
-                    alignItems: "flex-start",
-                    flexDirection: "column",
-                    textAlign: "left",
+                    minHeight: 42,
+                    p: 0,
+                    border: 0,
+                    borderRadius: 0,
+                    alignItems: "center",
+                    justifyContent: "center",
+                    textAlign: "center",
                     textTransform: "none",
+                    ...(entryProgram.kind === kind
+                      ? selectedChoiceSx
+                      : {
+                        color: "text.primary",
+                        bgcolor: "background.paper",
+                        boxShadow: "none",
+                      }),
+                    "&:hover": {
+                      borderColor: "transparent",
+                      backgroundColor: entryProgram.kind === kind ? "var(--halpha-selection) !important" : undefined,
+                      bgcolor: entryProgram.kind === kind ? undefined : "action.hover",
+                    },
                   }}
                 >
-                  <Typography component="span" variant="body2" sx={{ fontWeight: 800 }}>
+                  <Typography component="span" variant="body2" sx={{ fontWeight: entryProgram.kind === kind ? 850 : 800, lineHeight: 1 }}>
                     {label}
-                  </Typography>
-                  <Typography component="span" variant="caption" color="text.secondary">
-                    {detail}
                   </Typography>
                 </Button>
               ))}
@@ -1546,11 +1806,10 @@ export default function OrderScheduleEditor({
             changeOrderType(next);
           }}
           sx={{
+            ...outlinedChoiceSx,
             "& .MuiToggleButton-root": {
-              minHeight: 34,
-              py: .5,
-              textTransform: "none",
-              fontWeight: 700,
+              ...outlinedChoiceSx["& .MuiToggleButton-root"],
+              minHeight: 38,
             },
           }}
         >
@@ -1574,22 +1833,56 @@ export default function OrderScheduleEditor({
             ) : (
               <>
                 <TextField
+                  select
                   fullWidth
                   size="small"
-                  type="number"
-                  label="限价（USDT）"
-                  value={price.limit_price ?? ""}
-                  disabled={venue.price_match !== null}
-                  onChange={(event) => onChange({
-                    ...value,
-                    price_distribution: { ...price, limit_price: event.target.value },
-                    venue_policy: { ...venue, price_match: null },
-                  })}
-                  helperText={venue.price_match !== null
-                    ? `已使用 ${venue.price_match}，价格由场所决定`
-                    : "可输入、拖动图线，或使用下方盘口价"}
-                  slotProps={{ htmlInput: { min: 0, step: "any" } }}
-                />
+                  label="限价来源"
+                  value={venue.price_match ?? "MANUAL"}
+                  onChange={(event) => {
+                    const next = event.target.value as OrderSchedulePriceMatch | "MANUAL";
+                    const useBookPrice = next !== "MANUAL";
+                    onChange({
+                      ...value,
+                      price_distribution: {
+                        ...price,
+                        limit_price: useBookPrice
+                          ? null
+                          : (price.limit_price ?? referencePrice ?? ""),
+                      },
+                      venue_policy: {
+                        ...venue,
+                        post_only: false,
+                        price_match: useBookPrice ? next : null,
+                      },
+                      dynamic_rules: useBookPrice
+                        ? withoutDynamicRule(value.dynamic_rules, "REPRICE_ENTRY")
+                        : value.dynamic_rules,
+                    });
+                  }}
+                >
+                  <MenuItem value="MANUAL">手动指定价格</MenuItem>
+                  {priceMatchOptions.map((option) => (
+                    <MenuItem key={option.value} value={option.value}>
+                      盘口定价 · {option.label}
+                    </MenuItem>
+                  ))}
+                </TextField>
+                {venue.price_match === null ? (
+                  <>
+                    <TextField
+                      fullWidth
+                      size="small"
+                      type="number"
+                      label="限价（USDT）"
+                      value={price.limit_price ?? ""}
+                      onChange={(event) => onChange({
+                        ...value,
+                        price_distribution: { ...price, limit_price: event.target.value },
+                        venue_policy: { ...venue, price_match: null },
+                      })}
+                      slotProps={{ htmlInput: { min: 0, step: "any" } }}
+                      sx={{ mt: 1 }}
+                    />
                 <Stack direction="row" spacing={.75} sx={{ mt: .75 }}>
                   {[
                     { label: "买一", candidate: bidPrice },
@@ -1612,6 +1905,8 @@ export default function OrderScheduleEditor({
                     </Button>
                   ))}
                 </Stack>
+                  </>
+                ) : null}
               </>
             )}
           </Box>
@@ -1660,6 +1955,24 @@ export default function OrderScheduleEditor({
                 slotProps={{ htmlInput: { min: 2, max: 50, step: 1 } }}
               />
             </Box>
+            <Box sx={fieldGridSx}>
+              <TextField
+                select
+                size="small"
+                label="提交顺序"
+                value={value.submission_order}
+                onChange={(event) => onChange({
+                  ...value,
+                  submission_order: event.target.value as typeof value.submission_order,
+                })}
+              >
+                <MenuItem value="LOW_TO_HIGH">低价 → 高价</MenuItem>
+                <MenuItem value="HIGH_TO_LOW">高价 → 低价</MenuItem>
+              </TextField>
+            </Box>
+            <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: .65 }}>
+              依次提交；前档闭合并确认保护后才提交下一档。
+            </Typography>
             <Box
               component="details"
               sx={{
@@ -1798,13 +2111,13 @@ export default function OrderScheduleEditor({
         id="order-schedule-amount-title"
         title="下单金额"
       >
-        <Box sx={fieldGridSx}>
+        <Box sx={price.kind === "SINGLE" && entryProgram.kind !== "TIME_SLICED" ? undefined : fieldGridSx}>
+          {price.kind !== "SINGLE" || entryProgram.kind === "TIME_SLICED" ? (
           <TextField
             select
             size="small"
             label="下单额模式"
             value={amount.mode}
-            disabled={price.kind === "SINGLE" && entryProgram.kind !== "TIME_SLICED"}
             onChange={(event) => {
               const mode = event.target.value as typeof amount.mode;
               onChange({
@@ -1836,6 +2149,7 @@ export default function OrderScheduleEditor({
             <MenuItem value="EXPONENTIAL">指数增长</MenuItem>
             <MenuItem value="CUSTOM">逐档自定义</MenuItem>
           </TextField>
+          ) : null}
           <TextField
             size="small"
             type="number"
@@ -1928,21 +2242,20 @@ export default function OrderScheduleEditor({
         ) : null}
       </EditorSection>
 
+      {venue.order_type === "LIMIT" ? (
       <EditorSection
         id="order-schedule-venue-title"
         title="交易所模式"
       >
+        {venue.time_in_force === "GTC"
+          && entryProgram.kind !== "TIME_SLICED"
+          && venue.price_match === null ? (
         <Stack direction="row" spacing={1} sx={{ alignItems: "center", justifyContent: "space-between" }}>
           <FormControlLabel
             control={(
               <Switch
                 size="small"
                 checked={venue.post_only}
-                disabled={
-                  venue.order_type === "MARKET"
-                  || venue.time_in_force !== "GTC"
-                  || entryProgram.kind === "TIME_SLICED"
-                }
                 onChange={(event) => onChange({
                   ...value,
                   price_distribution: event.target.checked
@@ -1967,25 +2280,14 @@ export default function OrderScheduleEditor({
               : "允许按当前订单类型执行"}
           </Typography>
         </Stack>
-        <Box
-          component="details"
-          sx={{
-            mt: .75,
-            borderTop: 1,
-            borderColor: "divider",
-            pt: .75,
-            "& > summary": { cursor: "pointer", fontSize: 12, fontWeight: 700 },
-          }}
-        >
-          <Box component="summary">交易所订单选项 · {venueSummary}</Box>
-          <Stack spacing={1.25} sx={{ mt: 1 }}>
+        ) : null}
+        <Stack spacing={1.25} sx={{ mt: 1 }}>
             <Box sx={fieldGridSx}>
               <TextField
                 select
                 size="small"
                 label="有效方式"
                 value={venue.time_in_force ?? ""}
-                disabled={venue.order_type === "MARKET"}
                 onChange={(event) => {
                   const next = event.target.value as "GTC" | "GTD" | "IOC" | "FOK";
                   onChange({
@@ -2014,59 +2316,7 @@ export default function OrderScheduleEditor({
                 <MenuItem value="IOC">IOC · 立即成交余量撤销</MenuItem>
                 <MenuItem value="FOK">FOK · 全成或全撤</MenuItem>
               </TextField>
-              {entryProgram.kind !== "TIME_SLICED" ? (
-              <TextField
-                select
-                size="small"
-                label="串行提交顺序"
-                value={value.submission_order}
-                onChange={(event) => onChange({
-                  ...value,
-                  submission_order: event.target.value as typeof value.submission_order,
-                })}
-              >
-                <MenuItem value="LOW_TO_HIGH">低价 → 高价</MenuItem>
-                <MenuItem value="HIGH_TO_LOW">高价 → 低价</MenuItem>
-              </TextField>
-              ) : (
-                <TextField
-                  size="small"
-                  label="释放顺序"
-                  value="按时间先后"
-                  slotProps={{ htmlInput: { readOnly: true } }}
-                />
-              )}
             </Box>
-            {price.kind === "SINGLE" && venue.order_type === "LIMIT" ? (
-              <TextField
-                select
-                fullWidth
-                size="small"
-                label="priceMatch"
-                value={venue.price_match ?? ""}
-                disabled={venue.post_only}
-                onChange={(event) => {
-                  const next = event.target.value as OrderSchedulePriceMatch | "";
-                  onChange({
-                    ...value,
-                    price_distribution: { ...price, limit_price: next ? null : (price.limit_price ?? referencePrice ?? "") },
-                    venue_policy: { ...venue, price_match: next || null },
-                    dynamic_rules: next
-                      ? withoutDynamicRule(
-                        value.dynamic_rules,
-                        "REPRICE_ENTRY",
-                      )
-                      : value.dynamic_rules,
-                  });
-                }}
-                helperText={venue.post_only ? "Maker only 已启用，不能使用 priceMatch" : "使用场所队列价格时，预览成交价仍未知"}
-              >
-                <MenuItem value="">不使用（显式价格）</MenuItem>
-                {priceMatchOptions.map((option) => (
-                  <MenuItem key={option.value} value={option.value}>{option.label}</MenuItem>
-                ))}
-              </TextField>
-            ) : null}
             {venue.time_in_force === "GTD" ? (
               <TextField
                 size="small"
@@ -2081,12 +2331,9 @@ export default function OrderScheduleEditor({
                 slotProps={{ inputLabel: { shrink: true } }}
               />
             ) : null}
-            <Typography variant="caption" color="text.secondary">
-              当前为串行保护：前一档的成交、撤单竞争和保护责任闭合后，才开放下一档。
-            </Typography>
-          </Stack>
-        </Box>
+        </Stack>
       </EditorSection>
+      ) : null}
 
       <Box sx={{ px: 1.5, py: 1.25, borderBottom: 1, borderColor: "divider" }}>
         <Button
@@ -2255,7 +2502,7 @@ export default function OrderScheduleEditor({
               </Button>
               <Typography variant="caption" color="text.secondary">
                 {repriceCompatible
-                  ? " 适用于一次性或事件触发的显式 GTC 限价单；每次先确认原订单终态，再按已固定的次数、间隔与总移动上限重挂。"
+                  ? " 适用于一次性或事件触发的显式 GTC 限价单；每次先确认原订单终态，再按预设的次数、间隔与总移动上限重挂。"
                   : " 当前入场方式也不兼容；市价、区间、时间分批、IOC/FOK/GTD 与 priceMatch 不可组合。"}
               </Typography>
             </Box>
@@ -2523,16 +2770,15 @@ export default function OrderScheduleEditor({
 
       {activeMilestone === 1 ? (
         <EditorSection
-        id="order-schedule-protection-title"
-        title="成交后立即保护"
-        description="每笔成交都有只减仓保护；分批成交后按本计划当前均价重算，且不突破创建时的最大预计亏损。"
-      >
-        <Typography variant="caption" sx={{ display: "block", mb: .75, fontWeight: 750 }}>
+          id="order-schedule-protection-title"
+          title="成交后立即保护"
+        >
+        <Typography component="h3" variant="body2" sx={{ display: "block", mb: 1, fontWeight: 800 }}>
           初始止损
         </Typography>
         <Box
           data-testid="initial-stop-recommendations"
-          sx={{ ...surfaceFrameSx, mb: 1.25, p: 1.25 }}
+          sx={{ mb: 1.25, pb: 1.25, borderBottom: 1, borderColor: "divider" }}
         >
           <Stack
             direction={{ xs: "column", sm: "row" }}
@@ -2540,17 +2786,12 @@ export default function OrderScheduleEditor({
             sx={{
               alignItems: { xs: "stretch", sm: "center" },
               justifyContent: "space-between",
-              mb: .9,
+              mb: .6,
             }}
           >
-            <Box sx={{ minWidth: 0 }}>
-              <Typography variant="body2" sx={{ fontWeight: 800 }}>
-                行情止损参考
-              </Typography>
-              <Typography variant="caption" color="text.secondary">
-                周期仅影响结构、量价、趋势和 ATR 候选
-              </Typography>
-            </Box>
+            <Typography component="h4" variant="body2" sx={{ fontWeight: 800, whiteSpace: "nowrap" }}>
+              止损候选
+            </Typography>
             <ToggleButtonGroup
               exclusive
               size="small"
@@ -2560,9 +2801,11 @@ export default function OrderScheduleEditor({
                 if (interval !== null) onStopReferenceIntervalChange(interval);
               }}
               sx={{
+                ...outlinedChoiceSx,
                 flexWrap: "nowrap",
                 width: { xs: "100%", sm: "auto" },
                 "& .MuiToggleButton-root": {
+                  ...outlinedChoiceSx["& .MuiToggleButton-root"],
                   flex: { xs: 1, sm: "0 0 auto" },
                   minWidth: 0,
                   px: { xs: .5, sm: 1.25 },
@@ -2576,26 +2819,13 @@ export default function OrderScheduleEditor({
               ))}
             </ToggleButtonGroup>
           </Stack>
-          <Stack
-            direction="row"
-            spacing={1}
-            sx={{
-              alignItems: "baseline",
-              justifyContent: "space-between",
-              mb: stopRecommendations.length > 0 ? .75 : 0,
-            }}
-          >
-            <Typography variant="caption" color="text.secondary">
-              推荐止损位置
+          {stopRecommendations[0] ? (
+            <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: .5 }}>
+              {stopReferenceInterval} K 线 · 截止 {formatUserVisibleTime(stopRecommendations[0].evidenceCutoff)}
             </Typography>
-            {stopRecommendations[0] ? (
-              <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: "nowrap" }}>
-                {stopReferenceInterval} 截止 {formatUserVisibleTime(stopRecommendations[0].evidenceCutoff)}
-              </Typography>
-            ) : null}
-          </Stack>
+          ) : null}
           {stopRecommendations.length > 0 ? (
-            <Stack spacing={.75}>
+            <Stack spacing={0}>
               {stopRecommendations.map((recommendation) => {
                 const selected = approximatelyEqual(
                   value.protection_policy.initial_stop.distance_bps,
@@ -2618,6 +2848,12 @@ export default function OrderScheduleEditor({
                   recommendation.price,
                   priceTickSize,
                 );
+                const distanceBase = venue.order_type === "MARKET"
+                  ? Number(displayReferencePrice)
+                  : Number(fullFillProtectionEstimate?.average_entry_price);
+                const priceDistance = Number.isFinite(distanceBase) && distanceBase > 0
+                  ? Math.abs(recommendation.price - distanceBase)
+                  : null;
                 return (
                   <Box
                     key={recommendation.id}
@@ -2625,20 +2861,20 @@ export default function OrderScheduleEditor({
                     sx={{
                       display: "grid",
                       gridTemplateColumns: "minmax(0, 1fr) auto",
-                      gap: 1,
-                      alignItems: "center",
-                      p: .9,
-                      borderRadius: 1,
-                      bgcolor: selected ? "#FFF8E1" : "action.hover",
-                      border: 1,
-                      borderColor: selected ? "warning.main" : "transparent",
+                      columnGap: 1.25,
+                      rowGap: .45,
+                      alignItems: "start",
+                      py: 1,
+                      borderTop: 1,
+                      borderColor: selected ? "primary.main" : "divider",
+                      bgcolor: "transparent",
                     }}
                   >
-                    <Box sx={{ minWidth: 0 }}>
+                    <Box sx={{ minWidth: 0, display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", columnGap: 1, rowGap: .35 }}>
                       <Stack
                         direction="row"
-                        spacing={.75}
-                        sx={{ alignItems: "baseline", flexWrap: "wrap" }}
+                        spacing={.45}
+                        sx={{ alignItems: "center", minWidth: 0 }}
                       >
                         <Typography variant="body2" sx={{ fontWeight: 800 }}>
                           {recommendation.label}
@@ -2663,27 +2899,41 @@ export default function OrderScheduleEditor({
                           <IconButton
                             size="small"
                             aria-label={`${recommendation.label}止损逻辑`}
-                            sx={{ p: .25, alignSelf: "center" }}
+                            sx={{
+                              width: 24,
+                              height: 24,
+                              p: 0,
+                              border: 0,
+                              borderRadius: "50%",
+                              color: "text.secondary",
+                              flexShrink: 0,
+                            }}
                           >
                             <InfoOutlined sx={{ fontSize: 16 }} />
                           </IconButton>
                         </Tooltip>
-                        <Typography variant="body2" sx={{ fontWeight: 800, fontVariantNumeric: "tabular-nums" }}>
-                          {displayedPrice} USDT
-                        </Typography>
-                        <Typography variant="caption" color="text.secondary">
-                          {recommendation.distanceBpsInput} bps
-                          {estimatedLoss === null
-                            ? ""
-                            : ` · 约 ${quoteCurrencyEstimate(estimatedLoss)} USDT`}
-                        </Typography>
                       </Stack>
+                      <Typography
+                        className="mono"
+                        variant="body2"
+                        sx={{ fontWeight: 800, fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap", textAlign: "right" }}
+                      >
+                        {displayedPrice} USDT
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary" sx={{ gridColumn: "1 / -1", minWidth: 0 }}>
+                        {priceDistance === null
+                          ? `${recommendation.distanceBpsInput} bps`
+                          : `距${venue.order_type === "MARKET" ? "现价" : "预计均价"} ${roundedTradingPriceEstimate(priceDistance, priceTickSize)} USDT · ${recommendation.distanceBpsInput} bps`}
+                        {estimatedLoss === null
+                          ? ""
+                          : <> · <Box component="span" className="market-tone-down" sx={{ fontWeight: 700 }}>{`约 -${quoteCurrencyEstimate(estimatedLoss)} USDT`}</Box></>}
+                      </Typography>
                     </Box>
                     <Button
                       type="button"
                       size="small"
                       variant={selected ? "contained" : "outlined"}
-                      disabled={selected}
+                      disabled={selected || previewStale || preview.isFetching || preview.isError}
                       aria-label={`采用${recommendation.label} ${displayedPrice} USDT`}
                       onClick={() => onChange({
                         ...value,
@@ -2695,16 +2945,24 @@ export default function OrderScheduleEditor({
                           },
                         },
                       })}
-                      sx={{ minWidth: 58 }}
+                      sx={{
+                        width: 64,
+                        minWidth: 64,
+                        flexShrink: 0,
+                        ...(selected ? {
+                          "&.Mui-disabled": {
+                            bgcolor: "primary.main",
+                            color: "primary.contrastText",
+                            opacity: 1,
+                          },
+                        } : {}),
+                      }}
                     >
                       {selected ? "已采用" : "采用"}
                     </Button>
                   </Box>
                 );
               })}
-              <Typography variant="caption" color="text.secondary">
-                仅当前采用的止损会标在 K 线上。候选必须位于全部入场档位之外；当前未接入可信清算分布，因此不参与推荐。
-              </Typography>
             </Stack>
           ) : (
             <Typography variant="caption" color="text.secondary" aria-live="polite">
@@ -2712,17 +2970,28 @@ export default function OrderScheduleEditor({
                 ? `正在计算 ${stopReferenceInterval} 止损参考…`
                 : stopReferenceUnavailable
                   ? `${stopReferenceInterval} 止损参考暂不可用；当前固定止损不受影响。`
-                  : "完成当前入场配置的服务端预览与同环境行情读取后显示候选位置。"}
+                  : marketContext
+                    ? "当前周期未形成位于入场价外侧的候选止损。"
+                    : "等待归一化入场档位与当前周期行情后显示候选位置。"}
             </Typography>
           )}
         </Box>
-        <Box sx={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", gap: 1, alignItems: "center" }}>
+        {protectionLocationRisks.length > 0 ? (
+          <Box data-testid="protection-location-risk" sx={{ mb: 1.25, pl: 1, borderLeft: 3, borderColor: "warning.main" }}>
+            <Typography variant="caption" sx={{ fontWeight: 800 }}>保护位置风险</Typography>
+            <Box component="ul" sx={{ m: .4, pl: 2, "& li": { fontSize: 12 } }}>
+              {protectionLocationRisks.map((risk) => <li key={risk}>{risk}</li>)}
+            </Box>
+          </Box>
+        ) : null}
+        <Box>
           <TextField
+            fullWidth
             size="small"
             type="number"
             label="初始止损距离（bps）"
             value={value.protection_policy.initial_stop.distance_bps}
-            error={!protectionLocalReady}
+            error={!protectionLocalReady || stopExceedsDisciplineLoss}
             onChange={(event) => onChange({
               ...value,
               protection_policy: {
@@ -2733,18 +3002,26 @@ export default function OrderScheduleEditor({
                 },
               },
             })}
-            helperText={protectionLocalReady
-              ? "1% = 100 bps；最大 5000 bps"
+            helperText={stopExceedsDisciplineLoss && maximumDisciplineStopDistanceBps !== null
+              ? lossLimitedEntry.maximumEntryNotional
+                ? `超过纪律最大 ${compactDecimal(maximumDisciplineStopDistanceBps)} bps；实际最大开仓额度将按 ${quoteCurrencyEstimate(lossLimitedEntry.maximumEntryNotional)} USDT 核算。`
+                : `超过纪律最大 ${compactDecimal(maximumDisciplineStopDistanceBps)} bps。`
+              : maximumDisciplineStopDistanceBps !== null
+              ? `纪律最大 ${compactDecimal(maximumDisciplineStopDistanceBps)} bps`
+              : protectionLocalReady
+              ? undefined
               : requiredFeeEvidenceMissing || feeEvidenceLoading || feeEvidenceUnavailable
                 ? "等待同环境手续费参考，以计算费用后最大预计亏损"
-                : "必须大于 0 且不超过 5000 bps"}
-            slotProps={{ htmlInput: { min: 0, max: 5_000, step: "any" } }}
+                : "必须大于 0 且低于 10000 bps"}
+            slotProps={{ htmlInput: { min: 0, step: "any" } }}
           />
-          <Typography variant="caption" color="text.secondary">标记价格触发</Typography>
+          <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: .45 }}>
+            标记价格触发
+          </Typography>
         </Box>
         <Box
           data-testid="initial-stop-projection"
-          sx={{ ...surfaceFrameSx, mt: 1.25, p: 1.25 }}
+          sx={configuredRuleSx}
         >
           <Typography variant="body2" sx={{ fontWeight: 750, mb: .8 }}>
             止损价格与风险预览
@@ -2763,23 +3040,50 @@ export default function OrderScheduleEditor({
                 [
                   "全档成交预计均价",
                   `${roundedTradingPriceEstimate(fullFillProtectionEstimate.average_entry_price, priceTickSize)} USDT`,
+                  undefined,
                 ],
                 [
                   "全档成交预计止损",
                   `${roundedTradingPriceEstimate(fullFillProtectionEstimate.stop_price, priceTickSize)} USDT`,
+                  undefined,
                 ],
                 [
+                  venue.order_type === "MARKET" ? "距实时现价" : "距预计均价",
+                  (() => {
+                    const base = venue.order_type === "MARKET"
+                      ? Number(displayReferencePrice)
+                      : Number(fullFillProtectionEstimate.average_entry_price);
+                    const stop = Number(fullFillProtectionEstimate.stop_price);
+                    return Number.isFinite(base) && Number.isFinite(stop)
+                      ? `${roundedTradingPriceEstimate(Math.abs(base - stop), priceTickSize)} USDT`
+                      : "待行情";
+                  })(),
+                  undefined,
+                ],
+                ...(maximumDisciplineStopPrice === null ? [] : [[
+                  "纪律最大止损",
+                  `${roundedTradingPriceEstimate(maximumDisciplineStopPrice, priceTickSize)} USDT`,
+                  undefined,
+                ]]),
+                ...(lossLimitedEntry.constrained && lossLimitedEntry.maximumEntryNotional ? [[
+                  "核算后最大开仓额度",
+                  `${quoteCurrencyEstimate(lossLimitedEntry.maximumEntryNotional)} USDT`,
+                  undefined,
+                ]] : []),
+                [
                   "预计进出手续费",
-                  `${quoteCurrencyEstimate(
+                  `-${quoteCurrencyEstimate(
                     Number(fullFillProtectionEstimate.estimated_entry_fee)
                     + Number(fullFillProtectionEstimate.estimated_exit_fee),
                   )} USDT`,
+                  "market-tone-down",
                 ],
                 [
                   "最大预计亏损",
-                  `${quoteCurrencyEstimate(fullFillProtectionEstimate.maximum_projected_loss)} USDT`,
+                  `-${quoteCurrencyEstimate(fullFillProtectionEstimate.maximum_projected_loss)} USDT`,
+                  "market-tone-down",
                 ],
-              ].map(([label, display]) => (
+              ].map(([label, display, toneClassName]) => (
                 <Box key={label} sx={{ minWidth: 0 }}>
                   <Typography component="dt" variant="caption" color="text.secondary">
                     {label}
@@ -2787,6 +3091,7 @@ export default function OrderScheduleEditor({
                   <Typography
                     component="dd"
                     variant="body2"
+                    className={toneClassName}
                     sx={{ m: 0, fontWeight: 750, overflowWrap: "anywhere" }}
                   >
                     {display}
@@ -2801,12 +3106,6 @@ export default function OrderScheduleEditor({
           )}
           <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: .8 }}>
             最大预计亏损按全部标准化档位、全档成交均价、止损价及预计进出手续费计算；不含触发后滑点、跳空和未来资金费，因此不是成交结果保证。
-          </Typography>
-        </Box>
-        <Box sx={{ mt: 1.25, p: 1.25, bgcolor: "action.hover", borderRadius: 1 }}>
-          <Typography variant="body2" sx={{ fontWeight: 750 }}>运行时：按本计划当前仓位重算</Typography>
-          <Typography variant="caption" color="text.secondary">
-            新增成交后按当前归属数量与平均成本调整止损；价格可随策略放宽或收紧，但费用后预计亏损不得超过上述创建时上限。已有收益锁定不会被后续入场放松。
           </Typography>
         </Box>
         <Box sx={{ mt: 1.25 }}>
@@ -2906,7 +3205,7 @@ export default function OrderScheduleEditor({
             </Stack>
           ) : null}
           {steppedRule || profitLockRule ? (
-            <Box sx={{ ...surfaceFrameSx, mt: 1, p: 1.1 }}>
+            <Box sx={{ ...configuredRuleSx }}>
               <Stack direction="row" spacing={1} sx={{ justifyContent: "space-between", alignItems: "center" }}>
                 <Box sx={{ minWidth: 0 }}>
                   <Typography variant="body2" sx={{ fontWeight: 800 }}>
@@ -2944,7 +3243,6 @@ export default function OrderScheduleEditor({
         <EditorSection
           id="order-schedule-exit-title"
           title="自动退出"
-          description="至少保留一种自动止盈、收益锁定或时间退出；初始止损始终有效，不提供“仅手动退出”。"
         >
         <Box sx={{ mb: 1.25 }}>{fundingPanel}</Box>
         <Box
@@ -2965,7 +3263,7 @@ export default function OrderScheduleEditor({
           {exitCatalogOpen ? (
             <Stack
               spacing={1.25}
-              sx={{ ...surfaceFrameSx, mt: 1, p: 1.25 }}
+              sx={{ mt: 1, pt: 1, borderTop: 1, borderColor: "divider" }}
               aria-label="退出方式目录"
             >
               <Box>
@@ -3043,7 +3341,7 @@ export default function OrderScheduleEditor({
             </Stack>
           ) : null}
           {value.protection_policy.take_profit_ladder !== null ? (
-          <Box sx={{ ...surfaceFrameSx, mt: 1.25, p: 1.25 }}>
+          <Box sx={configuredRuleSx}>
           <Stack direction="row" spacing={1} sx={{ alignItems: "center", justifyContent: "space-between" }}>
             <Box sx={{ minWidth: 0 }}>
               <Typography variant="body2" sx={{ fontWeight: 750 }}>固定 / 分级止盈</Typography>
@@ -3069,9 +3367,6 @@ export default function OrderScheduleEditor({
           </Stack>
         {value.protection_policy.take_profit_ladder !== null ? (
           <Box sx={{ mt: .75 }}>
-            <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1 }}>
-              R 以该笔成交的初始止损距离为基准；比例合计必须为 100%。止损仍覆盖该笔成交，止盈只使用只减仓订单。
-            </Typography>
             <Box sx={{ mb: 1 }}>
               {takeProfitAfterCostPanel}
             </Box>
@@ -3207,7 +3502,7 @@ export default function OrderScheduleEditor({
           ) : null}
 
           {steppedRule ? (
-          <Box sx={{ ...surfaceFrameSx, mt: 1.25, p: 1.25 }}>
+          <Box sx={configuredRuleSx}>
             <Stack direction="row" spacing={1} sx={{ alignItems: "center", justifyContent: "space-between" }}>
               <Box sx={{ minWidth: 0 }}>
                 <Typography variant="body2" sx={{ fontWeight: 750 }}>阶梯保盈</Typography>
@@ -3230,9 +3525,6 @@ export default function OrderScheduleEditor({
             </Stack>
             {steppedRule ? (
               <Box sx={{ mt: .75 }}>
-                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1 }}>
-                  例：触发 1R、止损 0R 表示盈利达到 1R 后把止损移到入场价。新止损收到工作中事实后才撤旧止损；结果未知时保留旧保护。
-                </Typography>
                 <Stack spacing={.75}>
                   {steppedRule.steps.map((step, index) => (
                     <Box
@@ -3370,7 +3662,7 @@ export default function OrderScheduleEditor({
           ) : null}
 
           {profitLockRule ? (
-          <Box sx={{ ...surfaceFrameSx, mt: 1.25, p: 1.25 }}>
+          <Box sx={configuredRuleSx}>
             <Stack direction="row" spacing={1} sx={{ alignItems: "center", justifyContent: "space-between" }}>
               <Box sx={{ minWidth: 0 }}>
                 <Typography variant="body2" sx={{ fontWeight: 750 }}>连续收益锁定</Typography>
@@ -3511,7 +3803,7 @@ export default function OrderScheduleEditor({
           ) : null}
 
           {value.protection_policy.time_exit_seconds !== null ? (
-          <Box sx={{ ...surfaceFrameSx, mt: 1.25, p: 1.25 }}>
+          <Box sx={configuredRuleSx}>
           <Stack direction="row" spacing={1} sx={{ alignItems: "center", justifyContent: "space-between" }}>
             <Typography variant="body2" sx={{ fontWeight: 750 }}>时间退出</Typography>
             <Button
@@ -3550,18 +3842,14 @@ export default function OrderScheduleEditor({
           ) : null}
           </Box>
           ) : null}
-          <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1 }}>
-            每笔确认成交按自身成交价与数量建立保护；是否生效以交易所事实为准。
-          </Typography>
         </Box>
       </EditorSection>
       ) : null}
 
       {activeMilestone === 0 && entryDynamicRules.length > 0 ? (
-        <EditorSection
+      <EditorSection
         id="order-schedule-dynamic-title"
         title="入场管理"
-        description="管理未成交挂单的到期、行情失效与有界移动；撤单可能与成交竞争，迟到成交仍进入既定保护闭环。"
       >
         <Stack spacing={1.25}>
           {expireRule ? (
@@ -3958,45 +4246,26 @@ export default function OrderScheduleEditor({
         <EditorSection
           id="order-schedule-review-title"
           title="计划概要"
-          description="确认入场、失效、保护和自动退出意图后再保存或启动。"
         >
-          <Box
-            component="dl"
-            sx={{
-              m: 0,
-              display: "grid",
-              gridTemplateColumns: "repeat(2,minmax(0,1fr))",
-              gap: .75,
-            }}
-          >
-            {[
+          <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: .75 }}>
+            当前配置
+          </Typography>
+          <ReviewFactRows
+            rows={[
               ["入场", entryProgramSummary],
               ["订单", orderInstructionSummary],
-              ["金额", `${amountSummary} · 上限 ${quoteAmount(maxNotional)} USDT`],
+              ["下单金额", amountSummary],
               ["条件", conditionReviewSummary],
               ["入场管理", invalidationReviewSummary],
-              ["成交保护", `每笔确认成交后建立标记价止损 · 距离 ${compactDecimal(value.protection_policy.initial_stop.distance_bps)} bps`],
+              ["成交保护", `标记价止损 · ${compactDecimal(value.protection_policy.initial_stop.distance_bps)} bps`],
               ["自动退出", exitReviewSummary || "缺失"],
-            ].map(([label, display], index) => (
-              <Box
-                key={label}
-                sx={{
-                  gridColumn: index >= 3 ? "1 / -1" : "auto",
-                  px: 1,
-                  py: .85,
-                  bgcolor: "action.hover",
-                  borderRadius: 1,
-                }}
-              >
-                <Typography component="dt" variant="caption" color="text.secondary">
-                  {label}
-                </Typography>
-                <Typography component="dd" variant="body2" sx={{ m: 0, mt: .2, fontWeight: 750 }}>
-                  {display}
-                </Typography>
-              </Box>
-            ))}
-          </Box>
+            ]}
+          />
+          {reviewDisciplineSummary ? (
+            <Box sx={{ mt: 1.75 }}>
+              {reviewDisciplineSummary}
+            </Box>
+          ) : null}
         </EditorSection>
         <EditorSection
         id="order-schedule-preview-title"
@@ -4048,7 +4317,7 @@ export default function OrderScheduleEditor({
             ) : null}
             <Alert severity={preview.data.valid ? "success" : "error"}>
               {preview.data.valid
-                ? `技术预览可保存 · ${preview.data.legs.length} 档 · 标准化总额 ${quoteAmount(preview.data.effective_total_notional)} USDT`
+                ? `技术预览可保存 · ${preview.data.legs.length} 档 · 标准化总额 ${quoteCurrencyAmount(preview.data.effective_total_notional)} USDT`
                 : "预览被服务端阻断；标准化结果仅用于定位，不能形成执行档位。"}
             </Alert>
             {preview.data.issues.length > 0 ? (
@@ -4086,13 +4355,13 @@ export default function OrderScheduleEditor({
               }}
             >
               {[
-                ["请求总额", `${quoteAmount(preview.data.requested_total_notional)} USDT`],
-                ["标准化总额", `${quoteAmount(preview.data.effective_total_notional)} USDT`],
+                ["请求总额", `${quoteCurrencyAmount(preview.data.requested_total_notional)} USDT`],
+                ["标准化总额", `${quoteCurrencyAmount(preview.data.effective_total_notional)} USDT`],
                 ["计量参考价", preview.data.reference_price === null ? "未使用" : `${tradingPrice(preview.data.reference_price, priceTickSize)} USDT`],
                 ["交易所规则", preview.data.instrument_rules.source],
                 ["规则截止", formatUserVisibleTime(preview.data.source_cutoff)],
                 ["价格步进", compactDecimal(preview.data.instrument_rules.price_tick_size)],
-                ["最小名义金额", `${quoteAmount(preview.data.instrument_rules.min_notional)} USDT`],
+                ["最小名义金额", `${quoteCurrencyAmount(preview.data.instrument_rules.min_notional)} USDT`],
               ].map(([label, display]) => (
                 <Box key={label} sx={{ px: 1.25, py: 1, bgcolor: "action.hover", borderRadius: 1 }}>
                   <Typography component="dt" variant="caption" color="text.secondary">{label}</Typography>
@@ -4137,9 +4406,9 @@ export default function OrderScheduleEditor({
                       </TableCell>
                       <TableCell className="mono" align="right">{leg.price === null ? "场所决定" : tradingPrice(leg.price, priceTickSize)}</TableCell>
                       <TableCell className="mono" align="right">{tradingPrice(leg.sizing_price, priceTickSize)}</TableCell>
-                      <TableCell className="mono" align="right">{quoteAmount(leg.requested_notional)} USDT</TableCell>
+                      <TableCell className="mono" align="right">{quoteCurrencyAmount(leg.requested_notional)} USDT</TableCell>
                       <TableCell className="mono" align="right">{tradingQuantity(leg.quantity, quantityStep)}</TableCell>
-                      <TableCell className="mono" align="right">{quoteAmount(leg.effective_notional)} USDT</TableCell>
+                      <TableCell className="mono" align="right">{quoteCurrencyAmount(leg.effective_notional)} USDT</TableCell>
                     </TableRow>
                   ))}
                   {preview.data.normalized_legs.length === 0 ? (
@@ -4166,6 +4435,11 @@ export default function OrderScheduleEditor({
       </EditorSection>
         </>
       ) : null}
+      {activeMilestone === 4 ? (
+        <Box sx={{ minWidth: 0 }}>
+          {aiReviewPanel}
+        </Box>
+      ) : null}
         </Box>
         {footerControls ? (
           <Box
@@ -4178,88 +4452,7 @@ export default function OrderScheduleEditor({
               py: 1.25,
             }}
           >
-            {entrySignalWarning
-              && activeMilestone === 0
-              && !markCondition
-              && !spreadCondition
-              && !moveCondition ? (
-              <Typography
-                role="alert"
-                variant="caption"
-                color="warning.dark"
-                sx={{ display: "block", mb: .75, fontWeight: 750 }}
-              >
-                {entrySignalWarning}
-              </Typography>
-            ) : null}
-            {automaticProfitExitMissing && activeMilestone === 2 ? (
-              <Typography
-                role="alert"
-                variant="caption"
-                color="warning.dark"
-                sx={{ display: "block", mb: .75, fontWeight: 750 }}
-              >
-                必须保留至少一种自动止盈、收益锁定或时间退出方式。
-              </Typography>
-            ) : null}
-            {activeMilestone < 3
-              && localValidation.length === 0
-              && marketProjectionReady
-              && preview.data
-              && !previewStale
-              && !preview.data.valid ? (
-              <Typography
-                role="alert"
-                variant="caption"
-                color="error.main"
-                sx={{ display: "block", mb: .75, fontWeight: 750 }}
-              >
-                {preview.data.issues.length > 0
-                  ? preview.data.issues.map((issue) => previewIssueText(issue, preview.data!)).join("；")
-                  : "服务端预览未通过；请修正当前配置。"}
-              </Typography>
-            ) : null}
-            {currentMilestoneBlockingReason
-              && activeMilestone !== 1
-              && !(activeMilestone === 2 && automaticProfitExitMissing) ? (
-              <Typography
-                role="status"
-                variant="caption"
-                color="text.secondary"
-                sx={{ display: "block", mb: .75 }}
-              >
-                {currentMilestoneBlockingReason}
-              </Typography>
-            ) : null}
-            {activeMilestone === 3 ? footerControls : (
-              <Stack direction="row" spacing={1} sx={{ justifyContent: "space-between" }}>
-                <Button
-                  type="button"
-                  variant="outlined"
-                  disabled={activeMilestone === 0}
-                  onClick={() => visitMilestone(
-                    Math.max(0, activeMilestone - 1) as EditorMilestone,
-                  )}
-                >
-                  上一步
-                </Button>
-                <Button
-                  type="button"
-                  variant="contained"
-                  color="warning"
-                  disabled={activeMilestone === 0
-                    ? !entryStepReady
-                    : activeMilestone === 1
-                      ? !protectionStepReady
-                      : !exitStepReady}
-                  onClick={() => visitMilestone(
-                    Math.min(3, activeMilestone + 1) as EditorMilestone,
-                  )}
-                >
-                  下一步
-                </Button>
-              </Stack>
-            )}
+            {footerControls}
           </Box>
         ) : null}
       </Box>

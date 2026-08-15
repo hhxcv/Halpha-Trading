@@ -20,6 +20,7 @@ import {
   type ReviewSequenceScope,
 } from "../api/client";
 import { formatUserVisibleTime } from "../format";
+import { financialToneForSignedValue } from "../marketColors";
 import { surfaceFrameSx } from "../theme";
 import FactGrid from "./FactGrid";
 
@@ -64,7 +65,7 @@ export function sequenceEvidenceUsdt(value: string | null | undefined): string {
   const normalized = Math.abs(parsed) < .0000005 ? 0 : parsed;
   return `${new Intl.NumberFormat("zh-CN", {
     minimumFractionDigits: 2,
-    maximumFractionDigits: 6,
+    maximumFractionDigits: 2,
     signDisplay: "exceptZero",
   }).format(normalized)} USDT`;
 }
@@ -94,7 +95,7 @@ function sequenceEvidenceMagnitudeUsdt(value: string | null | undefined): string
   if (parsed === null) return "未知";
   return `${new Intl.NumberFormat("zh-CN", {
     minimumFractionDigits: 2,
-    maximumFractionDigits: 6,
+    maximumFractionDigits: 2,
   }).format(Math.abs(parsed))} USDT`;
 }
 
@@ -269,9 +270,9 @@ export default function ReviewSequenceEvidencePanel({
                 dense
                 facts={[
                   { label: "可排序闭合结果", value: `${metrics.trade_count} 笔`, note: `${metrics.wins} 盈 / ${metrics.losses} 亏 / ${metrics.flat} 平` },
-                  { label: "累计净盈亏", value: sequenceEvidenceUsdt(metrics.net_pnl), note: `手续费 ${sequenceEvidenceMagnitudeUsdt(metrics.commission)}` },
-                  { label: "样本路径最大回撤", value: sequenceEvidenceUsdt(`-${metrics.maximum_drawdown}`), note: metrics.maximum_drawdown_trough_at ? `谷底 ${formatUserVisibleTime(metrics.maximum_drawdown_trough_at)}` : undefined },
-                  { label: "最大亏损占全部亏损", value: sequenceEvidenceMagnitudePercent(metrics.largest_loss_share_percent), note: metrics.worst_trade_net_pnl ? `最差一笔 ${sequenceEvidenceUsdt(metrics.worst_trade_net_pnl)}` : "当前没有亏损结果" },
+                  { label: "累计净盈亏", value: sequenceEvidenceUsdt(metrics.net_pnl), tone: financialToneForSignedValue(metrics.net_pnl), note: `手续费 -${sequenceEvidenceMagnitudeUsdt(metrics.commission)}` },
+                  { label: "样本路径最大回撤", value: sequenceEvidenceUsdt(`-${metrics.maximum_drawdown}`), tone: financialToneForSignedValue(-1), note: metrics.maximum_drawdown_trough_at ? `谷底 ${formatUserVisibleTime(metrics.maximum_drawdown_trough_at)}` : undefined },
+                  { label: "最大亏损占全部亏损", value: sequenceEvidenceMagnitudePercent(metrics.largest_loss_share_percent), tone: financialToneForSignedValue(-1), note: metrics.worst_trade_net_pnl ? `最差一笔 ${sequenceEvidenceUsdt(metrics.worst_trade_net_pnl)}` : "当前没有亏损结果" },
                   { label: "最长连盈", value: segmentValue(longestWin), note: segmentNote(longestWin) },
                   { label: "最长连亏", value: segmentValue(longestLoss), note: segmentNote(longestLoss) },
                   { label: "最佳连盈段", value: segmentValue(bestWin), note: segmentNote(bestWin) },

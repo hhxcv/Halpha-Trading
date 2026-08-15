@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 
 export type MarketColorScheme = "RED_DOWN_GREEN_UP" | "RED_UP_GREEN_DOWN";
 export type MarketTone = "up" | "down";
+export type FinancialTone = "profit" | "loss";
 
 export const DEFAULT_MARKET_COLOR_SCHEME: MarketColorScheme = "RED_DOWN_GREEN_UP";
 const MARKET_COLOR_STORAGE_KEY = "halpha.market-color-scheme.v1";
@@ -37,16 +38,29 @@ export function marketToneForDirection(direction: unknown): MarketTone | undefin
   return undefined;
 }
 
-export function marketToneForSignedValue(value: unknown): MarketTone | undefined {
+/** Financial signs are stable; their color follows the active K-line palette. */
+export function financialToneForSignedValue(value: unknown): FinancialTone | undefined {
   const amount = Number(value);
   if (!Number.isFinite(amount) || amount === 0) return undefined;
-  return amount > 0 ? "up" : "down";
+  return amount > 0 ? "profit" : "loss";
 }
 
 export function marketToneClassName(tone: MarketTone | undefined): string | undefined {
   return tone ? `market-tone-${tone}` : undefined;
 }
 
+export function financialToneClassName(tone: FinancialTone | undefined): string | undefined {
+  return tone === "profit"
+    ? "market-tone-up"
+    : tone === "loss"
+      ? "market-tone-down"
+      : undefined;
+}
+
 export function MarketToneText({ tone, children }: { tone: MarketTone | undefined; children: ReactNode }) {
   return <Box component="span" className={marketToneClassName(tone)}>{children}</Box>;
+}
+
+export function FinancialToneText({ tone, children }: { tone: FinancialTone | undefined; children: ReactNode }) {
+  return <Box component="span" className={financialToneClassName(tone)}>{children}</Box>;
 }

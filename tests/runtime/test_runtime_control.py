@@ -12,6 +12,7 @@ import pytest
 import pywintypes
 
 from halpha.configuration import load_settings
+from halpha.database.schema_version import SchemaVersionError
 from halpha.control import main as control_main
 from halpha.control import render_action_report, render_error, render_status_report
 from halpha.runtime_control import (
@@ -825,6 +826,89 @@ def test_product_task_start_and_stop_use_one_controller_and_disable_restart(
     assert events == [("app", False), ("executor", False)]
     assert app.Enabled is False
     assert executor.Enabled is False
+
+
+def test_product_start_rejects_stale_database_before_touching_tasks() -> None:
+    settings = load_settings(EXAMPLE_CONFIG)
+    app = _FakeTask(DEMO_DEPLOYMENT.app_task, 3, enabled=False)
+    executor = _FakeTask(DEMO_DEPLOYMENT.executor_task, 3, enabled=False)
+    task_service = _FakeTaskService(
+        {
+            DEMO_DEPLOYMENT.app_task: app,
+            DEMO_DEPLOYMENT.executor_task: executor,
+        }
+    )
+
+    def reject_schema() -> None:
+        raise SchemaVersionError(
+            "DATABASE_SCHEMA_VERSION_MISMATCH expected=current actual=old"
+        )
+
+    controller = RuntimeController(
+        ROOT,
+        settings,
+        EXAMPLE_CONFIG,
+        task_service_factory=lambda: task_service,
+        schema_readiness=reject_schema,
+    )
+
+    with pytest.raises(
+        RuntimeControlError,
+        match="DATABASE_SCHEMA_NOT_CURRENT.*expected=current actual=old",
+    ):
+        controller.start("product")
+
+    assert task_service.requests == []
+    assert app.run_calls == executor.run_calls == 0
+    assert app.Enabled is executor.Enabled is False
+
+
+def test_autostart_enable_rejects_unavailable_database_schema() -> None:
+    settings = load_settings(EXAMPLE_CONFIG)
+    app = _FakeTask(DEMO_DEPLOYMENT.app_task, 3, enabled=False)
+    executor = _FakeTask(DEMO_DEPLOYMENT.executor_task, 3, enabled=False)
+    controller = RuntimeController(
+        ROOT,
+        settings,
+        EXAMPLE_CONFIG,
+        task_service_factory=lambda: _FakeTaskService(
+            {
+                DEMO_DEPLOYMENT.app_task: app,
+                DEMO_DEPLOYMENT.executor_task: executor,
+            }
+        ),
+        schema_readiness=lambda: (_ for _ in ()).throw(RuntimeError("private")),
+    )
+
+    with pytest.raises(
+        RuntimeControlError,
+        match=(
+            "DATABASE_SCHEMA_READINESS_UNAVAILABLE "
+            "reason=DATABASE_SCHEMA_READINESS_FAILED type=RuntimeError"
+        ),
+    ):
+        controller.set_autostart("product", enabled=True)
+
+    assert app.Enabled is executor.Enabled is False
+
+
+def test_database_schema_status_distinguishes_stale_from_unavailable() -> None:
+    settings = load_settings(EXAMPLE_CONFIG)
+
+    def unavailable_schema() -> None:
+        raise SchemaVersionError("DATABASE_SCHEMA_VERSION_UNAVAILABLE")
+
+    controller = RuntimeController(
+        ROOT,
+        settings,
+        EXAMPLE_CONFIG,
+        schema_readiness=unavailable_schema,
+    )
+
+    assert controller.database_schema_status() == {
+        "status": "UNAVAILABLE",
+        "reason": "DATABASE_SCHEMA_VERSION_UNAVAILABLE",
+    }
 
 
 def test_product_autostart_changes_task_eligibility_without_running_tasks() -> None:

@@ -29,6 +29,7 @@ from halpha.capital.models import (
     MAX_INSTRUMENT_EXPOSURE_FRACTION,
     MAX_OPEN_RISK_FRACTION,
     MAX_PLAN_LOSS_FRACTION,
+    MINIMUM_REWARD_RISK_RATIO,
     ROLLING_DRAWDOWN_LOOKBACK_DAYS,
     ROLLING_DRAWDOWN_STOP_FRACTION,
     WEEKLY_LOSS_STOP_FRACTION,
@@ -486,6 +487,8 @@ class HalphaSettings(BaseSettings):
             > Decimal(WEEKLY_LOSS_STOP_FRACTION)
             or Decimal(policy.rolling_drawdown_stop_fraction)
             > Decimal(ROLLING_DRAWDOWN_STOP_FRACTION)
+            or Decimal(policy.minimum_reward_risk_ratio)
+            < Decimal(MINIMUM_REWARD_RISK_RATIO)
             # A shorter lookback can forget the previous equity peak earlier and
             # therefore relax admission.  Only the baseline window or a longer
             # one is a monotonic tightening of this policy.

@@ -55,6 +55,12 @@ def test_condition_group_uses_kleene_all_and_any_semantics() -> None:
     )
 
 
+def test_initial_stop_uses_the_discipline_budget_not_a_static_half_price_cap() -> None:
+    assert InitialStopSpec(distance_bps="7500").distance_bps == "7500"
+    with pytest.raises(ValidationError, match="PROTECTION_POLICY_INVALID"):
+        InitialStopSpec(distance_bps="10000")
+
+
 def test_price_spread_and_window_move_conditions_are_exact() -> None:
     facts = ConditionFacts(
         mark_price="100",

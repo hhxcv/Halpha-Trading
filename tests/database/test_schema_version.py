@@ -40,6 +40,20 @@ def test_current_schema_is_accepted() -> None:
     ]
 
 
+def test_current_schema_is_accepted_through_sqlalchemy_driver_sql() -> None:
+    calls: list[str] = []
+
+    class _SqlAlchemyConnection:
+        @staticmethod
+        def exec_driver_sql(query: str) -> _Cursor:
+            calls.append(query)
+            return _Cursor([(CURRENT_SCHEMA_REVISION,)])
+
+    require_current_schema(_SqlAlchemyConnection())
+
+    assert calls == ["SELECT version_num FROM halpha_meta.alembic_version"]
+
+
 @pytest.mark.parametrize("rows", [[], [("old",)], [(CURRENT_SCHEMA_REVISION,), ("old",)]])
 def test_missing_stale_or_ambiguous_schema_is_rejected(rows) -> None:
     with pytest.raises(SchemaVersionError, match="DATABASE_SCHEMA_VERSION_MISMATCH"):

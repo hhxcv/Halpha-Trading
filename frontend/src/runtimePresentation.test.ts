@@ -797,7 +797,7 @@ describe("runtime presentation", () => {
       "0.1",
     )).toEqual({
       headline: "价格已错过机会边界，取消入场",
-      detail: "标记价 64,418.4… USDT 已到达机会错过边界 64,390.0 USDT；未形成交易所风险",
+      detail: "标记价 64,418.5 USDT 已到达机会错过边界 64,390.0 USDT；未形成交易所风险",
     });
     expect(runtimeNoActionPresentation(
       "ENTRY_MARKET_INVALIDATED",

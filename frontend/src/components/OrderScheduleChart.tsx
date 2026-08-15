@@ -1816,7 +1816,7 @@ export default function OrderScheduleChart({
     );
   const previewStatus = previewState === "READY"
     ? displayMode === "RUNTIME"
-      ? `${previewLegs.length} 条已固定计划档位`
+      ? `${previewLegs.length} 条已归一化计划档位`
       : hasFixedEntryPrices
         ? `${previewLegs.length} 条服务端归一化草稿线`
         : `${previewLegs.length} 个服务端归一化草稿档位`

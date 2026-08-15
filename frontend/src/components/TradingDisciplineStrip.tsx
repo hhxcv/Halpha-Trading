@@ -1,13 +1,13 @@
 import { Alert, Box, Chip, Stack, Typography } from "@mui/material";
 
 import type { Overview } from "../api/client";
-import { formatUserVisibleTime, quoteAmount } from "../format";
+import { formatUserVisibleTime, quoteCurrencyAmount } from "../format";
 import { surfaceFrameSx } from "../theme";
 
 
-const blockerLabels: Record<string, string> = {
+export const newRiskDisciplineBlockerLabels: Record<string, string> = {
   ACCOUNT_EQUITY_SNAPSHOT_UNAVAILABLE: "账户权益事实不可用",
-  ACCOUNT_EQUITY_SNAPSHOT_STALE: "账户权益事实已过期",
+  ACCOUNT_EQUITY_SNAPSHOT_STALE: "账户权益快照未刷新",
   ACCOUNT_EQUITY_SNAPSHOT_TIME_INVALID: "账户权益事实时间异常",
   ACCOUNT_RISK_EQUITY_NOT_POSITIVE: "风险权益不为正数",
   ACCOUNT_TRADING_DISABLED: "交易所账户当前不允许交易",
@@ -28,6 +28,269 @@ const blockerLabels: Record<string, string> = {
   NEW_RISK_ROLLING_DRAWDOWN_STOP_REACHED: "滚动账户回撤已触发新增风险停止",
 };
 
+export type NewRiskDiscipline = Overview["new_risk_discipline"];
+
+type NewRiskDisciplineRecoveryInput = Partial<Pick<
+  NewRiskDiscipline,
+  | "day_window_started_at"
+  | "week_window_started_at"
+  | "rolling_drawdown_lookback_days"
+>> & {
+  blocker_codes: readonly string[];
+};
+
+export type NewRiskDisciplineRecoveryCue = {
+  key: string;
+  text: string;
+};
+
+export function newRiskDisciplineBlockerText(codes: readonly string[]): string {
+  return codes
+    .map((code) => newRiskDisciplineBlockerLabels[code] ?? code)
+    .join("；");
+}
+
+export function newRiskDisciplineBlockerCodesFromFailureCode(
+  code: string,
+): string[] {
+  return code
+    .split(/[;,]/u)
+    .map((item) => item.trim())
+    .filter((item) => item in newRiskDisciplineBlockerLabels);
+}
+
+type AccountObservationFacts = Pick<
+  Overview,
+  | "account_snapshot_status"
+  | "account_snapshot_age_seconds"
+  | "account_observation_failure_code"
+>;
+
+function accountObservationFailureLabel(code: string): string {
+  if (code.startsWith("ACCOUNT_SNAPSHOT_QUERY_FAILED_")) {
+    if (code.includes("TIMEOUT")) return "交易所账户查询超时";
+    if (code.includes("CONNECTION") || code.includes("OSERROR")) {
+      return "交易所账户查询连接失败";
+    }
+    if (code.includes("HTTPERROR")) return "交易所账户查询返回错误";
+    return "交易所账户查询失败";
+  }
+  if (code.startsWith("ACCOUNT_SNAPSHOT_PERSIST_FAILED_")) {
+    return "账户快照保存失败";
+  }
+  if (code === "ACCOUNT_SNAPSHOT_IDENTITY_CONFLICT") {
+    return "账户快照写入冲突";
+  }
+  return "账户快照刷新失败";
+}
+
+/**
+ * Separates a missing snapshot from its known operational cause.  A stale
+ * snapshot is an age result, not evidence of a network fault.
+ */
+export function accountObservationBlockerText(
+  facts: AccountObservationFacts | null | undefined,
+  executorStatus?: string,
+): string | null {
+  if (!facts) return null;
+  const failureCode = facts.account_observation_failure_code;
+  if (failureCode) return accountObservationFailureLabel(failureCode);
+  if (facts.account_snapshot_status === "STALE") {
+    const age = facts.account_snapshot_age_seconds;
+    return Number.isInteger(age) && age !== null
+      ? `账户权益快照未刷新（${age} 秒）`
+      : "账户权益快照未刷新";
+  }
+  if (facts.account_snapshot_status === "UNAVAILABLE") {
+    if (executorStatus === "UNAVAILABLE") return "账户观察服务未运行";
+    if (executorStatus === "STARTING") return "账户观察服务正在启动";
+    if (executorStatus === "BUILD_MISMATCH") return "账户观察服务版本不一致";
+    return "账户权益快照不可用";
+  }
+  if (facts.account_snapshot_status === "UNKNOWN") {
+    return "账户权益快照状态异常";
+  }
+  return null;
+}
+
+function nextWindowStart(
+  windowStartedAt: string | undefined,
+  windowMilliseconds: number,
+): string | null {
+  if (!windowStartedAt) return null;
+  const start = Date.parse(windowStartedAt);
+  if (!Number.isFinite(start)) return null;
+  return new Date(start + windowMilliseconds).toISOString();
+}
+
+function earliestWindowReviewText(
+  nextWindowAt: string | null,
+  label: string,
+): string {
+  return nextWindowAt
+    ? `最早可在 ${formatUserVisibleTime(nextWindowAt)}（${label}重新开始）后重新核对；这不是恢复承诺，仍须以届时完整账户事实和全部阻断项为准。`
+    : `等待${label}重新开始后重新核对；当前无法计算确切时刻，仍须以完整账户事实和全部阻断项为准。`;
+}
+
+export function newRiskDisciplineRecoveryGuidance(
+  discipline: NewRiskDisciplineRecoveryInput,
+): NewRiskDisciplineRecoveryCue[] {
+  const codes = new Set(discipline.blocker_codes);
+  const cues: NewRiskDisciplineRecoveryCue[] = [];
+  const add = (key: string, text: string) => {
+    if (!cues.some((item) => item.key === key)) cues.push({ key, text });
+  };
+  const hasAny = (...values: string[]) => values.some((value) => codes.has(value));
+
+  if (hasAny(
+    "ACCOUNT_EQUITY_SNAPSHOT_UNAVAILABLE",
+    "ACCOUNT_EQUITY_SNAPSHOT_STALE",
+    "ACCOUNT_EQUITY_SNAPSHOT_TIME_INVALID",
+  )) {
+    add(
+      "fresh-account-facts",
+      "等待下一次完整账户快照后重新核对；如账户观察已报告原因，请先处理该原因。",
+    );
+  }
+  if (codes.has("ACCOUNT_TRADING_DISABLED")) {
+    add(
+      "trading-enabled",
+      "需要交易所账户恢复可交易，并由新的完整账户快照证明；当前没有可承诺的恢复时刻。",
+    );
+  }
+  if (codes.has("ACCOUNT_RISK_EQUITY_NOT_POSITIVE")) {
+    add(
+      "positive-risk-equity",
+      "钱包余额与保证金余额的较小值需要恢复为正数，并由新的完整账户快照重新计算；这不是资金保证或自动入金提示。",
+    );
+  }
+  if (hasAny(
+    "NEW_RISK_PROPOSED_LOSS_INVALID",
+    "NEW_RISK_PROPOSED_NOTIONAL_INVALID",
+    "NEW_RISK_PROPOSED_INSTRUMENT_INVALID",
+    "NEW_RISK_PROPOSED_DIRECTION_INVALID",
+    "NEW_RISK_ENTRY_DIRECTION_INVALID",
+  )) {
+    add(
+      "plan-input",
+      "修正草稿的金额、品种或方向后重新形成服务端预览；运行中计划的实质修改应创建新草稿，不能绕过检查。",
+    );
+  }
+  if (codes.has("NEW_RISK_PLAN_LOSS_LIMIT_EXCEEDED")) {
+    add(
+      "plan-loss-limit",
+      "将草稿最大预计损失收窄到当前单计划上限以内，再重新提交并启动；不以等待时间解除。",
+    );
+  }
+  if (hasAny(
+    "NEW_RISK_OPEN_RISK_LIMIT_EXCEEDED",
+    "NEW_RISK_GROSS_EXPOSURE_LIMIT_EXCEEDED",
+    "NEW_RISK_INSTRUMENT_EXPOSURE_LIMIT_EXCEEDED",
+    "NEW_RISK_CORRELATED_EXPOSURE_LIMIT_EXCEEDED",
+  )) {
+    add(
+      "portfolio-capacity",
+      "等待相关未闭合计划、持仓、开放委托或在途责任真实变化后，以新的完整账户快照重算容量；没有固定等待时长，也不应为了清除门槛而自动平仓。",
+    );
+  }
+  if (codes.has("NEW_RISK_DAILY_LOSS_STOP_REACHED")) {
+    add(
+      "daily-loss-window",
+      earliestWindowReviewText(
+        nextWindowStart(discipline.day_window_started_at, 24 * 60 * 60 * 1_000),
+        "纪律日窗口",
+      ),
+    );
+  }
+  if (codes.has("NEW_RISK_WEEKLY_LOSS_STOP_REACHED")) {
+    add(
+      "weekly-loss-window",
+      earliestWindowReviewText(
+        nextWindowStart(discipline.week_window_started_at, 7 * 24 * 60 * 60 * 1_000),
+        "纪律周窗口",
+      ),
+    );
+  }
+  if (codes.has("NEW_RISK_ROLLING_DRAWDOWN_STOP_REACHED")) {
+    const lookbackDays = discipline.rolling_drawdown_lookback_days;
+    add(
+      "rolling-drawdown",
+      `没有固定解锁时刻。刷新后账户回撤必须低于阈值；${Number.isInteger(lookbackDays) ? `${lookbackDays} 日` : "滚动"}权益高水位何时移出窗口及届时权益都会影响结果。`,
+    );
+  }
+  if (codes.has("NEW_RISK_LOSING_POSITION_ADD_PROHIBITED")) {
+    add(
+      "losing-position",
+      "同品种同方向持仓需要不再浮亏或已不存在，并由新的完整账户快照确认；普通新计划没有按时间自动恢复的例外。",
+    );
+  }
+  if (codes.has("NEW_RISK_CORRELATION_CLUSTER_UNKNOWN")) {
+    add(
+      "correlation-cluster",
+      "当前品种没有受支持的相关风险簇。这不是等待可解决的状态；请改用受支持品种，不能把未知风险簇当作零风险。",
+    );
+  }
+  for (const code of codes) {
+    if (!(code in newRiskDisciplineBlockerLabels)) continue;
+    if (!cues.some((item) => item.key === code)) {
+      add(
+        code,
+        "需要在下一次服务端当前事实复核中确认该原因已解除；当前没有可承诺的恢复时刻。",
+      );
+    }
+  }
+  return cues;
+}
+
+export function NewRiskDisciplineBlockNotice({
+  discipline,
+  blockerCodes = discipline?.blocker_codes ?? [],
+  title = "新增风险纪律未通过",
+  consequence = "这只阻止新的风险计划；已有风险仍可保护、撤单、减仓、退出或接管。",
+}: {
+  discipline?: NewRiskDiscipline | null;
+  blockerCodes?: readonly string[];
+  title?: string;
+  consequence?: string;
+}) {
+  const effectiveBlockerCodes = blockerCodes.length > 0
+    ? blockerCodes
+    : discipline?.blocker_codes ?? [];
+  if (effectiveBlockerCodes.length === 0 && discipline?.new_risk_allowed !== false) {
+    return null;
+  }
+  const recovery = newRiskDisciplineRecoveryGuidance({
+    blocker_codes: effectiveBlockerCodes,
+    day_window_started_at: discipline?.day_window_started_at,
+    week_window_started_at: discipline?.week_window_started_at,
+    rolling_drawdown_lookback_days: discipline?.rolling_drawdown_lookback_days,
+  });
+  if (recovery.length === 0 && discipline?.new_risk_allowed === false) {
+    recovery.push({
+      key: "current-facts",
+      text: "重新读取服务端当前事实后再核对；当前没有可承诺的恢复时刻，也不能由页面确认覆盖。",
+    });
+  }
+  const severity = discipline?.status === "UNKNOWN" ? "warning" : "error";
+
+  return (
+    <Alert severity={severity} variant="outlined" aria-live="polite">
+      <Typography component="div" sx={{ fontWeight: 800 }}>{title}</Typography>
+      <Typography component="div" variant="body2" sx={{ mt: .35 }}>
+        {newRiskDisciplineBlockerText(effectiveBlockerCodes) || "当前事实无法确认"}。
+      </Typography>
+      {recovery.length > 0 && (
+        <Box component="ul" sx={{ pl: 2.25, my: .75, "& li + li": { mt: .35 } }}>
+          {recovery.map((item) => <li key={item.key}>
+            <Typography component="span" variant="body2">{item.text}</Typography>
+          </li>)}
+        </Box>
+      )}
+      <Typography component="div" variant="body2">{consequence}</Typography>
+    </Alert>
+  );
+}
+
 function percent(value: string): string {
   const number = Number(value);
   if (!Number.isFinite(number)) return "未知";
@@ -37,7 +300,7 @@ function percent(value: string): string {
 function amount(value: string | null | undefined): string {
   return value === null || value === undefined
     ? "未知"
-    : `${quoteAmount(value)} USDT`;
+    : `${quoteCurrencyAmount(value)} USDT`;
 }
 
 export function maxPlanLossFractionNote(
@@ -64,7 +327,7 @@ type TradingAccessFacts = Pick<
 
 export function tradingAccessNotice(facts: TradingAccessFacts): string | null {
   if (facts.profile === "BINANCE_LIVE_READ_ONLY") {
-    return "当前为实盘只读观察：风险纪律只说明账户事实与额度计算结果，不能保存、固定或激活计划，也不能提交交易所动作。";
+    return "当前为实盘只读观察：风险纪律只说明账户事实与额度计算结果，不能保存或提交并启动计划，也不能提交交易所动作。";
   }
   if (
     facts.environment_kind === "LIVE"
@@ -89,9 +352,6 @@ export default function TradingDisciplineStrip({ overview }: { overview: Overvie
       ? "暂停新增风险"
       : "风险纪律允许";
   const accessNotice = tradingAccessNotice(overview);
-  const blockerText = discipline.blocker_codes
-    .map((code) => blockerLabels[code] ?? code)
-    .join("；");
   const facts = [
     {
       label: "账户权益",
@@ -112,6 +372,11 @@ export default function TradingDisciplineStrip({ overview }: { overview: Overvie
         discipline.risk_equity,
         discipline.max_plan_loss,
       ),
+    },
+    {
+      label: "最低计划收益 / 风险",
+      value: `${discipline.minimum_reward_risk_ratio}R`,
+      note: "按价格止盈数量比例加权；时间退出不能替代该新增风险纪律",
     },
     {
       label: "组合风险容量",
@@ -182,10 +447,10 @@ export default function TradingDisciplineStrip({ overview }: { overview: Overvie
           {accessNotice}
         </Alert>
       )}
-      {blockerText && (
-        <Alert severity={severity === "success" ? "info" : severity} variant="outlined" sx={{ mt: 1.5 }}>
-          {blockerText}。这只阻止新的风险计划；已有风险仍可保护、撤单、减仓、退出或接管。
-        </Alert>
+      {discipline.blocker_codes.length > 0 && (
+        <Box sx={{ mt: 1.5 }}>
+          <NewRiskDisciplineBlockNotice discipline={discipline} />
+        </Box>
       )}
     </Box>
   );

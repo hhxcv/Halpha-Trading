@@ -15,9 +15,11 @@ from sqlalchemy.pool import NullPool
 
 from halpha.configuration import (
     DatabaseMaintenanceTarget,
+    HalphaSettings,
     load_settings,
     maintenance_settings,
 )
+from halpha.database.schema_version import require_current_schema
 from halpha.runtime_identity import repository_root, require_repository_runtime
 from halpha.windows_runtime import (
     acquire_executor_maintenance_mutex,
@@ -31,6 +33,16 @@ class MigrationMutexScope:
     name: str
     executor_task_sid: str
     maintenance_sid: str
+
+
+def _environment_for_settings(settings: HalphaSettings) -> str:
+    """Return the one maintenance target allowed by this product context."""
+
+    return {
+        "USDM_DEMO": "demo",
+        "USDM_COPY_LEAD": "live_copy",
+        "USDM_PERSONAL": "live_personal",
+    }[settings.release.venue_account_type.value]
 
 
 def _alembic_config(
@@ -52,11 +64,7 @@ def _migration_target(
     mutating: bool = False,
 ) -> tuple[DatabaseMaintenanceTarget, str, MigrationMutexScope]:
     settings = load_settings(config_path)
-    expected_environment = {
-        "USDM_DEMO": "demo",
-        "USDM_COPY_LEAD": "live_copy",
-        "USDM_PERSONAL": "live_personal",
-    }[settings.release.venue_account_type.value]
+    expected_environment = _environment_for_settings(settings)
     if environment != expected_environment:
         raise ValueError("MIGRATION_ENVIRONMENT_PROFILE_MISMATCH")
     if mutating:
@@ -110,6 +118,9 @@ def _run_alembic(
             mutating = operation == "upgrade"
             if not mutating:
                 connection.execute(text("SET TRANSACTION READ ONLY"))
+            if operation == "verify":
+                require_current_schema(connection)
+                return
             config = _alembic_config(
                 repository_root(),
                 connection,
@@ -123,6 +134,30 @@ def _run_alembic(
         engine.dispose()
 
 
+def verify_current_schema_for_config(config_path: Path) -> None:
+    """Read the selected database and require the current product schema.
+
+    This is deliberately read-only and does not acquire the Executor maintenance
+    mutex: it is a lifecycle preflight, not a migration.  Applying a migration
+    remains an explicit, serialized maintenance operation.
+    """
+
+    settings = load_settings(config_path)
+    selected, secret, _ = _migration_target(
+        config_path,
+        _environment_for_settings(settings),
+    )
+    try:
+        _run_alembic(
+            selected=selected,
+            secret=secret,
+            operation="verify",
+            target="head",
+        )
+    finally:
+        secret = None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m halpha.database.migrate")
     parser.add_argument("--config", type=Path, required=True)
@@ -130,20 +165,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         "environment",
         choices=("demo", "live_copy", "live_personal"),
     )
-    parser.add_argument("operation", choices=("upgrade", "downgrade", "current"))
+    parser.add_argument(
+        "operation",
+        choices=("upgrade", "downgrade", "current", "verify"),
+    )
     parser.add_argument("target", nargs="?", default="head")
     args = parser.parse_args(argv)
 
     require_repository_runtime()
     if args.operation == "downgrade":
         raise ValueError("DATABASE_DOWNGRADE_FORBIDDEN")
+    if args.operation == "verify" and args.target != "head":
+        raise ValueError("DATABASE_SCHEMA_VERIFY_TARGET_INVALID")
     selected, secret, mutex_scope = _migration_target(
         args.config,
         args.environment,
         mutating=args.operation in {"upgrade", "downgrade"},
     )
     try:
-        if args.operation == "current":
+        if args.operation in {"current", "verify"}:
             _run_alembic(
                 selected=selected,
                 secret=secret,

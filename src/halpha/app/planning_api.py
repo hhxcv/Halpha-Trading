@@ -19,6 +19,16 @@ from pydantic import (
     model_validator,
 )
 
+from halpha.app.plan_ai_review import (
+    PLAN_AI_REVIEW_PROMPT_VERSION,
+    PlanAiReviewConfiguration,
+    PlanAiReviewRecord,
+    PlanAiReviewResult,
+    PlanAiReviewStatus,
+    PostgreSQLPlanAiReviewStore,
+    plan_ai_review_approval_is_current,
+)
+
 from halpha.binance_contracts import (
     BINANCE_USDM_ACCOUNT_POSITION_ORDER_QUERY_PATHS,
     BINANCE_USDM_ACCOUNT_SNAPSHOT_QUERY_PATHS,
@@ -59,6 +69,7 @@ from halpha.planning.models import (
     TradePlanContent,
     TradePlanVersion,
     new_risk_decision_context_incompatibility,
+    validate_current_plan_admission,
 )
 from halpha.planning.order_schedule import (
     OrderSchedulePreview,
@@ -154,12 +165,6 @@ class PlanDraftPayload(ApiModel):
             ):
                 raise ValueError("POSITION_ALIGNMENT_PLAN_SHAPE_INVALID")
             return self
-        context_incompatibility = new_risk_decision_context_incompatibility(
-            decision_basis_kind=self.decision_basis.kind,
-            decision_context=self.decision_context,
-        )
-        if context_incompatibility is not None:
-            raise ValueError(context_incompatibility)
         if (
             self.decision_basis.kind is DecisionBasisKind.STRATEGY_SIGNAL
             and self.decision_basis.parameters.get("demo_immediate_entry") is True
@@ -528,21 +533,50 @@ class PostgreSQLPlanningApi:
             rows = connection.execute(
                 """
                 SELECT d.plan_id, d.draft_version, d.content_digest, d.updated_at,
-                       d.content, v.plan_version_id, v.fixed_at, v.content_digest,
+                       d.content,
+                       a.activation_id, a.lifecycle, a.created_at, a.updated_at,
+                       v.plan_version_id, v.fixed_at, v.content_digest,
                        v.product_build_id, v.terms ->> 'valid_until',
                        v.fixed_decision_basis, v.order_schedule_spec,
                        v.order_schedule_spec_digest, v.terms -> 'allowed_actions',
-                       v.position_alignment, v.terms -> 'decision_context'
+                       v.position_alignment, v.terms -> 'decision_context',
+                       v.ai_review_ref,
+                       CASE WHEN r.review_id IS NULL THEN NULL ELSE jsonb_build_object(
+                           'review_id', r.review_id,
+                           'status', r.status,
+                           'decision', r.decision,
+                           'draft_content_digest', r.draft_content_digest,
+                           'prompt_version', r.prompt_version,
+                           'configuration', jsonb_build_object(
+                               'model', r.review_model,
+                               'reasoning_effort', r.reasoning_effort
+                           ),
+                           'market_context_digest', r.market_context_digest,
+                           'market_source_cutoff', r.market_source_cutoff,
+                           'reason', r.reason,
+                           'suggestions', r.suggestions,
+                           'completed_at', r.completed_at
+                ) END
                 FROM halpha.trade_plan_draft d
                 LEFT JOIN LATERAL (
-                    SELECT plan_version_id, fixed_at, content_digest,
-                           product_build_id, terms, fixed_decision_basis,
-                           order_schedule_spec, order_schedule_spec_digest
-                           , position_alignment
-                    FROM halpha.trade_plan_version v
-                    WHERE v.environment_id = d.environment_id AND v.plan_id = d.plan_id
-                    ORDER BY fixed_at DESC LIMIT 1
-                ) v ON true
+                    SELECT activation.activation_id, activation.lifecycle,
+                           activation.created_at, activation.updated_at,
+                           activation.plan_version_ref
+                    FROM halpha.plan_activation activation
+                    JOIN halpha.trade_plan_version snapshot
+                      ON snapshot.environment_id = activation.environment_id
+                     AND snapshot.plan_version_id = activation.plan_version_ref
+                    WHERE activation.environment_id = d.environment_id
+                      AND snapshot.plan_id = d.plan_id
+                    ORDER BY activation.created_at DESC, activation.activation_id DESC
+                    LIMIT 1
+                ) a ON true
+                LEFT JOIN halpha.trade_plan_version v
+                  ON v.environment_id = d.environment_id
+                 AND v.plan_version_id = a.plan_version_ref
+                LEFT JOIN halpha.plan_ai_review r
+                  ON r.environment_id = d.environment_id
+                 AND r.review_id = v.ai_review_ref
                 WHERE d.environment_id = %s
                 ORDER BY d.updated_at DESC
                 """,
@@ -554,75 +588,97 @@ class PostgreSQLPlanningApi:
             basis = DraftDecisionBasis.model_validate(content["decision_basis"])
             requested_limits = dict(content["requested_limits"])
             runtime_incompatibility: str | None = None
-            if row[5] is not None:
+            if row[9] is not None:
                 try:
                     fixed_schedule_spec = load_persisted_order_schedule_spec(
-                        row[11],
-                        row[12],
+                        row[15],
+                        row[16],
                     )
                     runtime_incompatibility = plan_runtime_incompatibility(
                         decision_basis=_FIXED_DECISION_BASIS_ADAPTER.validate_python(
-                            row[10]
+                            row[14]
                         ),
                         decision_context=(
-                            PlanDecisionContext.model_validate(row[15])
-                            if row[15] is not None
+                            PlanDecisionContext.model_validate(row[19])
+                            if row[19] is not None
                             else None
                         ),
                         order_schedule_spec=fixed_schedule_spec,
                         allowed_actions=frozenset(
-                            str(item) for item in (row[13] or ())
+                            str(item) for item in (row[17] or ())
                         ),
                         position_alignment=(
-                            PositionAlignmentSpec.model_validate(row[14])
-                            if row[14] is not None
+                            PositionAlignmentSpec.model_validate(row[18])
+                            if row[18] is not None
                             else None
                         ),
                     )
                 except (TypeError, ValueError):
                     runtime_incompatibility = "PLAN_FIXED_CONTENT_UNREADABLE"
+            ai_review_ref = str(row[20]) if row[20] is not None else None
+            activation_lifecycle = str(row[6]) if row[6] is not None else None
+            status = (
+                "DRAFT"
+                if row[5] is None
+                else "ENDED"
+                if activation_lifecycle == "COMPLETED"
+                else "RUNNING"
+            )
             result.append(
                 {
-                "plan_id": str(row[0]),
-                "draft_version": int(row[1]),
-                "draft_content_digest": str(row[2]),
-                "updated_at": row[3].isoformat(),
-                "plan_name": content.get("plan_name"),
-                "created_at": _iso_value(content.get("created_at")),
-                "creator_kind": _enum_value(content.get("creator_kind")),
-                "decision_context": content.get("decision_context"),
-                "decision_basis": basis.model_dump(mode="json"),
-                "decision_basis_kind": basis.kind.value,
-                "decision_basis_ref": basis.decision_basis_ref,
-                "strategy_id": (
-                    basis.decision_basis_ref
-                    if basis.kind is DecisionBasisKind.STRATEGY_SIGNAL
-                    else None
-                ),
-                "instrument_ref": str(content["instrument_ref"]),
-                "direction": str(_enum_value(content["direction"])),
-                "parameters": dict(basis.parameters),
-                "order_schedule_spec": content.get("order_schedule_spec"),
-                "position_alignment": content.get("position_alignment"),
-                "max_notional": str(requested_limits["max_notional"]),
-                "valid_from": _iso_value(content["valid_from"]),
-                "valid_until": _iso_value(content["valid_until"]),
-                "plan_version_id": str(row[5]) if row[5] is not None else None,
-                "fixed_at": row[6].isoformat() if row[6] is not None else None,
-                "fixed_content_digest": str(row[7]) if row[7] is not None else None,
-                "fixed_product_build_id": str(row[8]) if row[8] is not None else None,
-                "fixed_valid_until": str(row[9]) if row[9] is not None else None,
-                "product_build_consistent": (
-                    str(row[8]) == self._product_build_id
-                    if row[8] is not None
-                    else None
-                ),
-                "runtime_compatible": (
-                    runtime_incompatibility is None
-                    if row[5] is not None
-                    else None
-                ),
-                "runtime_incompatibility_reason": runtime_incompatibility,
+                    "plan_id": str(row[0]),
+                    "draft_version": int(row[1]),
+                    "draft_content_digest": str(row[2]),
+                    "updated_at": row[3].isoformat(),
+                    "plan_name": content.get("plan_name"),
+                    "created_at": _iso_value(content.get("created_at")),
+                    "creator_kind": _enum_value(content.get("creator_kind")),
+                    "decision_context": content.get("decision_context"),
+                    "decision_basis": basis.model_dump(mode="json"),
+                    "decision_basis_kind": basis.kind.value,
+                    "decision_basis_ref": basis.decision_basis_ref,
+                    "strategy_id": (
+                        basis.decision_basis_ref
+                        if basis.kind is DecisionBasisKind.STRATEGY_SIGNAL
+                        else None
+                    ),
+                    "instrument_ref": str(content["instrument_ref"]),
+                    "direction": str(_enum_value(content["direction"])),
+                    "parameters": dict(basis.parameters),
+                    "order_schedule_spec": content.get("order_schedule_spec"),
+                    "position_alignment": content.get("position_alignment"),
+                    "max_notional": str(requested_limits["max_notional"]),
+                    "valid_from": _iso_value(content["valid_from"]),
+                    "valid_until": _iso_value(content["valid_until"]),
+                    "status": status,
+                    "activation_id": str(row[5]) if row[5] is not None else None,
+                    "activation_lifecycle": activation_lifecycle,
+                    "activation_created_at": (
+                        row[7].isoformat() if row[7] is not None else None
+                    ),
+                    "activation_updated_at": (
+                        row[8].isoformat() if row[8] is not None else None
+                    ),
+                    "plan_version_id": str(row[9]) if row[9] is not None else None,
+                    "fixed_at": row[10].isoformat() if row[10] is not None else None,
+                    "fixed_content_digest": str(row[11]) if row[11] is not None else None,
+                    "fixed_product_build_id": str(row[12]) if row[12] is not None else None,
+                    "fixed_valid_until": str(row[13]) if row[13] is not None else None,
+                    "product_build_consistent": (
+                        str(row[12]) == self._product_build_id
+                        if row[12] is not None
+                        else None
+                    ),
+                    "runtime_compatible": (
+                        runtime_incompatibility is None
+                        if row[9] is not None
+                        else None
+                    ),
+                    "runtime_incompatibility_reason": runtime_incompatibility,
+                    "ai_review_ref": ai_review_ref,
+                    "ai_review": (
+                        dict(row[21]) if row[21] is not None else None
+                    ),
                 }
             )
         return result
@@ -633,6 +689,295 @@ class PostgreSQLPlanningApi:
                 connection, self._environment_id
             ).get_draft(plan_id)
         return draft.model_dump(mode="json")
+
+    def request_ai_review(
+        self,
+        plan_id: str,
+        *,
+        idempotency_key: str,
+        expected_version: int,
+        configuration: PlanAiReviewConfiguration,
+        review_evidence_cutoff: datetime,
+        observed_at: datetime,
+    ) -> dict[str, Any]:
+        """Bind a queued review to a freshly collected server market cutoff.
+
+        ``evidence_cutoff`` is system metadata, not a browser assertion.  It
+        is refreshed in the same transaction that creates the immutable review
+        identity, so the reviewer never receives a current market snapshot
+        paired with an old draft cutoff.
+        """
+
+        self._require_product_mutation_allowed()
+        if review_evidence_cutoff.utcoffset() is None:
+            raise ValueError("PLAN_AI_REVIEW_CONTEXT_INVALID")
+        review_id = _stable_id(
+            self._environment_id,
+            "plan-ai-review",
+            idempotency_key,
+        )
+        with self._connect() as connection, connection.transaction():
+            planning = PostgreSQLPlanningRepository(
+                connection,
+                self._environment_id,
+            )
+            draft = planning.get_draft(plan_id, for_update=True)
+            review_store = PostgreSQLPlanAiReviewStore(
+                connection,
+                self._environment_id,
+            )
+            existing = review_store.by_idempotency_key(idempotency_key)
+            if existing is not None:
+                if (
+                    existing.plan_id != plan_id
+                    or existing.configuration != configuration
+                ):
+                    raise ValueError("IDEMPOTENCY_CONTENT_CONFLICT")
+                return existing.model_dump(mode="json")
+            if draft.draft_version != expected_version:
+                raise ValueError("PLAN_VERSION_CONFLICT")
+            if planning.has_activation(plan_id):
+                raise ValueError("PLAN_ALREADY_STARTED")
+            if draft.content.position_alignment is not None:
+                raise ValueError("PLAN_AI_REVIEW_NOT_APPLICABLE")
+            decision_context = draft.content.decision_context
+            if decision_context is None:
+                raise ValueError("PLAN_DECISION_EXPERIMENT_INCOMPLETE")
+            review_content = draft.content.model_copy(
+                update={
+                    "decision_context": decision_context.model_copy(
+                        update={"evidence_cutoff": review_evidence_cutoff}
+                    )
+                }
+            )
+            draft = PlanningApplicationService(
+                connection,
+                self._environment_id,
+            ).update_draft(
+                plan_id=plan_id,
+                expected_version=expected_version,
+                content=review_content,
+                observed_at=observed_at,
+                preserve_system_evidence_cutoff=False,
+            )
+            context_incompatibility = new_risk_decision_context_incompatibility(
+                decision_basis_kind=draft.content.decision_basis.kind,
+                decision_context=draft.content.decision_context,
+            )
+            if context_incompatibility is not None:
+                raise ValueError(context_incompatibility)
+            validate_current_plan_admission(
+                decision_basis_kind=draft.content.decision_basis.kind,
+                order_schedule_spec=draft.content.order_schedule_spec,
+                allowed_actions=draft.content.allowed_actions,
+                position_alignment=draft.content.position_alignment,
+            )
+            review = review_store.create_queued(
+                review_id=review_id,
+                plan_id=plan_id,
+                draft_version=draft.draft_version,
+                draft_content_digest=draft.content_digest,
+                configuration=configuration,
+                idempotency_key=idempotency_key,
+                observed_at=observed_at,
+            )
+        return review.model_dump(mode="json")
+
+    def get_ai_review(self, review_id: str) -> dict[str, Any]:
+        with self._connect() as connection, connection.transaction():
+            review = PostgreSQLPlanAiReviewStore(
+                connection,
+                self._environment_id,
+            ).get(review_id)
+        return review.model_dump(mode="json")
+
+    def latest_ai_review(self, plan_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection, connection.transaction():
+            review = PostgreSQLPlanAiReviewStore(
+                connection,
+                self._environment_id,
+            ).latest_for_plan(plan_id)
+        return review.model_dump(mode="json") if review is not None else None
+
+    def mark_ai_review_running(
+        self,
+        review_id: str,
+        market_context_digest: str,
+        market_source_cutoff: datetime,
+    ) -> PlanAiReviewRecord:
+        observed_at = datetime.now(UTC)
+        with self._connect() as connection, connection.transaction():
+            return PostgreSQLPlanAiReviewStore(
+                connection,
+                self._environment_id,
+            ).mark_running(
+                review_id,
+                market_context_digest=market_context_digest,
+                market_source_cutoff=market_source_cutoff,
+                observed_at=observed_at,
+            )
+
+    def update_ai_review_progress(
+        self,
+        review_id: str,
+        message: str,
+        public_output: str,
+    ) -> PlanAiReviewRecord:
+        with self._connect() as connection, connection.transaction():
+            return PostgreSQLPlanAiReviewStore(
+                connection,
+                self._environment_id,
+            ).update_progress(
+                review_id,
+                message=message,
+                public_output=public_output,
+                observed_at=datetime.now(UTC),
+            )
+
+    def complete_ai_review(
+        self,
+        review_id: str,
+        result: PlanAiReviewResult,
+    ) -> PlanAiReviewRecord:
+        with self._connect() as connection, connection.transaction():
+            return PostgreSQLPlanAiReviewStore(
+                connection,
+                self._environment_id,
+            ).complete(
+                review_id,
+                result=result,
+                observed_at=datetime.now(UTC),
+            )
+
+    def fail_ai_review(
+        self,
+        review_id: str,
+        failure_code: str,
+    ) -> PlanAiReviewRecord:
+        with self._connect() as connection, connection.transaction():
+            return PostgreSQLPlanAiReviewStore(
+                connection,
+                self._environment_id,
+            ).fail(
+                review_id,
+                failure_code=failure_code,
+                observed_at=datetime.now(UTC),
+            )
+
+    @staticmethod
+    def _review_activation_snapshot(
+        review: PlanAiReviewRecord,
+    ) -> dict[str, Any]:
+        return {
+            "review_id": review.review_id,
+            "status": review.status.value,
+            "decision": review.decision.value if review.decision is not None else None,
+            "draft_content_digest": review.draft_content_digest,
+            "prompt_version": review.prompt_version,
+            "configuration": review.configuration.model_dump(mode="json"),
+            "market_context_digest": review.market_context_digest,
+            "market_source_cutoff": (
+                review.market_source_cutoff.isoformat()
+                if review.market_source_cutoff is not None
+                else None
+            ),
+            "reason": review.reason,
+            "suggestions": list(review.suggestions),
+            "completed_at": (
+                review.completed_at.isoformat()
+                if review.completed_at is not None
+                else None
+            ),
+        }
+
+    def _stored_ai_review_snapshot(
+        self,
+        connection: psycopg.Connection[Any],
+        review_id: str | None,
+    ) -> dict[str, Any] | None:
+        """Read the one immutable review bound to a fixed plan version.
+
+        UI readers must not use ``latest_for_plan`` here: a later draft can have
+        a newer review that does not authorize the fixed or activated version.
+        """
+
+        if not review_id:
+            return None
+        try:
+            review = PostgreSQLPlanAiReviewStore(
+                connection,
+                self._environment_id,
+            ).get(review_id)
+        except ValueError:
+            # Historical fixed versions remain readable even when an older
+            # installation did not retain a review row.
+            return None
+        return self._review_activation_snapshot(review)
+
+    def _approved_current_draft_ai_review(
+        self,
+        connection: psycopg.Connection[Any],
+        draft: Any,
+        *,
+        observed_at: datetime,
+    ) -> PlanAiReviewRecord:
+        """Return the exact, still-current review that may start this draft."""
+
+        review = PostgreSQLPlanAiReviewStore(
+            connection,
+            self._environment_id,
+        ).approved_for_draft(
+            plan_id=draft.plan_id,
+            draft_version=draft.draft_version,
+            draft_content_digest=draft.content_digest,
+        )
+        if review is None:
+            raise ValueError("PLAN_AI_REVIEW_REQUIRED")
+        if not plan_ai_review_approval_is_current(
+            review,
+            observed_at=observed_at,
+        ):
+            raise ValueError("PLAN_AI_REVIEW_EXPIRED")
+        return review
+
+    def _require_approved_version_ai_review(
+        self,
+        connection: psycopg.Connection[Any],
+        version: TradePlanVersion,
+        *,
+        observed_at: datetime | None = None,
+        require_current_market_context: bool = False,
+    ) -> dict[str, Any]:
+        if getattr(version, "position_alignment", None) is not None:
+            return {}
+        ai_review_ref = getattr(version, "ai_review_ref", None)
+        if not ai_review_ref:
+            raise ValueError("PLAN_AI_REVIEW_REQUIRED")
+        review = PostgreSQLPlanAiReviewStore(
+            connection,
+            self._environment_id,
+        ).get(ai_review_ref)
+        draft = PostgreSQLPlanningRepository(
+            connection,
+            self._environment_id,
+        ).get_draft(version.plan_id)
+        if (
+            review.plan_id != version.plan_id
+            or review.draft_version != draft.draft_version
+            or review.draft_content_digest != draft.content_digest
+            or review.prompt_version != PLAN_AI_REVIEW_PROMPT_VERSION
+            or review.status is not PlanAiReviewStatus.APPROVED
+            or review.decision is None
+            or review.decision.value != "APPROVE"
+        ):
+            raise ValueError("PLAN_AI_REVIEW_NOT_APPROVED")
+        if require_current_market_context:
+            if observed_at is None or not plan_ai_review_approval_is_current(
+                review,
+                observed_at=observed_at,
+            ):
+                raise ValueError("PLAN_AI_REVIEW_EXPIRED")
+        return self._review_activation_snapshot(review)
 
     def get_plan_version(self, plan_version_id: str) -> dict[str, Any]:
         with self._connect() as connection, connection.transaction():
@@ -671,7 +1016,13 @@ class PostgreSQLPlanningApi:
             plan_name=payload.plan_name,
             created_at=observed_at,
             creator_kind=payload.creator_kind,
-            decision_context=payload.decision_context,
+            # The browser may display a current market cutoff while the owner
+            # edits, but this is server-owned review metadata.  A new draft
+            # receives its authoritative cutoff only when an AI review collects
+            # its fresh, bounded market context.
+            decision_context=payload.decision_context.model_copy(
+                update={"evidence_cutoff": None}
+            ),
             decision_basis=basis,
             order_schedule_spec=payload.order_schedule_spec,
             position_alignment=payload.position_alignment,
@@ -805,6 +1156,12 @@ class PostgreSQLPlanningApi:
         expected_version: int,
         observed_at: datetime,
     ) -> dict[str, Any]:
+        """Compatibility-only historical snapshot writer.
+
+        The normal workbench path is ``submit_and_start``.  It is deliberately
+        not exposed as a public HTTP command, because creating a snapshot
+        without its activation would reintroduce a fourth lifecycle state.
+        """
         self._require_product_mutation_allowed()
         plan_version_id = _stable_id(
             self._environment_id, "plan-version", idempotency_key
@@ -813,6 +1170,18 @@ class PostgreSQLPlanningApi:
             repository = PostgreSQLPlanningRepository(connection, self._environment_id)
             try:
                 with connection.transaction():
+                    draft = repository.get_draft(plan_id, for_update=True)
+                    if draft.draft_version != expected_version:
+                        raise ValueError("PLAN_VERSION_CONFLICT")
+                    approved_review = (
+                        None
+                        if draft.content.position_alignment is not None
+                        else self._approved_current_draft_ai_review(
+                            connection,
+                            draft,
+                            observed_at=observed_at,
+                        )
+                    )
                     version = PlanningApplicationService(
                         connection, self._environment_id
                     ).fix_draft(
@@ -821,6 +1190,14 @@ class PostgreSQLPlanningApi:
                         plan_version_id=plan_version_id,
                         product_build_id=self._product_build_id,
                         fixed_at=observed_at,
+                        ai_review_ref=(
+                            approved_review.review_id
+                            if approved_review is not None
+                            else None
+                        ),
+                        new_risk_discipline_policy=(
+                            self._new_risk_discipline_policy
+                        ),
                     )
             except psycopg.errors.UniqueViolation:
                 connection.rollback()
@@ -830,43 +1207,56 @@ class PostgreSQLPlanningApi:
                     raise ValueError("IDEMPOTENCY_CONTENT_CONFLICT") from None
         return version.model_dump(mode="json")
 
-    def activation_preview(self, plan_version_id: str) -> dict[str, Any]:
-        previewed_at = datetime.now(UTC)
-        with self._connect() as connection, connection.transaction():
-            version = PostgreSQLPlanningRepository(
-                connection, self._environment_id
-            ).get_version(plan_version_id)
-            position_alignment = getattr(version, "position_alignment", None)
-            position_alignment_blocker: str | None = None
-            if position_alignment is not None:
-                try:
-                    PlanningApplicationService(
-                        connection,
-                        self._environment_id,
-                    ).require_current_position_alignment(
-                        version,
-                        observed_at=previewed_at,
-                    )
-                except ValueError as exc:
-                    position_alignment_blocker = str(exc)
-            new_risk_discipline = (
-                None
-                if position_alignment is not None
-                else PlanningApplicationService(
+    def _activation_preview_for_version(
+        self,
+        connection: psycopg.Connection[Any],
+        version: TradePlanVersion,
+        *,
+        previewed_at: datetime,
+    ) -> dict[str, Any]:
+        """Build a current-fact preview for a persisted or transient snapshot."""
+
+        position_alignment = getattr(version, "position_alignment", None)
+        ai_review: dict[str, Any] | None = None
+        ai_review_blocker: str | None = None
+        if position_alignment is None:
+            try:
+                ai_review = self._require_approved_version_ai_review(
+                    connection,
+                    version,
+                )
+            except ValueError as exc:
+                ai_review_blocker = str(exc)
+        position_alignment_blocker: str | None = None
+        if position_alignment is not None:
+            try:
+                PlanningApplicationService(
                     connection,
                     self._environment_id,
-                ).new_risk_discipline_status(
-                    account_ref=version.account_ref,
-                    policy=self._new_risk_discipline_policy,
+                ).require_current_position_alignment(
+                    version,
                     observed_at=previewed_at,
-                    proposed_max_allowed_loss=(
-                        version.requested_limits.max_allowed_loss
-                    ),
-                    proposed_max_notional=version.requested_limits.max_notional,
-                    proposed_instrument_ref=version.instrument_ref,
-                    proposed_direction=version.direction.value,
                 )
+            except ValueError as exc:
+                position_alignment_blocker = str(exc)
+        new_risk_discipline = (
+            None
+            if position_alignment is not None
+            else PlanningApplicationService(
+                connection,
+                self._environment_id,
+            ).new_risk_discipline_status(
+                account_ref=version.account_ref,
+                policy=self._new_risk_discipline_policy,
+                observed_at=previewed_at,
+                proposed_max_allowed_loss=(
+                    version.requested_limits.max_allowed_loss
+                ),
+                proposed_max_notional=version.requested_limits.max_notional,
+                proposed_instrument_ref=version.instrument_ref,
+                proposed_direction=version.direction.value,
             )
+        )
         live_profit_qualification = self._live_profit_qualification(
             version,
             previewed_at,
@@ -945,6 +1335,11 @@ class PostgreSQLPlanningApi:
                 else position_alignment_blocker is None
             ),
             "position_alignment_blocker": position_alignment_blocker,
+            "ai_review": ai_review,
+            "ai_review_ready": (
+                None if position_alignment is not None else ai_review_blocker is None
+            ),
+            "ai_review_blocker": ai_review_blocker,
             "new_risk_discipline": (
                 new_risk_discipline.model_dump(mode="json")
                 if new_risk_discipline is not None
@@ -961,6 +1356,7 @@ class PostgreSQLPlanningApi:
                 self._profile == "BINANCE_LIVE_WRITE"
                 and runtime_compatible
                 and position_alignment_blocker is None
+                and ai_review_blocker is None
                 and (
                     new_risk_discipline is None
                     or new_risk_discipline.new_risk_allowed
@@ -972,6 +1368,211 @@ class PostgreSQLPlanningApi:
             ),
             "capital_notice": "计划中的交易金额就是本次边界；激活不再要求独立资金授权，也不会绕过事实、CAP 或 EXE。",
         }
+
+    def activation_preview(self, plan_version_id: str) -> dict[str, Any]:
+        """Compatibility preview for an already persisted historical snapshot."""
+
+        previewed_at = datetime.now(UTC)
+        with self._connect() as connection, connection.transaction():
+            version = PostgreSQLPlanningRepository(
+                connection,
+                self._environment_id,
+            ).get_version(plan_version_id)
+            return self._activation_preview_for_version(
+                connection,
+                version,
+                previewed_at=previewed_at,
+            )
+
+    def submit_and_start_preview(
+        self,
+        plan_id: str,
+        *,
+        idempotency_key: str,
+        expected_version: int,
+        observed_at: datetime,
+    ) -> dict[str, Any]:
+        """Preflight a transient run snapshot without changing plan state."""
+
+        self._require_product_mutation_allowed()
+        plan_version_id = _stable_id(
+            self._environment_id,
+            "activation-snapshot",
+            idempotency_key,
+        )
+        with self._connect() as connection, connection.transaction():
+            repository = PostgreSQLPlanningRepository(
+                connection,
+                self._environment_id,
+            )
+            draft = repository.get_draft(plan_id, for_update=True)
+            if draft.draft_version != expected_version:
+                raise ValueError("PLAN_VERSION_CONFLICT")
+            if repository.has_activation(plan_id):
+                raise ValueError("PLAN_ALREADY_STARTED")
+            approved_review = (
+                None
+                if draft.content.position_alignment is not None
+                else self._approved_current_draft_ai_review(
+                    connection,
+                    draft,
+                    observed_at=observed_at,
+                )
+            )
+            version = PlanningApplicationService(
+                connection,
+                self._environment_id,
+            ).build_activation_snapshot(
+                plan_id=plan_id,
+                expected_draft_version=expected_version,
+                plan_version_id=plan_version_id,
+                product_build_id=self._product_build_id,
+                snapshot_at=observed_at,
+                ai_review_ref=(
+                    approved_review.review_id if approved_review is not None else None
+                ),
+                new_risk_discipline_policy=self._new_risk_discipline_policy,
+            )
+            return self._activation_preview_for_version(
+                connection,
+                version,
+                previewed_at=observed_at,
+            )
+
+    def submit_and_start_replay(
+        self,
+        plan_id: str,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any] | None:
+        """Return a previously committed start before rechecking current facts."""
+
+        activation_id = _stable_id(self._environment_id, "activation", idempotency_key)
+        with self._connect() as connection, connection.transaction():
+            repository = PostgreSQLPlanningRepository(
+                connection,
+                self._environment_id,
+            )
+            try:
+                activation = repository.get_activation(activation_id)
+            except PlanningConflict as exc:
+                if str(exc) == "ACTIVATION_NOT_FOUND":
+                    return None
+                raise
+            version = repository.get_version(activation.plan_version_ref)
+        if version.plan_id != plan_id:
+            raise ValueError("IDEMPOTENCY_CONTENT_CONFLICT")
+        return self._activation_response(activation)
+
+    def submit_and_start(
+        self,
+        plan_id: str,
+        *,
+        idempotency_key: str,
+        expected_version: int,
+        observed_at: datetime,
+        order_schedule_snapshot: OrderSchedulePreview | None,
+    ) -> dict[str, Any]:
+        """Atomically preserve a run snapshot and create its activation.
+
+        This is the only normal workbench start command.  A rejected preview,
+        discipline check, or activation admission raises inside the transaction,
+        so the draft is still the same editable draft afterwards.
+        """
+
+        self._require_product_mutation_allowed()
+        gate_status = self._gate_status()
+        if self._profile == "BINANCE_LIVE_WRITE":
+            if gate_status.product_build_consistent is not True:
+                raise ValueError("LIVE_WRITE_PRODUCT_BUILD_MISMATCH")
+            if gate_status.violations:
+                raise ValueError("LIVE_WRITE_GATE_BINDING_INVALID_FOR_ACTIVATION")
+            if gate_status.configured_runtime_real_write_gate != "CLOSED":
+                raise ValueError("LIVE_WRITE_GATE_MUST_BE_CLOSED_FOR_ACTIVATION")
+        plan_version_id = _stable_id(
+            self._environment_id,
+            "activation-snapshot",
+            idempotency_key,
+        )
+        activation_id = _stable_id(self._environment_id, "activation", idempotency_key)
+        with self._connect() as connection:
+            repository = PostgreSQLPlanningRepository(connection, self._environment_id)
+            try:
+                with connection.transaction():
+                    try:
+                        existing = repository.get_activation(activation_id)
+                    except PlanningConflict as exc:
+                        if str(exc) != "ACTIVATION_NOT_FOUND":
+                            raise
+                    else:
+                        version = repository.get_version(existing.plan_version_ref)
+                        if version.plan_id != plan_id:
+                            raise ValueError("IDEMPOTENCY_CONTENT_CONFLICT")
+                        return self._activation_response(existing)
+                    if self._profile == "BINANCE_LIVE_WRITE":
+                        try:
+                            require_live_activation_safety_index(connection)
+                        except LiveWriteGateError as exc:
+                            raise ValueError(str(exc)) from None
+                    draft = repository.get_draft(plan_id, for_update=True)
+                    if draft.draft_version != expected_version:
+                        raise ValueError("PLAN_VERSION_CONFLICT")
+                    if repository.has_activation(plan_id):
+                        raise ValueError("PLAN_ALREADY_STARTED")
+                    approved_review = (
+                        None
+                        if draft.content.position_alignment is not None
+                        else self._approved_current_draft_ai_review(
+                            connection,
+                            draft,
+                            observed_at=observed_at,
+                        )
+                    )
+                    _version, activation = PlanningApplicationService(
+                        connection,
+                        self._environment_id,
+                    ).fix_and_activate(
+                        plan_id=plan_id,
+                        expected_draft_version=expected_version,
+                        plan_version_id=plan_version_id,
+                        activation_id=activation_id,
+                        environment_kind=self._environment_kind,
+                        authority_class=self._authority_class,
+                        product_build_id=self._product_build_id,
+                        observed_at=observed_at,
+                        ai_review_ref=(
+                            approved_review.review_id
+                            if approved_review is not None
+                            else None
+                        ),
+                        order_schedule_snapshot=order_schedule_snapshot,
+                        ai_review_checker=(
+                            lambda version: self._require_approved_version_ai_review(
+                                connection,
+                                version,
+                                observed_at=observed_at,
+                                require_current_market_context=True,
+                            )
+                        ),
+                        live_profit_qualification_checker=(
+                            lambda version: self._require_live_profit_qualification_snapshot(
+                                version,
+                                observed_at,
+                            )
+                        ),
+                        new_risk_discipline_policy=self._new_risk_discipline_policy,
+                    )
+            except psycopg.errors.UniqueViolation:
+                connection.rollback()
+                with connection.transaction():
+                    try:
+                        activation = repository.get_activation(activation_id)
+                        version = repository.get_version(activation.plan_version_ref)
+                    except PlanningConflict:
+                        raise ValueError("IDEMPOTENCY_CONTENT_CONFLICT") from None
+                if version.plan_id != plan_id:
+                    raise ValueError("IDEMPOTENCY_CONTENT_CONFLICT") from None
+        return self._activation_response(activation)
 
     def activate(
         self,
@@ -1024,6 +1625,16 @@ class PostgreSQLPlanningApi:
                                 self._require_live_profit_qualification_snapshot(
                                     version,
                                     observed_at,
+                                )
+                            )
+                        ),
+                        ai_review_checker=(
+                            lambda version: (
+                                self._require_approved_version_ai_review(
+                                    connection,
+                                    version,
+                                    observed_at=observed_at,
+                                    require_current_market_context=True,
                                 )
                             )
                         ),
@@ -1197,6 +1808,11 @@ class PostgreSQLPlanningApi:
             activation = planning_repository.get_activation(activation_id)
             version = planning_repository.get_version(
                 activation.plan_version_ref
+            )
+            ai_review_ref = getattr(version, "ai_review_ref", None)
+            ai_review = self._stored_ai_review_snapshot(
+                connection,
+                ai_review_ref,
             )
             actions = connection.execute(
                 """
@@ -1379,6 +1995,8 @@ class PostgreSQLPlanningApi:
             )
         return {
             "activation": activation.model_dump(mode="json"),
+            "ai_review_ref": ai_review_ref,
+            "ai_review": ai_review,
             "plan": {
                 "plan_version_id": version.plan_version_id,
                 "plan_id": version.plan_id,

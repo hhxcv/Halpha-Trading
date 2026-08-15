@@ -18,6 +18,7 @@ function plan(
   planVersionId: string | null,
   fixedValidUntil: string | null,
   productBuildConsistent: boolean | null,
+  status: PlanSummary["status"] = planVersionId ? "RUNNING" : "DRAFT",
 ): PlanSummary {
   return {
     plan_id: planId,
@@ -43,6 +44,11 @@ function plan(
     max_notional: "100",
     valid_from: "2026-07-26T00:00:00Z",
     valid_until: "2026-07-26T01:00:00Z",
+    status,
+    activation_id: status === "DRAFT" ? null : `${planId}-activation`,
+    activation_lifecycle: status === "ENDED" ? "COMPLETED" : status === "RUNNING" ? "RUNNING" : null,
+    activation_created_at: status === "DRAFT" ? null : "2026-07-26T01:30:00Z",
+    activation_updated_at: status === "DRAFT" ? null : "2026-07-26T02:00:00Z",
     plan_version_id: planVersionId,
     fixed_at: planVersionId ? "2026-07-26T00:00:00Z" : null,
     fixed_content_digest: planVersionId ? "b".repeat(64) : null,
@@ -103,7 +109,7 @@ function activation(
 }
 
 describe("plan workbench sections", () => {
-  it("summarizes the frozen order role and price without relying on the plan name", () => {
+  it("summarizes the configured order role and price without relying on the plan name", () => {
     const makerPlan = plan(
       "maker-plan",
       "maker-version",
@@ -211,7 +217,7 @@ describe("plan workbench sections", () => {
       .toBe("区间限价 63,000.00–64,000.00 USDT · 5 档");
   });
 
-  it("uses frozen normalized legs and venue tick precision for activated plans", () => {
+  it("uses normalized legs and venue tick precision for running plans", () => {
     const ladder: NonNullable<PlanSummary["order_schedule_spec"]> = {
       entry_program: null,
       price_distribution: {
@@ -340,7 +346,7 @@ describe("plan workbench sections", () => {
     const sections = planWorkbenchSections(
       [
         activePlan,
-        plan("historical-plan", "historical-version", "2026-07-26T01:00:00Z", false),
+        plan("historical-plan", "historical-version", "2026-07-26T01:00:00Z", false, "ENDED"),
         plan("draft-plan", null, null, null),
       ],
       [
@@ -357,11 +363,11 @@ describe("plan workbench sections", () => {
       .toEqual(["historical-plan"]);
   });
 
-  it("does not treat a compatible fixed plan as historical only because its build differs", () => {
+  it("keeps an editable draft in the current list regardless of runtime snapshot metadata", () => {
     const compatible = plan(
       "compatible-plan",
-      "compatible-version",
-      "2026-07-26T04:00:00Z",
+      null,
+      null,
       false,
     );
 
@@ -372,18 +378,17 @@ describe("plan workbench sections", () => {
     expect(sections.historicalPlans).toEqual([]);
   });
 
-  it("preserves multiple open activations of the same fixed plan", () => {
+  it("does not create a fourth plan section for a running plan", () => {
     const sections = planWorkbenchSections(
       [plan("shared-plan", "shared-version", "2026-07-26T04:00:00Z", true)],
       [
         activation("activation-a", "shared-version", "RUNNING", "ACTIVE"),
-        activation("activation-b", "shared-version", "EXITING", "ACTIVE"),
       ],
       NOW,
     );
 
     expect(sections.currentActivations.map((item) => item.activation_id))
-      .toEqual(["activation-a", "activation-b"]);
+      .toEqual(["activation-a"]);
     expect(sections.currentPlans).toEqual([]);
     expect(sections.historicalPlans).toEqual([]);
   });

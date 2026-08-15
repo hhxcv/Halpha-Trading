@@ -2,10 +2,12 @@ from threading import Event
 
 from halpha.executor.__main__ import (
     _RuntimeLivenessWatchdog,
+    _runtime_build_failure_log_fields,
     _runtime_ready_log_fields,
     _signal_runtime_failure_stop,
     _start_failure_cleanup_watchdog,
 )
+from halpha.executor.runtime import ExecutorRuntimeError
 
 
 def test_runtime_liveness_watchdog_forces_recovery_after_heartbeat_stalls() -> None:
@@ -66,6 +68,19 @@ def test_runtime_ready_log_fields_accept_private_observer_profile_evidence() -> 
         "product_build_id": "build-123",
         "read_only_mode": "PRIVATE_ACCOUNT_OBSERVATION",
         "account_observer_started": True,
+    }
+
+
+def test_runtime_build_failure_log_fields_preserve_only_stable_codes() -> None:
+    assert _runtime_build_failure_log_fields(
+        ExecutorRuntimeError("DATABASE_SCHEMA_NOT_CURRENT")
+    ) == {
+        "exception_type": "ExecutorRuntimeError",
+        "reason_code": "DATABASE_SCHEMA_NOT_CURRENT",
+    }
+    assert _runtime_build_failure_log_fields(RuntimeError("secret=value")) == {
+        "exception_type": "RuntimeError",
+        "reason_code": "PRODUCT_RUNTIME_BUILD_FAILED type=RuntimeError",
     }
 
 

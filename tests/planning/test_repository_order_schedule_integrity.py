@@ -121,7 +121,7 @@ def test_insert_version_hashes_the_exact_json_payload_it_persists() -> None:
     PostgreSQLPlanningRepository(connection, "demo").insert_version(version)  # type: ignore[arg-type]
 
     assert connection.params is not None
-    assert connection.params[16].obj["decision_context"] == {
+    assert connection.params[17].obj["decision_context"] == {
         "rationale": "bounded reason",
         "evidence": "bounded evidence",
         "limitations": "bounded limitations",

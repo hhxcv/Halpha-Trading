@@ -30,7 +30,8 @@ _PROGRAMMATIC_PLAN_MUTATION_ROUTES = (
     ("POST", re.compile(r"^/api/v1/plans$")),
     ("PUT", re.compile(r"^/api/v1/plans/[^/]+$")),
     ("DELETE", re.compile(r"^/api/v1/plans/[^/]+$")),
-    ("POST", re.compile(r"^/api/v1/plans/[^/]+/fix$")),
+    ("POST", re.compile(r"^/api/v1/plans/[^/]+/submit-and-start$")),
+    ("POST", re.compile(r"^/api/v1/plans/[^/]+/ai-review$")),
     (
         "POST",
         re.compile(r"^/api/v1/plan-versions/[^/]+/activation-preview$"),

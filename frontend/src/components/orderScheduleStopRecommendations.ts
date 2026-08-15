@@ -4,7 +4,7 @@ import type {
   OrderSchedulePreviewLeg,
 } from "../api/client";
 
-const MAX_INITIAL_STOP_BPS = 5_000;
+const MAX_INITIAL_STOP_BPS = 10_000;
 const ENTRY_ATR_MULTIPLE = 1.5;
 const MAX_RECOMMENDATIONS = 3;
 
@@ -126,7 +126,7 @@ export function buildInitialStopRecommendations(input: {
     if (
       !Number.isFinite(distanceBps)
       || distanceBps <= 0
-      || distanceBps > MAX_INITIAL_STOP_BPS
+      || distanceBps >= MAX_INITIAL_STOP_BPS
     ) return [];
     const presentation = referencePresentation(reference);
     return [{
@@ -151,7 +151,7 @@ export function buildInitialStopRecommendations(input: {
     const distanceBps = Math.abs(price - entryBasis) / entryBasis * 10_000;
     if (
       price > 0
-      && distanceBps <= MAX_INITIAL_STOP_BPS
+      && distanceBps < MAX_INITIAL_STOP_BPS
       && outsideAllEntries(price)
     ) {
       candidates.push({

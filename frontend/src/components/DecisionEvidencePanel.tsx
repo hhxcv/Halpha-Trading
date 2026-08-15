@@ -11,6 +11,7 @@ import { DownloadOutlined } from "@mui/icons-material";
 
 import type { DecisionEvidence } from "../api/client";
 import { formatUserVisibleTime } from "../format";
+import { financialToneForSignedValue } from "../marketColors";
 import { surfaceFrameSx } from "../theme";
 import FactGrid from "./FactGrid";
 
@@ -93,9 +94,14 @@ export function decisionEvidenceUsdt(value: string | null | undefined): string {
   if (!Number.isFinite(parsed)) return "未知";
   return `${new Intl.NumberFormat("zh-CN", {
     minimumFractionDigits: 2,
-    maximumFractionDigits: 6,
+    maximumFractionDigits: 2,
     signDisplay: "exceptZero",
   }).format(parsed)} USDT`;
+}
+
+function decisionEvidenceCostUsdt(value: string | null | undefined): string {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? decisionEvidenceUsdt(String(-Math.abs(parsed))) : "未知";
 }
 
 export function decisionEvidencePercent(value: string | null | undefined): string {
@@ -215,13 +221,13 @@ export default function DecisionEvidencePanel({
           facts={[
             { label: "可比交易", value: String(evidence.metrics.trade_count), note: `${evidence.matched_review_count} 条同签名复盘，排除 ${evidence.excluded_review_count} 条` },
             { label: "胜 / 负 / 平", value: `${evidence.metrics.wins} / ${evidence.metrics.losses} / ${evidence.metrics.flat}` },
-            { label: "累计费用后盈亏", value: decisionEvidenceUsdt(evidence.metrics.net_pnl) },
-            { label: "单笔平均", value: decisionEvidenceUsdt(evidence.metrics.average_net_pnl) },
-            { label: "名义金额回报", value: decisionEvidencePercent(evidence.metrics.notional_return_percent), note: "净盈亏 ÷ 全部入场名义金额；不是账户收益率" },
+            { label: "累计费用后盈亏", value: decisionEvidenceUsdt(evidence.metrics.net_pnl), tone: financialToneForSignedValue(evidence.metrics.net_pnl) },
+            { label: "单笔平均", value: decisionEvidenceUsdt(evidence.metrics.average_net_pnl), tone: financialToneForSignedValue(evidence.metrics.average_net_pnl) },
+            { label: "名义金额回报", value: decisionEvidencePercent(evidence.metrics.notional_return_percent), tone: financialToneForSignedValue(evidence.metrics.notional_return_percent), note: "净盈亏 ÷ 全部入场名义金额；不是账户收益率" },
             { label: "盈利因子", value: decisionEvidenceRatio(evidence.metrics.profit_factor) },
-            { label: "累计手续费", value: decisionEvidenceUsdt(evidence.metrics.commission) },
-            { label: "样本路径最大回撤", value: decisionEvidenceUsdt(evidence.metrics.maximum_drawdown) },
-            { label: "最差单笔", value: decisionEvidenceUsdt(evidence.metrics.worst_trade_net_pnl) },
+            { label: "累计手续费", value: decisionEvidenceCostUsdt(evidence.metrics.commission), tone: financialToneForSignedValue(-1) },
+            { label: "样本路径最大回撤", value: decisionEvidenceCostUsdt(evidence.metrics.maximum_drawdown), tone: financialToneForSignedValue(-1) },
+            { label: "最差单笔", value: decisionEvidenceUsdt(evidence.metrics.worst_trade_net_pnl), tone: financialToneForSignedValue(evidence.metrics.worst_trade_net_pnl) },
             { label: "最长连盈 / 连亏", value: `${evidence.metrics.longest_winning_streak} / ${evidence.metrics.longest_losing_streak} 笔` },
             { label: "当前同剧本连续结果", value: decisionEvidenceCurrentStreak(evidence.metrics.current_streak_kind, evidence.metrics.current_streak_count) },
           ]}

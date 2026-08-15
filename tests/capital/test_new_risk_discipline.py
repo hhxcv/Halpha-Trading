@@ -76,6 +76,7 @@ def test_small_plan_is_allowed_against_current_equity() -> None:
     assert status.status == "ALLOWED"
     assert status.risk_equity == "975"
     assert status.max_plan_loss == "7.3125"
+    assert status.minimum_reward_risk_ratio == "1"
     assert status.open_risk_limit == "24.375"
     assert status.gross_exposure_limit == "1950"
 
@@ -128,6 +129,44 @@ def test_actual_position_and_plan_notional_use_the_larger_scope_not_the_sum() ->
 
     assert status.gross_exposure == "120"
     assert status.gross_exposure_after_proposal == "130"
+
+
+def test_targeted_planning_projection_exposes_remaining_nominal_capacity() -> None:
+    status = evaluate_new_risk_discipline(
+        policy=POLICY,
+        observed_at=NOW,
+        account_equity=_equity(
+            positions=(
+                AccountPositionRisk(
+                    instrument_ref="BTCUSDT-PERP",
+                    direction="LONG",
+                    notional="120",
+                    unrealized_pnl="0",
+                ),
+            )
+        ),
+        attempts=(_attempt("open", notional="100"),),
+        entry_instrument_ref="BTCUSDT-PERP",
+        entry_direction="LONG",
+    )
+
+    assert status.status == "ALLOWED"
+    assert status.instrument_ref == "BTCUSDT-PERP"
+    assert status.instrument_exposure == "120"
+    assert status.available_notional_capacity == "875"
+
+
+def test_targeted_planning_capacity_is_hidden_when_new_risk_is_blocked() -> None:
+    status = evaluate_new_risk_discipline(
+        policy=POLICY,
+        observed_at=NOW,
+        account_equity=_equity(),
+        attempts=(),
+        **_proposal(proposed_max_allowed_loss="7.4"),
+    )
+
+    assert status.status == "BLOCKED"
+    assert status.available_notional_capacity is None
 
 
 def test_distinct_actual_and_planned_instruments_remain_additive() -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -20,6 +21,7 @@ from nautilus_trader.adapters.binance.futures.http.market import (
 )
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.indicators import LinearRegression, OnBalanceVolume, Swings
+from nautilus_trader.core.nautilus_pyo3.network import HttpMethod
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from halpha.domain_values import canonical_decimal, decimal_from_string
@@ -30,12 +32,17 @@ FIFTEEN_MINUTES_MS = 15 * 60 * 1000
 ONE_MINUTE_MS = 60 * 1000
 _INSTRUMENT_SYMBOLS = {"BTCUSDT-PERP": "BTCUSDT"}
 PUBLIC_MARKET_TIMEOUT_SECONDS = 10
+PUBLIC_MARKET_TRANSIENT_READ_ATTEMPTS = 3
+PUBLIC_MARKET_TRANSIENT_RETRY_DELAY_SECONDS = 0.25
 PUBLIC_MARKET_MAX_SOURCE_AGE_SECONDS = 30
 PUBLIC_MARKET_MAX_FUTURE_SKEW_SECONDS = 5
 MAX_MARKET_WINDOW_BARS = 300
 PUBLIC_MARKET_CONTEXT_CACHE_TTL_SECONDS = 5
 PUBLIC_MARKET_RECENT_WINDOW_CACHE_TTL_SECONDS = 5
 PUBLIC_MARKET_HISTORICAL_WINDOW_CACHE_TTL_SECONDS = 60 * 60
+PUBLIC_FUNDING_HISTORY_CACHE_TTL_SECONDS = 60
+FUNDING_RATE_HISTORY_PATH = "/fapi/v1/fundingRate"
+FUNDING_RATE_HISTORY_SAMPLE_COUNT = 8
 STOP_REFERENCE_METHOD_VERSION = "STOP_REFERENCE_MULTI_INTERVAL_V1"
 STOP_STRUCTURE_ATR_BUFFER = Decimal("0.2")
 STOP_SWING_ATR_BUFFER = Decimal("0.2")
@@ -130,6 +137,86 @@ class MarketStopReference(BaseModel):
 
 class MarketContextUnavailable(RuntimeError):
     """Sanitized public-market read failure."""
+
+
+async def _retry_transient_market_read(operation: Callable[[], Any]) -> Any:
+    """Retry only an upstream timeout; validation failures remain final."""
+
+    for attempt in range(PUBLIC_MARKET_TRANSIENT_READ_ATTEMPTS):
+        try:
+            return await operation()
+        except MarketContextUnavailable as exc:
+            if (
+                "TIMEOUT" not in str(exc).upper()
+                or attempt + 1 >= PUBLIC_MARKET_TRANSIENT_READ_ATTEMPTS
+            ):
+                raise
+            await asyncio.sleep(
+                PUBLIC_MARKET_TRANSIENT_RETRY_DELAY_SECONDS * (attempt + 1)
+            )
+
+
+class MarketFundingRateSample(BaseModel):
+    """One venue-settled public funding rate used only for local estimates."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    settled_at: datetime
+    funding_rate: str
+
+    @field_validator("settled_at")
+    @classmethod
+    def settled_at_is_aware(cls, value: datetime) -> datetime:
+        if value.utcoffset() is None:
+            raise ValueError("MARKET_FUNDING_RATE_TIMEZONE_REQUIRED")
+        return value.astimezone(UTC)
+
+    @field_validator("funding_rate")
+    @classmethod
+    def funding_rate_is_finite_and_bounded(cls, value: str) -> str:
+        rate = decimal_from_string(value, code="MARKET_FUNDING_RATE_INVALID")
+        if abs(rate) > 1:
+            raise ValueError("MARKET_FUNDING_RATE_INVALID")
+        return canonical_decimal(rate)
+
+
+class MarketFundingRateHistory(BaseModel):
+    """Recent funding-rate observations from the current public market source."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    instrument_ref: str
+    source: str
+    source_cutoff: datetime
+    samples: tuple[MarketFundingRateSample, ...]
+    average_funding_rate: str
+    average_interval_seconds: int
+
+    @field_validator("source_cutoff")
+    @classmethod
+    def source_cutoff_is_aware(cls, value: datetime) -> datetime:
+        if value.utcoffset() is None:
+            raise ValueError("MARKET_FUNDING_HISTORY_TIMEZONE_REQUIRED")
+        return value.astimezone(UTC)
+
+    @field_validator("average_funding_rate")
+    @classmethod
+    def average_rate_is_finite_and_bounded(cls, value: str) -> str:
+        rate = decimal_from_string(value, code="MARKET_FUNDING_HISTORY_AVERAGE_INVALID")
+        if abs(rate) > 1:
+            raise ValueError("MARKET_FUNDING_HISTORY_AVERAGE_INVALID")
+        return canonical_decimal(rate)
+
+    @model_validator(mode="after")
+    def history_is_ordered_and_complete(self) -> MarketFundingRateHistory:
+        if not 3 <= len(self.samples) <= FUNDING_RATE_HISTORY_SAMPLE_COUNT:
+            raise ValueError("MARKET_FUNDING_HISTORY_SAMPLE_COUNT_INVALID")
+        if self.average_interval_seconds <= 0:
+            raise ValueError("MARKET_FUNDING_HISTORY_INTERVAL_INVALID")
+        settled = [sample.settled_at for sample in self.samples]
+        if settled != sorted(settled) or len(set(settled)) != len(settled):
+            raise ValueError("MARKET_FUNDING_HISTORY_ORDER_INVALID")
+        return self
 
 
 class MarketContext(BaseModel):
@@ -262,6 +349,11 @@ class MarketContextProvider(Protocol):
         start_at: datetime,
         end_at: datetime,
     ) -> MarketWindow: ...
+
+    async def fetch_funding_rate_history(
+        self,
+        instrument_ref: str,
+    ) -> MarketFundingRateHistory: ...
 
 
 class BinanceMarketApi(Protocol):
@@ -431,6 +523,7 @@ class BinancePublicMarketContext:
         *,
         proxy_url: str | None = None,
         market_api: BinanceMarketApi | None = None,
+        funding_rate_query: Callable[[str, int], Any] | None = None,
         observed_at_provider: Callable[[], datetime] | None = None,
     ) -> None:
         environment, self._source = binance_public_market_identity(profile)
@@ -445,7 +538,9 @@ class BinancePublicMarketContext:
                 client,
                 BinanceAccountType.USDT_FUTURES,
             )
+            funding_rate_query = funding_rate_query or self._build_funding_rate_query(client)
         self._market_api = market_api
+        self._funding_rate_query = funding_rate_query
         self._observed_at_provider = observed_at_provider or (lambda: datetime.now(UTC))
         # async-lru supplies bounded TTL caching and single-flight behavior: all
         # same-key callers await one venue request rather than multiplying it by
@@ -463,6 +558,26 @@ class BinancePublicMarketContext:
             maxsize=256,
             ttl=PUBLIC_MARKET_HISTORICAL_WINDOW_CACHE_TTL_SECONDS,
         )(self._fetch_window_uncached)
+        self._fetch_funding_history_cached = alru_cache(
+            maxsize=32,
+            ttl=PUBLIC_FUNDING_HISTORY_CACHE_TTL_SECONDS,
+        )(self._fetch_funding_rate_history_uncached)
+
+    @staticmethod
+    def _build_funding_rate_query(client: Any) -> Callable[[str, int], Any]:
+        async def query(symbol: str, limit: int) -> Any:
+            raw = await client.send_request(
+                http_method=HttpMethod.GET,
+                url_path=FUNDING_RATE_HISTORY_PATH,
+                payload={"symbol": symbol, "limit": str(limit)},
+                ratelimiter_keys=[
+                    f"binance:{FUNDING_RATE_HISTORY_PATH}",
+                    "binance:global",
+                ],
+            )
+            return json.loads(raw)
+
+        return query
 
     async def fetch(
         self,
@@ -470,11 +585,87 @@ class BinancePublicMarketContext:
         lookback: int,
         stop_reference_interval: MarketInterval = "15m",
     ) -> MarketContext:
-        return await self._fetch_cached(
-            instrument_ref,
-            lookback,
-            stop_reference_interval,
+        return await _retry_transient_market_read(
+            lambda: self._fetch_cached(
+                instrument_ref,
+                lookback,
+                stop_reference_interval,
+            )
         )
+
+    async def fetch_funding_rate_history(
+        self,
+        instrument_ref: str,
+    ) -> MarketFundingRateHistory:
+        return await _retry_transient_market_read(
+            lambda: self._fetch_funding_history_cached(instrument_ref)
+        )
+
+    async def _fetch_funding_rate_history_uncached(
+        self,
+        instrument_ref: str,
+    ) -> MarketFundingRateHistory:
+        symbol = _INSTRUMENT_SYMBOLS.get(instrument_ref)
+        if symbol is None:
+            raise MarketContextUnavailable("MARKET_FUNDING_HISTORY_INSTRUMENT_UNSUPPORTED")
+        if self._funding_rate_query is None:
+            raise MarketContextUnavailable("MARKET_FUNDING_HISTORY_UNAVAILABLE")
+        try:
+            raw_samples = await asyncio.wait_for(
+                self._funding_rate_query(symbol, FUNDING_RATE_HISTORY_SAMPLE_COUNT),
+                timeout=PUBLIC_MARKET_TIMEOUT_SECONDS,
+            )
+            if not isinstance(raw_samples, list):
+                raise ValueError("funding history response invalid")
+            samples = tuple(
+                MarketFundingRateSample(
+                    settled_at=datetime.fromtimestamp(
+                        int(item["fundingTime"]) / 1000,
+                        tz=UTC,
+                    ),
+                    funding_rate=str(item["fundingRate"]),
+                )
+                for item in raw_samples
+                if isinstance(item, dict) and item.get("symbol") == symbol
+            )
+            if len(samples) < 3:
+                raise ValueError("funding history incomplete")
+            ordered_samples = tuple(sorted(samples, key=lambda item: item.settled_at))
+            intervals = [
+                int((later.settled_at - earlier.settled_at).total_seconds())
+                for earlier, later in zip(ordered_samples, ordered_samples[1:])
+            ]
+            if any(interval <= 0 for interval in intervals):
+                raise ValueError("funding history timestamps invalid")
+            observed_at = self._observed_at_provider()
+            if observed_at.utcoffset() is None:
+                raise ValueError("funding history observation timezone invalid")
+            observed_at = observed_at.astimezone(UTC)
+            latest_settlement = ordered_samples[-1].settled_at
+            if (
+                observed_at - latest_settlement > timedelta(days=2)
+                or latest_settlement - observed_at > timedelta(minutes=5)
+            ):
+                raise ValueError("funding history stale")
+            average_rate = sum(
+                (Decimal(item.funding_rate) for item in ordered_samples),
+                Decimal(0),
+            ) / len(ordered_samples)
+            average_interval = sum(intervals) // len(intervals)
+            return MarketFundingRateHistory(
+                instrument_ref=instrument_ref,
+                source=self._source,
+                source_cutoff=observed_at,
+                samples=ordered_samples,
+                average_funding_rate=canonical_decimal(average_rate),
+                average_interval_seconds=average_interval,
+            )
+        except MarketContextUnavailable:
+            raise
+        except Exception as exc:
+            raise MarketContextUnavailable(
+                f"MARKET_FUNDING_HISTORY_READ_FAILED_{type(exc).__name__.upper()}"
+            ) from None
 
     async def _fetch_uncached(
         self,
@@ -739,11 +930,13 @@ class BinancePublicMarketContext:
             if historical
             else self._fetch_recent_window_cached
         )
-        return await fetcher(
-            instrument_ref,
-            interval,
-            normalized_start,
-            normalized_end,
+        return await _retry_transient_market_read(
+            lambda: fetcher(
+                instrument_ref,
+                interval,
+                normalized_start,
+                normalized_end,
+            )
         )
 
     async def _fetch_window_uncached(

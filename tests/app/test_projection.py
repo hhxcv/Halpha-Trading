@@ -8,6 +8,7 @@ from pydantic import SecretStr
 
 from halpha.app.projection import (
     PostgreSQLWorkbenchProjection,
+    _project_account_observation_failure,
     _executor_status_from_application_names,
     _project_account_snapshot,
 )
@@ -288,6 +289,34 @@ def test_stale_snapshot_remains_visible_but_is_not_current() -> None:
 
     assert projected["account_snapshot_status"] == "STALE"
     assert len(projected["account_positions"]) == 1
+
+
+def test_account_observation_failure_is_visible_only_after_latest_snapshot() -> None:
+    cutoff = datetime(2030, 1, 15, 4, 0, tzinfo=UTC)
+
+    current = _project_account_observation_failure(
+        snapshot_cutoff=cutoff,
+        failure_at=cutoff + timedelta(seconds=1),
+        reason_code="ACCOUNT_SNAPSHOT_QUERY_FAILED_HTTPERROR",
+        retry_after_seconds=30,
+    )
+    recovered = _project_account_observation_failure(
+        snapshot_cutoff=cutoff + timedelta(seconds=2),
+        failure_at=cutoff + timedelta(seconds=1),
+        reason_code="ACCOUNT_SNAPSHOT_QUERY_FAILED_HTTPERROR",
+        retry_after_seconds=30,
+    )
+
+    assert current == {
+        "account_observation_failure_at": "2030-01-15T04:00:01Z",
+        "account_observation_failure_code": "ACCOUNT_SNAPSHOT_QUERY_FAILED_HTTPERROR",
+        "account_observation_retry_after_seconds": 30.0,
+    }
+    assert recovered == {
+        "account_observation_failure_at": None,
+        "account_observation_failure_code": None,
+        "account_observation_retry_after_seconds": None,
+    }
 
 
 @pytest.mark.parametrize(

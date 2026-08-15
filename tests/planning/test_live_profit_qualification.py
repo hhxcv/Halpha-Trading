@@ -61,6 +61,7 @@ def _version() -> TradePlanVersion:
         plan_name="live profit qualification contract",
         created_at=NOW,
         creator_kind="AI",
+        ai_review_ref="review-approved",
         decision_context=PlanDecisionContext(
             rationale="The fixed setup has a bounded continuation hypothesis.",
             evidence="The exact Demo cohort passed the repeatability screen.",
@@ -92,6 +93,15 @@ def _version() -> TradePlanVersion:
         terms={},
         content_digest="b" * 64,
     )
+
+
+def _approved_ai_review(version: TradePlanVersion) -> dict[str, object]:
+    return {
+        "review_id": version.ai_review_ref,
+        "status": "APPROVED",
+        "decision": "APPROVE",
+        "draft_content_digest": "c" * 64,
+    }
 
 
 def _snapshot():
@@ -368,6 +378,7 @@ def test_live_profit_activation_has_a_server_side_qualification_gate() -> None:
             environment_kind=EnvironmentKind.LIVE,
             authority_class=AuthorityClass.LIVE_REAL_CAPITAL,
             observed_at=NOW + timedelta(minutes=1),
+            ai_review_checker=_approved_ai_review,
         )
 
     with pytest.raises(ValueError, match="LIVE_PROFIT_QUALIFICATION_EVIDENCE_STALE"):
@@ -380,6 +391,7 @@ def test_live_profit_activation_has_a_server_side_qualification_gate() -> None:
             live_profit_qualification_checker=lambda _version: (_ for _ in ()).throw(
                 ValueError("LIVE_PROFIT_QUALIFICATION_EVIDENCE_STALE")
             ),
+            ai_review_checker=_approved_ai_review,
         )
 
 
@@ -417,6 +429,7 @@ def test_live_activation_persists_the_consumed_evidence_identity() -> None:
         observed_at=NOW + timedelta(minutes=1),
         order_schedule_snapshot=_snapshot(),
         live_profit_qualification_checker=lambda _version: qualification_snapshot,
+        ai_review_checker=_approved_ai_review,
     )
 
     assert inserted == [activation]

@@ -7,13 +7,18 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from halpha.capital.models import StopStateVersion
+from halpha.app.plan_ai_review import (
+    PlanAiReviewConfiguration,
+    PlanAiReviewDecision,
+    PlanAiReviewStatus,
+)
 from halpha.outcomes.models import Review
 from halpha.outcomes.price_path import ReviewPricePathInterval
 from halpha.outcomes.sequence_evidence import (
     ReviewSequenceResultKind,
     ReviewSequenceScope,
 )
-from halpha.planning.models import PlanActivation
+from halpha.planning.models import PlanActivation, PlanLifecycle
 from halpha.planning.models import (
     PlanDecisionContext,
     PlanDecisionIntent,
@@ -123,6 +128,8 @@ class NewRiskDisciplineResponse(FrozenResponse):
     account_snapshot_cutoff: str | None
     risk_equity: str | None
     max_plan_loss: str | None
+    minimum_reward_risk_ratio: str
+    available_notional_capacity: str | None
     open_risk_limit: str | None
     open_risk_committed: str | None
     open_risk_after_proposal: str | None
@@ -172,6 +179,9 @@ class OverviewResponse(FrozenResponse):
     account_snapshot_ref: str | None
     account_snapshot_cutoff: str | None
     account_snapshot_age_seconds: int | None
+    account_observation_failure_at: str | None = None
+    account_observation_failure_code: str | None = None
+    account_observation_retry_after_seconds: float | None = None
     account_ordinary_open_order_count: int | None
     account_algo_open_order_count: int | None
     account_summary: AccountSummaryResponse | None
@@ -328,6 +338,9 @@ class ActivationPreviewResponse(FrozenResponse):
     runtime_incompatibility_reason: str | None
     position_alignment_ready: bool | None
     position_alignment_blocker: str | None
+    ai_review: dict[str, Any] | None = None
+    ai_review_ready: bool | None = None
+    ai_review_blocker: str | None = None
     new_risk_discipline: NewRiskDisciplineResponse | None = None
     live_profit_qualification: LiveProfitQualificationStatus
     configured_runtime_real_write_gate: str
@@ -361,6 +374,13 @@ class PlanSummaryResponse(FrozenResponse):
     max_notional: str
     valid_from: str
     valid_until: str
+    # Primary lifecycle shown to users.  Runtime control substates stay on the
+    # activation detail and never introduce a fourth plan status.
+    status: Literal["DRAFT", "RUNNING", "ENDED"]
+    activation_id: str | None = None
+    activation_lifecycle: PlanLifecycle | None = None
+    activation_created_at: str | None = None
+    activation_updated_at: str | None = None
     plan_version_id: str | None
     fixed_at: str | None
     fixed_content_digest: str | None
@@ -369,12 +389,44 @@ class PlanSummaryResponse(FrozenResponse):
     product_build_consistent: bool | None
     runtime_compatible: bool | None
     runtime_incompatibility_reason: str | None
+    ai_review_ref: str | None = None
+    ai_review: dict[str, Any] | None = None
 
 
 class PlanDeleteResponse(FrozenResponse):
     result: Literal["APPLIED"]
     plan_id: str
     deleted_draft_version: int
+
+
+class PlanAiReviewResponse(FrozenResponse):
+    review_id: str
+    environment_id: str
+    plan_id: str
+    draft_version: int
+    draft_content_digest: str
+    prompt_version: str
+    configuration: PlanAiReviewConfiguration
+    status: PlanAiReviewStatus
+    market_context_digest: str | None = None
+    market_source_cutoff: str | None = None
+    approval_valid_until: str | None = None
+    decision: PlanAiReviewDecision | None = None
+    reason: str | None = None
+    suggestions: list[str] = Field(default_factory=list)
+    progress_message: str
+    public_output: str = ""
+    failure_code: str | None = None
+    created_at: str
+    started_at: str | None = None
+    completed_at: str | None = None
+    updated_at: str
+
+
+class PlanAiReviewRequest(FrozenResponse):
+    configuration: PlanAiReviewConfiguration = Field(
+        default_factory=PlanAiReviewConfiguration
+    )
 
 
 class ActivationCreateResponse(FrozenResponse):
@@ -394,6 +446,8 @@ class ActivationSummaryResponse(PlanActivation):
 
 class ActivationDetailResponse(FrozenResponse):
     activation: PlanActivation
+    ai_review_ref: str | None = None
+    ai_review: dict[str, Any] | None = None
     plan: dict[str, Any]
     decision_basis: dict[str, Any]
     strategy: dict[str, Any] | None

@@ -74,6 +74,14 @@ describe("order schedule milestone server validation", () => {
     )).toContain("15m 已闭合 K 线收盘阈值必须大于 0。");
   });
 
+  it("does not impose a static 5000 bps initial-stop ceiling", () => {
+    const spec = createDefaultOrderScheduleSpec();
+    spec.protection_policy.initial_stop.distance_bps = "7500";
+
+    expect(localOrderScheduleProblems(spec, "BTCUSDT-PERP", "100", "schedule-stop"))
+      .not.toContain("初始止损距离必须大于 0 且低于 10000 bps。");
+  });
+
   it("assigns exit dynamic rules and semantic errors to Exit", () => {
     const spec = createDefaultOrderScheduleSpec();
     spec.dynamic_rules = [{

@@ -76,7 +76,7 @@ export function entrySignalQualityWarning(
 ): string | null {
   const marketConditions = items.filter((item) => item.kind !== "DECISION_BASIS_READY");
   if (marketConditions.length === 0) {
-    return "当前计划没有市场入场条件，启动后会立即尝试入场；计划名称与图上线不会自动成为执行条件。若交易依据依赖到价、方向或价差，请明确启用对应条件。";
+    return null;
   }
   if (operator === "ANY" && marketConditions.length > 1) {
     return "当前使用 ANY：价格、K 线收盘、价差或短时变动任一成立即可入场，并不构成组合确认。若交易依据要求组合确认，请改用 ALL。";

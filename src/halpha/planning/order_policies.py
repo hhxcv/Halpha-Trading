@@ -440,7 +440,7 @@ class InitialStopSpec(PolicyModel):
             code="PROTECTION_POLICY_INVALID",
             positive=True,
         )
-        if Decimal(normalized) > Decimal(5_000):
+        if Decimal(normalized) >= Decimal(10_000):
             raise ValueError("PROTECTION_POLICY_INVALID")
         return normalized
 

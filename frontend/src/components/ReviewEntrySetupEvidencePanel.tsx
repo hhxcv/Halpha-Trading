@@ -36,7 +36,7 @@ export function entrySetupPrice(value: unknown): string {
   const parsed = finite(value);
   return parsed === null
     ? "未知"
-    : formatted(parsed, { minimumFractionDigits: 2, maximumFractionDigits: 8 }) + " USDT";
+    : formatted(parsed, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " USDT";
 }
 
 export function entrySetupAtr(value: unknown): string {

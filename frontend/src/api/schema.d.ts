@@ -243,6 +243,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/market-funding-history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Market Funding History */
+        get: operations["market_funding_history_api_v1_market_funding_history_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/market-window": {
         parameters: {
             query?: never;
@@ -286,6 +303,23 @@ export interface paths {
         };
         /** Overview */
         get: operations["overview_api_v1_overview_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/plan-ai-reviews/{review_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Plan Ai Review */
+        get: operations["plan_ai_review_api_v1_plan_ai_reviews__review_id__get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -365,7 +399,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/plans/{plan_id}/fix": {
+    "/api/v1/plans/{plan_id}/ai-review": {
         parameters: {
             query?: never;
             header?: never;
@@ -374,8 +408,45 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Fix Plan */
-        post: operations["fix_plan_api_v1_plans__plan_id__fix_post"];
+        /** Request Plan Ai Review */
+        post: operations["request_plan_ai_review_api_v1_plans__plan_id__ai_review_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/plans/{plan_id}/ai-review/latest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Latest Plan Ai Review */
+        get: operations["latest_plan_ai_review_api_v1_plans__plan_id__ai_review_latest_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/plans/{plan_id}/submit-and-start": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit And Start Plan
+         * @description Start one draft atomically; failures retain the editable draft.
+         */
+        post: operations["submit_and_start_plan_api_v1_plans__plan_id__submit_and_start_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -833,6 +904,12 @@ export interface components {
         /** ActivationDetailResponse */
         ActivationDetailResponse: {
             activation: components["schemas"]["PlanActivation"];
+            /** Ai Review */
+            ai_review?: {
+                [key: string]: unknown;
+            } | null;
+            /** Ai Review Ref */
+            ai_review_ref?: string | null;
             /** Capital */
             capital: {
                 [key: string]: unknown;
@@ -894,6 +971,14 @@ export interface components {
             account_ref: string;
             /** Actual Account Configuration */
             actual_account_configuration: string;
+            /** Ai Review */
+            ai_review?: {
+                [key: string]: unknown;
+            } | null;
+            /** Ai Review Blocker */
+            ai_review_blocker?: string | null;
+            /** Ai Review Ready */
+            ai_review_ready?: boolean | null;
             /** Allowed Actions */
             allowed_actions: string[];
             /** Authority Class */
@@ -1310,6 +1395,12 @@ export interface components {
         /** ControlPreviewResponse */
         ControlPreviewResponse: {
             activation: components["schemas"]["PlanActivation"];
+            /** Ai Review */
+            ai_review?: {
+                [key: string]: unknown;
+            } | null;
+            /** Ai Review Ref */
+            ai_review_ref?: string | null;
             /** Capital */
             capital: {
                 [key: string]: unknown;
@@ -2031,6 +2122,40 @@ export interface components {
             stop_references: components["schemas"]["MarketStopReference"][];
         };
         /**
+         * MarketFundingRateHistory
+         * @description Recent funding-rate observations from the current public market source.
+         */
+        MarketFundingRateHistory: {
+            /** Average Funding Rate */
+            average_funding_rate: string;
+            /** Average Interval Seconds */
+            average_interval_seconds: number;
+            /** Instrument Ref */
+            instrument_ref: string;
+            /** Samples */
+            samples: components["schemas"]["MarketFundingRateSample"][];
+            /** Source */
+            source: string;
+            /**
+             * Source Cutoff
+             * Format: date-time
+             */
+            source_cutoff: string;
+        };
+        /**
+         * MarketFundingRateSample
+         * @description One venue-settled public funding rate used only for local estimates.
+         */
+        MarketFundingRateSample: {
+            /** Funding Rate */
+            funding_rate: string;
+            /**
+             * Settled At
+             * Format: date-time
+             */
+            settled_at: string;
+        };
+        /**
          * MarketStopReference
          * @description One explainable, direction-neutral market level for stop planning.
          */
@@ -2095,6 +2220,8 @@ export interface components {
             account_snapshot_cutoff: string | null;
             /** Account Snapshot Ref */
             account_snapshot_ref: string | null;
+            /** Available Notional Capacity */
+            available_notional_capacity: string | null;
             /** Blocker Codes */
             blocker_codes: string[];
             /** Correlated Exposure */
@@ -2129,6 +2256,8 @@ export interface components {
             instrument_ref: string | null;
             /** Max Plan Loss */
             max_plan_loss: string | null;
+            /** Minimum Reward Risk Ratio */
+            minimum_reward_risk_ratio: string;
             /** New Risk Allowed */
             new_risk_allowed: boolean;
             /** Open New Risk Activation Count */
@@ -2306,6 +2435,12 @@ export interface components {
             account_algo_open_order_count: number | null;
             /** Account Id */
             account_id: string;
+            /** Account Observation Failure At */
+            account_observation_failure_at?: string | null;
+            /** Account Observation Failure Code */
+            account_observation_failure_code?: string | null;
+            /** Account Observation Retry After Seconds */
+            account_observation_retry_after_seconds?: number | null;
             /** Account Orders */
             account_orders: components["schemas"]["AccountOrderResponse"][];
             /** Account Ordinary Open Order Count */
@@ -2428,6 +2563,82 @@ export interface components {
              */
             updated_at: string;
         };
+        /**
+         * PlanAiReasoningEffort
+         * @enum {string}
+         */
+        PlanAiReasoningEffort: "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+        /** PlanAiReviewConfiguration */
+        PlanAiReviewConfiguration: {
+            /** @default gpt-5.6-terra */
+            model: components["schemas"]["PlanAiReviewModel"];
+            /** @default medium */
+            reasoning_effort: components["schemas"]["PlanAiReasoningEffort"];
+        };
+        /**
+         * PlanAiReviewDecision
+         * @enum {string}
+         */
+        PlanAiReviewDecision: "APPROVE" | "REJECT";
+        /**
+         * PlanAiReviewModel
+         * @enum {string}
+         */
+        PlanAiReviewModel: "gpt-5.6-terra" | "gpt-5.6-sol" | "gpt-5.6-luna";
+        /** PlanAiReviewRequest */
+        PlanAiReviewRequest: {
+            configuration?: components["schemas"]["PlanAiReviewConfiguration"];
+        };
+        /** PlanAiReviewResponse */
+        PlanAiReviewResponse: {
+            /** Approval Valid Until */
+            approval_valid_until?: string | null;
+            /** Completed At */
+            completed_at?: string | null;
+            configuration: components["schemas"]["PlanAiReviewConfiguration"];
+            /** Created At */
+            created_at: string;
+            decision?: components["schemas"]["PlanAiReviewDecision"] | null;
+            /** Draft Content Digest */
+            draft_content_digest: string;
+            /** Draft Version */
+            draft_version: number;
+            /** Environment Id */
+            environment_id: string;
+            /** Failure Code */
+            failure_code?: string | null;
+            /** Market Context Digest */
+            market_context_digest?: string | null;
+            /** Market Source Cutoff */
+            market_source_cutoff?: string | null;
+            /** Plan Id */
+            plan_id: string;
+            /** Progress Message */
+            progress_message: string;
+            /** Prompt Version */
+            prompt_version: string;
+            /**
+             * Public Output
+             * @default
+             */
+            public_output: string;
+            /** Reason */
+            reason?: string | null;
+            /** Review Id */
+            review_id: string;
+            /** Started At */
+            started_at?: string | null;
+            status: components["schemas"]["PlanAiReviewStatus"];
+            /** Suggestions */
+            suggestions?: string[];
+            /** Updated At */
+            updated_at: string;
+        };
+        /**
+         * PlanAiReviewStatus
+         * @enum {string}
+         */
+        PlanAiReviewStatus: "QUEUED" | "RUNNING" | "APPROVED" | "REJECTED" | "FAILED";
         /** PlanCreatePayload */
         PlanCreatePayload: {
             creator_kind: components["schemas"]["PlanCreatorKind"];
@@ -2469,18 +2680,18 @@ export interface components {
          */
         "PlanDecisionContext-Input": {
             /** Evidence */
-            evidence: string;
+            evidence?: string | null;
             /** Evidence Cutoff */
             evidence_cutoff?: string | null;
             intent?: components["schemas"]["PlanDecisionIntent"] | null;
             /** Invalidation */
             invalidation?: string | null;
             /** Limitations */
-            limitations: string;
+            limitations?: string | null;
             /** Playbook Ref */
             playbook_ref?: string | null;
             /** Rationale */
-            rationale: string;
+            rationale?: string | null;
             setup_family?: components["schemas"]["PlanSetupFamily"] | null;
         };
         /**
@@ -2489,18 +2700,18 @@ export interface components {
          */
         "PlanDecisionContext-Output": {
             /** Evidence */
-            evidence: string;
+            evidence: string | null;
             /** Evidence Cutoff */
             evidence_cutoff: string | null;
             intent: components["schemas"]["PlanDecisionIntent"] | null;
             /** Invalidation */
             invalidation: string | null;
             /** Limitations */
-            limitations: string;
+            limitations: string | null;
             /** Playbook Ref */
             playbook_ref: string | null;
             /** Rationale */
-            rationale: string;
+            rationale: string | null;
             setup_family: components["schemas"]["PlanSetupFamily"] | null;
         };
         /**
@@ -2583,6 +2794,19 @@ export interface components {
         PlanSetupFamily: "BREAKOUT_CONTINUATION" | "PULLBACK_CONTINUATION" | "RANGE_MEAN_REVERSION" | "REVERSAL" | "EVENT_DRIVEN" | "OTHER";
         /** PlanSummaryResponse */
         PlanSummaryResponse: {
+            /** Activation Created At */
+            activation_created_at?: string | null;
+            /** Activation Id */
+            activation_id?: string | null;
+            activation_lifecycle?: components["schemas"]["PlanLifecycle"] | null;
+            /** Activation Updated At */
+            activation_updated_at?: string | null;
+            /** Ai Review */
+            ai_review?: {
+                [key: string]: unknown;
+            } | null;
+            /** Ai Review Ref */
+            ai_review_ref?: string | null;
             /** Created At */
             created_at: string | null;
             /** Creator Kind */
@@ -2627,6 +2851,11 @@ export interface components {
             runtime_compatible: boolean | null;
             /** Runtime Incompatibility Reason */
             runtime_incompatibility_reason: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "DRAFT" | "RUNNING" | "ENDED";
             /** Strategy Id */
             strategy_id: string | null;
             /** Updated At */
@@ -4270,6 +4499,8 @@ export interface components {
         TradePlanVersion: {
             /** Account Ref */
             account_ref: string;
+            /** Ai Review Ref */
+            ai_review_ref: string | null;
             /** Allowed Actions */
             allowed_actions: string[];
             /** Content Digest */
@@ -4898,6 +5129,37 @@ export interface operations {
             };
         };
     };
+    market_funding_history_api_v1_market_funding_history_get: {
+        parameters: {
+            query?: {
+                instrument_ref?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MarketFundingRateHistory"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     market_window_api_v1_market_window_get: {
         parameters: {
             query: {
@@ -4970,7 +5232,10 @@ export interface operations {
     };
     overview_api_v1_overview_get: {
         parameters: {
-            query?: never;
+            query?: {
+                entry_instrument_ref?: string | null;
+                entry_direction?: ("LONG" | "SHORT") | null;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -4984,6 +5249,46 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["OverviewResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    plan_ai_review_api_v1_plan_ai_reviews__review_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                review_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlanAiReviewResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -5215,7 +5520,78 @@ export interface operations {
             };
         };
     };
-    fix_plan_api_v1_plans__plan_id__fix_post: {
+    request_plan_ai_review_api_v1_plans__plan_id__ai_review_post: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+                "If-Match": string;
+                /** @description Required with value MONITOR for a native loopback Monitor mutation; browser workbench requests use their local Origin and CSRF token instead. */
+                "X-Halpha-Caller"?: components["parameters"]["HalphaProgrammaticCaller"];
+            };
+            path: {
+                plan_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PlanAiReviewRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlanAiReviewResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    latest_plan_ai_review_api_v1_plans__plan_id__ai_review_latest_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                plan_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlanAiReviewResponse"] | null;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_and_start_plan_api_v1_plans__plan_id__submit_and_start_post: {
         parameters: {
             query?: never;
             header: {
@@ -5232,12 +5608,12 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Successful Response */
-            200: {
+            201: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TradePlanVersion"];
+                    "application/json": components["schemas"]["ActivationCreateResponse"];
                 };
             };
             /** @description Validation Error */

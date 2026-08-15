@@ -21,8 +21,13 @@ from halpha.planning.models import (
     TradePlanContent,
     TradePlanDraft,
     TradePlanVersion,
+    new_risk_decision_context_incompatibility,
 )
-from halpha.planning.service import PlanningApplicationService
+from halpha.planning.service import (
+    PlanningApplicationService,
+    plan_reward_risk_ratio,
+    require_plan_reward_risk_discipline,
+)
 from halpha.planning.order_policies import (
     FullFillLossBudgetSpec,
     InitialStopSpec,
@@ -41,6 +46,7 @@ from halpha.planning.order_schedule import (
 )
 from halpha.planning.registry import (
     DIRECT_EXECUTION_REF,
+    DecisionBasisKind,
     Direction,
     DraftDecisionBasis,
     FixedDirectExecutionBasis,
@@ -67,6 +73,17 @@ def test_plan_decision_context_normalizes_readable_text() -> None:
     assert context.invalidation == "fixed boundary fails"
     assert context.playbook_ref == "BTC_BREAKOUT_V1"
     assert context.experiment_complete is True
+
+
+def test_draft_decision_context_preserves_incomplete_input_but_cannot_admit_risk() -> None:
+    context = PlanDecisionContext(rationale="只填写到一半的交易理由")
+
+    assert context.rationale == "只填写到一半的交易理由"
+    assert context.experiment_complete is False
+    assert new_risk_decision_context_incompatibility(
+        decision_basis_kind=DecisionBasisKind.DIRECT_EXECUTION,
+        decision_context=context,
+    ) == "PLAN_DECISION_EXPERIMENT_INCOMPLETE"
 
 
 def test_plan_decision_context_rejects_a_naive_evidence_cutoff() -> None:
@@ -131,8 +148,63 @@ def _spec() -> OrderScheduleSpec:
         amount_distribution=AmountDistribution(base_notional="20"),
         protection_policy=ProtectionPolicy(
             initial_stop=InitialStopSpec(distance_bps="100"),
+            take_profit_ladder=TakeProfitLadderSpec(
+                levels=(
+                    TakeProfitLevel(trigger_r="2", quantity_fraction="1"),
+                ),
+            ),
         ),
     )
+
+
+def test_price_exit_reward_risk_is_weighted_and_enforced() -> None:
+    basis = FixedDirectExecutionBasis(
+        parameter_digest=content_digest({}),
+        product_build_id="a" * 64,
+    )
+    spec = _spec().model_copy(
+        update={
+            "protection_policy": _spec().protection_policy.model_copy(
+                update={
+                    "take_profit_ladder": TakeProfitLadderSpec(
+                        levels=(
+                            TakeProfitLevel(
+                                trigger_r="0.5",
+                                quantity_fraction="1",
+                            ),
+                        )
+                    )
+                }
+            )
+        }
+    )
+
+    assert plan_reward_risk_ratio(
+        decision_basis=basis,
+        order_schedule_spec=_spec(),
+    ) == 2
+    with pytest.raises(
+        ValueError,
+        match="PLAN_REWARD_RISK_BELOW_DISCIPLINE_MINIMUM",
+    ):
+        require_plan_reward_risk_discipline(
+            decision_basis=basis,
+            order_schedule_spec=spec,
+            policy=NewRiskDisciplinePolicy(),
+        )
+
+    with pytest.raises(ValueError, match="PLAN_REWARD_RISK_UNAVAILABLE"):
+        require_plan_reward_risk_discipline(
+            decision_basis=basis,
+            order_schedule_spec=_spec().model_copy(
+                update={
+                    "protection_policy": _spec().protection_policy.model_copy(
+                        update={"take_profit_ladder": None}
+                    )
+                }
+            ),
+            policy=NewRiskDisciplinePolicy(),
+        )
 
 
 def _historical_split_spec() -> OrderScheduleSpec:
@@ -231,6 +303,45 @@ def _draft_content(*, allowed_actions: frozenset[str]) -> TradePlanContent:
     )
 
 
+def test_periodic_draft_save_is_a_noop_when_plan_fields_are_unchanged() -> None:
+    content = _draft_content(
+        allowed_actions=direct_allowed_action_profiles(_spec()),
+    )
+    current = TradePlanDraft(
+        plan_id="plan-periodic-save",
+        environment_id="demo",
+        draft_version=7,
+        content=content,
+        content_digest=content_digest(content),
+        updated_at=NOW,
+    )
+    saved: list[TradePlanDraft] = []
+    service = object.__new__(PlanningApplicationService)
+    service._environment_id = "demo"
+    service._planning = SimpleNamespace(
+        get_draft=lambda _plan_id, **_kwargs: current,
+        has_activation=lambda _plan_id: False,
+        save_draft=lambda draft, **_kwargs: saved.append(draft),
+    )
+    later = NOW + timedelta(minutes=5)
+    unchanged_payload = content.model_copy(
+        update={
+            "valid_from": later,
+            "valid_until": later + timedelta(hours=1),
+        }
+    )
+
+    result = service.update_draft(
+        plan_id=current.plan_id,
+        expected_version=current.draft_version,
+        content=unchanged_payload,
+        observed_at=later,
+    )
+
+    assert result is current
+    assert saved == []
+
+
 def _fixed_version(*, allowed_actions: frozenset[str]) -> TradePlanVersion:
     return TradePlanVersion(
         plan_version_id="plan-version-direct",
@@ -240,6 +351,7 @@ def _fixed_version(*, allowed_actions: frozenset[str]) -> TradePlanVersion:
         plan_name="direct contract",
         created_at=NOW,
         creator_kind="AI",
+        ai_review_ref="review-approved",
         decision_context=PlanDecisionContext(
             rationale="The fixed direct setup has a bounded market hypothesis.",
             evidence="Current venue facts and the fixed order schedule.",
@@ -273,6 +385,48 @@ def _fixed_version(*, allowed_actions: frozenset[str]) -> TradePlanVersion:
     )
 
 
+def _approved_ai_review(version: TradePlanVersion) -> dict[str, object]:
+    return {
+        "review_id": version.ai_review_ref,
+        "status": "APPROVED",
+        "decision": "APPROVE",
+        "draft_content_digest": "c" * 64,
+    }
+
+
+def test_new_risk_activation_fails_closed_without_an_exact_ai_approval() -> None:
+    version = _fixed_version(
+        allowed_actions=direct_allowed_action_profiles(_spec()),
+    )
+    service = object.__new__(PlanningApplicationService)
+    service._environment_id = "demo"
+    service._planning = SimpleNamespace(get_version=lambda _plan_version_id: version)
+
+    with pytest.raises(ValueError, match="PLAN_AI_REVIEW_NOT_CONFIGURED"):
+        service.activate_version(
+            plan_version_id=version.plan_version_id,
+            activation_id="activation-no-review-checker",
+            environment_kind=EnvironmentKind.DEMO,
+            authority_class=AuthorityClass.DEMO_VALIDATION,
+            observed_at=NOW + timedelta(minutes=1),
+        )
+
+    with pytest.raises(ValueError, match="PLAN_AI_REVIEW_NOT_APPROVED"):
+        service.activate_version(
+            plan_version_id=version.plan_version_id,
+            activation_id="activation-rejected-review",
+            environment_kind=EnvironmentKind.DEMO,
+            authority_class=AuthorityClass.DEMO_VALIDATION,
+            observed_at=NOW + timedelta(minutes=1),
+            ai_review_checker=lambda current: {
+                "review_id": current.ai_review_ref,
+                "status": "REJECTED",
+                "decision": "REJECT",
+                "draft_content_digest": "c" * 64,
+            },
+        )
+
+
 def test_new_risk_activation_rejects_a_historical_incomplete_decision_record() -> None:
     version = _fixed_version(
         allowed_actions=direct_allowed_action_profiles(_spec()),
@@ -294,12 +448,13 @@ def test_new_risk_activation_rejects_a_historical_incomplete_decision_record() -
             authority_class=AuthorityClass.DEMO_VALIDATION,
             observed_at=NOW + timedelta(minutes=1),
             order_schedule_snapshot=_snapshot(),
+            ai_review_checker=_approved_ai_review,
         )
 
     assert inserted == []
 
 
-def test_new_direct_risk_rejects_history_without_a_playbook_identity() -> None:
+def test_new_direct_risk_allows_the_simplified_record_without_a_playbook_identity() -> None:
     current = _fixed_version(
         allowed_actions=direct_allowed_action_profiles(_spec()),
     )
@@ -320,17 +475,17 @@ def test_new_direct_risk_rejects_history_without_a_playbook_identity() -> None:
         insert_activation=inserted.append,
     )
 
-    with pytest.raises(ValueError, match="PLAN_DECISION_PLAYBOOK_REF_REQUIRED"):
-        service.activate_version(
-            plan_version_id="plan-version-direct",
-            activation_id="activation-missing-playbook",
-            environment_kind=EnvironmentKind.DEMO,
-            authority_class=AuthorityClass.DEMO_VALIDATION,
-            observed_at=NOW + timedelta(minutes=1),
-            order_schedule_snapshot=_snapshot(),
-        )
+    activation = service.activate_version(
+        plan_version_id="plan-version-direct",
+        activation_id="activation-without-playbook",
+        environment_kind=EnvironmentKind.DEMO,
+        authority_class=AuthorityClass.DEMO_VALIDATION,
+        observed_at=NOW + timedelta(minutes=1),
+        order_schedule_snapshot=_snapshot(),
+        ai_review_checker=_approved_ai_review,
+    )
 
-    assert inserted == []
+    assert inserted == [activation]
 
 
 def test_fix_rejects_a_persisted_strategy_draft_with_unqualified_profit_intent() -> None:
@@ -370,6 +525,7 @@ def test_fix_rejects_a_persisted_strategy_draft_with_unqualified_profit_intent()
     service._environment_id = "demo"
     service._planning = SimpleNamespace(
         get_draft=lambda _plan_id, **_kwargs: draft,
+        has_activation=lambda _plan_id: False,
         insert_version=inserted.append,
     )
 
@@ -383,6 +539,7 @@ def test_fix_rejects_a_persisted_strategy_draft_with_unqualified_profit_intent()
             plan_version_id="version-unqualified-profit",
             product_build_id="a" * 64,
             fixed_at=NOW,
+            ai_review_ref="review-approved",
         )
 
     assert inserted == []
@@ -423,6 +580,7 @@ def test_new_risk_activation_fails_before_insertion_when_account_discipline_bloc
             observed_at=NOW + timedelta(minutes=1),
             order_schedule_snapshot=_snapshot(),
             new_risk_discipline_policy=NewRiskDisciplinePolicy(),
+            ai_review_checker=_approved_ai_review,
         )
 
     assert inserted == []
@@ -445,6 +603,7 @@ def test_same_direction_activations_share_one_account_instrument_scope() -> None
         authority_class=AuthorityClass.DEMO_VALIDATION,
         observed_at=NOW + timedelta(minutes=1),
         order_schedule_snapshot=_snapshot(),
+        ai_review_checker=_approved_ai_review,
     )
 
     assert activation.direction is Direction.LONG
@@ -454,13 +613,21 @@ def test_same_direction_activations_share_one_account_instrument_scope() -> None
 def test_activation_rejects_projected_loss_above_the_plan_limit() -> None:
     spec = _spec().model_copy(
         update={
-            "protection_policy": ProtectionPolicy(
-                initial_stop=InitialStopSpec(distance_bps="100"),
-                full_fill_loss_budget=FullFillLossBudgetSpec(
-                    entry_fee_bps="2",
-                    exit_fee_bps="5",
-                ),
-            )
+                "protection_policy": ProtectionPolicy(
+                    initial_stop=InitialStopSpec(distance_bps="100"),
+                    full_fill_loss_budget=FullFillLossBudgetSpec(
+                        entry_fee_bps="2",
+                        exit_fee_bps="5",
+                    ),
+                    take_profit_ladder=TakeProfitLadderSpec(
+                        levels=(
+                            TakeProfitLevel(
+                                trigger_r="2",
+                                quantity_fraction="1",
+                            ),
+                        )
+                    ),
+                )
         }
     )
     snapshot = _snapshot(spec)
@@ -497,6 +664,7 @@ def test_activation_rejects_projected_loss_above_the_plan_limit() -> None:
             authority_class=AuthorityClass.DEMO_VALIDATION,
             observed_at=NOW + timedelta(minutes=1),
             order_schedule_snapshot=snapshot,
+            ai_review_checker=_approved_ai_review,
         )
 
     assert inserted == []
@@ -535,6 +703,7 @@ def test_activation_rejects_unsafe_shared_position_scope(
             authority_class=AuthorityClass.DEMO_VALIDATION,
             observed_at=NOW + timedelta(minutes=1),
             order_schedule_snapshot=_snapshot(),
+            ai_review_checker=_approved_ai_review,
         )
 
     assert inserted == []
@@ -666,6 +835,7 @@ def test_historical_version_is_readable_but_cannot_be_newly_activated() -> None:
             authority_class=AuthorityClass.DEMO_VALIDATION,
             observed_at=NOW,
             order_schedule_snapshot=_snapshot(_historical_split_spec()),
+            ai_review_checker=_approved_ai_review,
         )
     assert version_reads == [{}]
 
