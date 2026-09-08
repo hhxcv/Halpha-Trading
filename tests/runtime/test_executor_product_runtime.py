@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 from nautilus_trader.adapters.binance.common.enums import BinanceEnvironment
 from nautilus_trader.model.data import Bar, BarType
-from nautilus_trader.model.identifiers import Venue
+from nautilus_trader.model.identifiers import InstrumentId, Venue
 from nautilus_trader.model.objects import Price, Quantity
 from pydantic import SecretStr
 
@@ -98,8 +98,12 @@ def _data_client_with_stream_state(
     disconnecting: bool = False,
     closed: bool = False,
     active: bool = True,
+    streams: list[str] | None = None,
 ) -> SimpleNamespace:
     stream_name = "btcusdt@markPrice"
+    active_streams = streams if streams is not None else (
+        [stream_name] if subscribed else []
+    )
     raw_client = SimpleNamespace(
         is_reconnecting=lambda: reconnecting,
         is_disconnecting=lambda: disconnecting,
@@ -107,9 +111,9 @@ def _data_client_with_stream_state(
         is_active=lambda: active,
     )
     primary = SimpleNamespace(
-        subscriptions=[stream_name] if subscribed else [],
+        subscriptions=active_streams,
         _clients={0: raw_client if raw_client_present else None},
-        _client_streams={0: [stream_name] if subscribed else []},
+        _client_streams={0: active_streams},
     )
     secondary = SimpleNamespace(
         subscriptions=[],
@@ -215,13 +219,16 @@ def test_market_data_stream_health_reads_every_subscribed_transport() -> None:
     )
 
 
-def test_runtime_market_health_requires_base_and_active_bar_streams() -> None:
+def test_runtime_market_health_requires_only_active_responsibility_streams() -> None:
     class Lifecycle:
         activation_ids = ("strategy-btc",)
 
         @staticmethod
         def adapter_for_activation(_activation_id: str):
             return SimpleNamespace(
+                market_data_instrument_id=InstrumentId.from_str(
+                    "BTCUSDT-PERP.BINANCE"
+                ),
                 _bar_evaluator=SimpleNamespace(
                     subscribed_bar_types=(
                         BarType.from_str(
@@ -235,20 +242,36 @@ def test_runtime_market_health_requires_base_and_active_bar_streams() -> None:
             )
 
     runtime = object.__new__(ProductExecutorRuntime)
-    runtime._settings = SimpleNamespace(
-        release=SimpleNamespace(profile="BINANCE_DEMO")
-    )
     runtime._lifecycle = Lifecycle()
     runtime._market_fact_lifecycle = None
+    runtime._direct_schedule_instruments = {
+        "scalp-sol": "SOLUSDT-PERP",
+    }
 
     assert runtime._required_market_data_streams() == (
         "btcusdt@bookTicker",
         "btcusdt@kline_15m",
         "btcusdt@kline_1m",
         "btcusdt@markPrice@1s",
-        "ethusdt@bookTicker",
-        "ethusdt@markPrice@1s",
+        "solusdt@bookTicker",
+        "solusdt@markPrice@1s",
     )
+
+
+def test_runtime_market_health_is_idle_without_a_market_responsibility() -> None:
+    class Lifecycle:
+        activation_ids = ()
+
+        @staticmethod
+        def adapter_for_activation(_activation_id: str):
+            raise AssertionError("there is no active adapter")
+
+    runtime = object.__new__(ProductExecutorRuntime)
+    runtime._lifecycle = Lifecycle()
+    runtime._market_fact_lifecycle = None
+    runtime._direct_schedule_instruments = {}
+
+    assert runtime._required_market_data_streams() == ()
 
 
 def test_mark_price_event_health_detects_silent_connected_stream() -> None:
@@ -414,6 +437,9 @@ def test_market_data_stream_allows_bounded_recovery_then_requests_restart() -> N
     runtime._framework_data_client = _data_client_with_stream_state(
         reconnecting=True
     )
+    runtime._direct_schedule_instruments = {
+        "market-duty": "BTCUSDT-PERP",
+    }
     runtime._market_data_stream_unhealthy_since = None
     runtime._market_data_stream_last_state = "UNKNOWN"
     runtime._runtime_event_sink = lambda event, fields: events.append((event, fields))
@@ -440,13 +466,18 @@ def test_market_data_stream_recovery_clears_the_restart_deadline() -> None:
     runtime._framework_data_client = _data_client_with_stream_state(
         reconnecting=True
     )
+    runtime._direct_schedule_instruments = {
+        "market-duty": "BTCUSDT-PERP",
+    }
     runtime._market_data_stream_unhealthy_since = None
     runtime._market_data_stream_last_state = "UNKNOWN"
     runtime._runtime_event_sink = lambda event, fields: events.append((event, fields))
 
     runtime._require_market_data_stream_recoverable()
     now[0] += 5.0
-    runtime._framework_data_client = _data_client_with_stream_state()
+    runtime._framework_data_client = _data_client_with_stream_state(
+        streams=["btcusdt@bookTicker", "btcusdt@markPrice@1s"],
+    )
     runtime._require_market_data_stream_recoverable()
 
     assert runtime._market_data_stream_unhealthy_since is None
@@ -795,8 +826,8 @@ def test_demo_product_node_uses_the_accepted_single_topology() -> None:
         "BTCUSDT-PERP.BINANCE",
         "ETHUSDT-PERP.BINANCE",
     }
-    assert provider.load_all is False
-    assert provider.query_commission_rates is True
+    assert provider.load_all is True
+    assert provider.query_commission_rates is False
     assert execution.max_retries is None
     assert execution.use_reduce_only is True
     assert execution.use_position_ids is True
@@ -1970,6 +2001,51 @@ def test_demo_runtime_discovers_ui_created_activation_without_restart() -> None:
     assert warmup_calls == 1
 
 
+def test_live_write_runtime_discovers_ui_created_activation_without_restart() -> None:
+    stop = threading.Event()
+    activation_ids: list[str] = []
+    sync_calls = 0
+
+    class FakeLifecycle:
+        @property
+        def activation_ids(self):
+            return tuple(activation_ids)
+
+    runtime = object.__new__(ProductExecutorRuntime)
+    runtime._settings = SimpleNamespace(
+        release=SimpleNamespace(profile="BINANCE_LIVE_WRITE")
+    )
+    runtime._runtime_real_write_gate = "OPEN"
+    runtime._live_write_risk_control_only = False
+    runtime._lifecycle = FakeLifecycle()
+    runtime._responsibility_processors = {}
+    runtime._direct_schedule_processors = {}
+
+    def sync(_capability: object) -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+        activation_ids.append("activation-created-from-ui")
+        stop.set()
+
+    async def ignore_warmup(*, timeout_seconds: float = 60.0) -> None:
+        del timeout_seconds
+
+    async def exercise() -> None:
+        runtime._loop = asyncio.get_running_loop()
+        runtime._restore_paused_adapters = sync
+        runtime._wait_for_strategy_history_warmup = ignore_warmup
+        await runtime._wait_for_stop_and_sync_activations(
+            stop.wait,
+            object(),
+            interval_seconds=0.001,
+        )
+
+    asyncio.run(exercise())
+
+    assert sync_calls == 1
+    assert activation_ids == ["activation-created-from-ui"]
+
+
 def test_live_runtime_periodically_advances_time_based_responsibilities() -> None:
     stop = threading.Event()
     responsibility_calls: list[str] = []
@@ -1990,21 +2066,30 @@ def test_live_runtime_periodically_advances_time_based_responsibilities() -> Non
     runtime._settings = SimpleNamespace(
         release=SimpleNamespace(profile="BINANCE_LIVE_READ_ONLY")
     )
-    runtime._lifecycle = SimpleNamespace(activation_ids=("activation-live",))
+    runtime._lifecycle = SimpleNamespace(
+        activation_ids=("activation-live",),
+        adapter_for_activation=lambda _activation_id: SimpleNamespace(),
+    )
     runtime._responsibility_processors = {"activation-live": Responsibility()}
     runtime._direct_schedule_processors = {"activation-live": Direct()}
     runtime._runtime_event_sink = lambda *_args: None
     runtime._restore_paused_adapters = lambda _capability: (_ for _ in ()).throw(
-        AssertionError("Live must not discover new activations")
+        AssertionError("Live read-only must not discover new activations")
     )
 
     async def exercise() -> None:
         runtime._loop = asyncio.get_running_loop()
-        await runtime._wait_for_stop_and_sync_activations(
-            stop.wait,
-            object(),
-            interval_seconds=0.001,
-        )
+        try:
+            await asyncio.wait_for(
+                runtime._wait_for_stop_and_sync_activations(
+                    stop.wait,
+                    object(),
+                    interval_seconds=0.001,
+                ),
+                timeout=2,
+            )
+        finally:
+            stop.set()
 
     asyncio.run(exercise())
 
@@ -2115,7 +2200,10 @@ def test_runtime_stops_when_responsibility_sync_has_an_internal_failure() -> Non
 
     runtime = object.__new__(ProductExecutorRuntime)
     runtime._settings = SimpleNamespace(release=SimpleNamespace(profile="BINANCE_DEMO"))
-    runtime._lifecycle = SimpleNamespace(activation_ids=("activation-demo",))
+    runtime._lifecycle = SimpleNamespace(
+        activation_ids=("activation-demo",),
+        adapter_for_activation=lambda _activation_id: SimpleNamespace(),
+    )
     runtime._responsibility_processors = {"activation-demo": FailingProcessor()}
     runtime._runtime_event_sink = lambda event, fields: events.append((event, fields))
     runtime._restore_paused_adapters = lambda _capability: None
@@ -2136,12 +2224,18 @@ def test_runtime_stops_when_responsibility_sync_has_an_internal_failure() -> Non
 
     async def exercise() -> None:
         runtime._loop = asyncio.get_running_loop()
-        with pytest.raises(ExecutorRuntimeError, match="RUNTIME_COMPONENT_FAILURE"):
-            await runtime._wait_for_stop_and_sync_activations(
-                stop.wait,
-                object(),
-                interval_seconds=0.001,
-            )
+        try:
+            with pytest.raises(ExecutorRuntimeError, match="RUNTIME_COMPONENT_FAILURE"):
+                await asyncio.wait_for(
+                    runtime._wait_for_stop_and_sync_activations(
+                        stop.wait,
+                        object(),
+                        interval_seconds=0.001,
+                    ),
+                    timeout=2,
+                )
+        finally:
+            stop.set()
 
     asyncio.run(exercise())
 
@@ -2452,52 +2546,115 @@ def test_demo_runtime_closes_an_expired_empty_activation_before_wiring(
     assert state["closed"] is True
 
 
-def test_live_runtime_rejects_an_activation_outside_the_authorized_set(
-    monkeypatch,
-) -> None:
-    activation = SimpleNamespace(
-        activation_id="activation-live-unauthorized",
-        lifecycle=PlanLifecycle.RUNNING,
-        entry_opportunity_consumed=False,
-        rule_state={"deadlines": {"entry_valid_until": "2026-07-19T00:00:00+00:00"}},
-    )
-
-    class FakePlanning:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        @staticmethod
-        def list_open_activations():
-            return (activation,)
-
-    monkeypatch.setattr(
-        runtime_module,
-        "PostgreSQLPlanningRepository",
-        FakePlanning,
-    )
+def test_live_runtime_authorizes_a_discovered_activation_with_the_current_gate() -> None:
+    authorized: list[str] = []
     runtime = object.__new__(ProductExecutorRuntime)
-    runtime._connection = object()
-    runtime._lifecycle = SimpleNamespace(activation_ids=())
     runtime._settings = SimpleNamespace(
-        release=SimpleNamespace(
-            profile="BINANCE_LIVE_WRITE",
-            environment_id="live-main",
-        )
+        release=SimpleNamespace(profile="BINANCE_LIVE_WRITE")
     )
+    runtime._runtime_real_write_gate = "OPEN"
+    runtime._live_write_risk_control_only = False
     runtime._live_write_activation_ids = frozenset({"activation-live-authorized"})
     runtime._coordinator = SimpleNamespace(
-        expire_empty_entry_window=lambda **_values: pytest.fail(
-            "unauthorized activation must not reach lifecycle mutation"
+        authorize_live_write_activation=lambda activation_id: authorized.append(
+            activation_id
         )
     )
-    runtime._proposal_processors = {}
-    runtime._responsibility_processors = {}
+    events: list[tuple[str, dict[str, object]]] = []
+    runtime._runtime_event_sink = lambda event, fields: events.append((event, fields))
+
+    runtime._authorize_discovered_live_write_activations(
+        [SimpleNamespace(activation_id="activation-live-new")]
+    )
+
+    assert authorized == ["activation-live-new"]
+    assert runtime._live_write_activation_ids == frozenset(
+        {"activation-live-authorized", "activation-live-new"}
+    )
+    assert events == [
+        (
+            "live_write_activation_discovered",
+            {"activation_id": "activation-live-new"},
+        )
+    ]
+
+
+def test_live_runtime_can_authorize_the_first_activation_after_idle_startup() -> None:
+    authorized: list[str] = []
+    runtime = object.__new__(ProductExecutorRuntime)
+    runtime._settings = SimpleNamespace(
+        release=SimpleNamespace(profile="BINANCE_LIVE_WRITE")
+    )
+    runtime._runtime_real_write_gate = "OPEN"
+    runtime._live_write_risk_control_only = False
+    runtime._live_write_activation_ids = frozenset()
+    runtime._coordinator = SimpleNamespace(
+        authorize_live_write_activation=lambda activation_id: authorized.append(
+            activation_id
+        )
+    )
+    runtime._runtime_event_sink = lambda _event, _fields: None
+
+    runtime._authorize_discovered_live_write_activations(
+        [SimpleNamespace(activation_id="activation-live-first")]
+    )
+
+    assert authorized == ["activation-live-first"]
+    assert runtime._live_write_activation_ids == frozenset(
+        {"activation-live-first"}
+    )
+
+
+def test_live_runtime_rejects_a_discovered_activation_when_the_gate_rejects() -> None:
+    runtime = object.__new__(ProductExecutorRuntime)
+    runtime._settings = SimpleNamespace(
+        release=SimpleNamespace(profile="BINANCE_LIVE_WRITE")
+    )
+    runtime._runtime_real_write_gate = "OPEN"
+    runtime._live_write_risk_control_only = False
+    runtime._live_write_activation_ids = frozenset({"activation-live-authorized"})
+    runtime._coordinator = SimpleNamespace(
+        authorize_live_write_activation=lambda _activation_id: (_ for _ in ()).throw(
+            RuntimeError("RUNTIME_REAL_WRITE_GATE_CLOSED")
+        )
+    )
 
     with pytest.raises(
         ExecutorRuntimeError,
-        match="LIVE_WRITE_ACTIVATION_SET_MISMATCH",
+        match="LIVE_WRITE_ACTIVATION_SCOPE_MISMATCH",
     ):
-        runtime._restore_paused_adapters(object())
+        runtime._authorize_discovered_live_write_activations(
+            [SimpleNamespace(activation_id="activation-live-unauthorized")]
+        )
+
+    assert runtime._live_write_activation_ids == frozenset(
+        {"activation-live-authorized"}
+    )
+
+
+def test_live_risk_control_runtime_does_not_admit_a_new_activation() -> None:
+    runtime = object.__new__(ProductExecutorRuntime)
+    runtime._settings = SimpleNamespace(
+        release=SimpleNamespace(profile="BINANCE_LIVE_WRITE")
+    )
+    runtime._runtime_real_write_gate = "CLOSED"
+    runtime._live_write_risk_control_only = True
+    runtime._live_write_activation_ids = frozenset({"activation-live-recovery"})
+
+    runtime._authorize_discovered_live_write_activations(
+        [SimpleNamespace(activation_id="activation-live-recovery")]
+    )
+
+    with pytest.raises(
+        ExecutorRuntimeError,
+        match="LIVE_WRITE_ACTIVATION_SCOPE_MISMATCH",
+    ):
+        runtime._authorize_discovered_live_write_activations(
+            [
+                SimpleNamespace(activation_id="activation-live-recovery"),
+                SimpleNamespace(activation_id="activation-live-new"),
+            ]
+        )
 
 
 def test_runtime_keeps_user_takeover_identity_for_read_only_reconciliation(
@@ -3075,85 +3232,57 @@ def test_direct_activation_uses_execution_adapter_without_strategy_basis(
         loop.close()
 
 
-def test_market_fact_streams_keep_quotes_warm_and_resume_only_matching_direct() -> (
-    None
-):
+def test_closed_bar_fact_stream_is_released_after_its_last_direct_duty() -> None:
     class FakeLifecycle:
         def __init__(self) -> None:
-            self.adapters = {}
+            self.adapters = {
+                "closed-bar-facts:BTCUSDT-PERP": object(),
+                "closed-bar-facts:ETHUSDT-PERP": object(),
+            }
+            self.removed: list[str] = []
 
-        def start(self, spec):
-            adapter = spec.factory()
-            self.adapters[spec.activation_id] = adapter
-            return adapter
+        @property
+        def activation_ids(self):
+            return tuple(self.adapters)
 
-    resumes: list[tuple[str, str]] = []
-
-    class FakeDirect:
-        def __init__(self, label: str) -> None:
-            self.label = label
-
-        def resume(self, activation_id: str) -> None:
-            resumes.append((self.label, activation_id))
+        def stop_and_remove(self, activation_id: str) -> None:
+            self.removed.append(activation_id)
+            self.adapters.pop(activation_id)
 
     runtime = object.__new__(ProductExecutorRuntime)
-    runtime._settings = SimpleNamespace(
-        release=SimpleNamespace(profile="BINANCE_DEMO")
-    )
     runtime._market_fact_lifecycle = FakeLifecycle()
-    runtime._market_fact_trackers = {}
-    runtime._direct_schedule_processors = {
-        "btc-activation": FakeDirect("btc"),
-        "eth-activation": FakeDirect("eth"),
+    runtime._market_fact_trackers = {
+        "BTCUSDT-PERP": object(),
+        "ETHUSDT-PERP": object(),
+    }
+    runtime._market_mark_event_at = {
+        _binance_mark_price_stream_name("BTCUSDT-PERP"): 1.0,
+        _binance_mark_price_stream_name("ETHUSDT-PERP"): 1.0,
     }
     runtime._direct_schedule_instruments = {
         "btc-activation": "BTCUSDT-PERP",
-        "eth-activation": "ETHUSDT-PERP",
     }
+    events: list[tuple[str, dict[str, object]]] = []
+    runtime._runtime_event_sink = lambda event, fields: events.append((event, fields))
 
-    runtime._start_market_fact_streams()
+    runtime._release_unused_closed_bar_fact_streams()
 
-    assert tuple(runtime._market_fact_lifecycle.adapters) == (
-        "market-facts:BTCUSDT-PERP",
-        "market-facts:ETHUSDT-PERP",
-    )
-    observed_at = datetime(2026, 7, 23, 7, 0, 1, tzinfo=UTC)
-    observed_at_ns = int(observed_at.timestamp() * 1_000_000_000)
-    btc_adapter = runtime._market_fact_lifecycle.adapters[
-        "market-facts:BTCUSDT-PERP"
+    assert runtime._market_fact_lifecycle.removed == [
+        "closed-bar-facts:ETHUSDT-PERP",
     ]
-    btc_adapter._quote_event_sink(
-        SimpleNamespace(
-            instrument_id="BTCUSDT-PERP.BINANCE",
-            bid_price="98",
-            ask_price="102",
-            ts_event=observed_at_ns,
-            ts_init=observed_at_ns,
-        )
+    assert tuple(runtime._market_fact_lifecycle.adapters) == (
+        "closed-bar-facts:BTCUSDT-PERP",
     )
-    btc_adapter._mark_price_event_sink(
-        SimpleNamespace(
-            instrument_id="BTCUSDT-PERP.BINANCE",
-            value="100",
-            ts_event=observed_at_ns,
-            ts_init=observed_at_ns,
-        )
+    assert tuple(runtime._market_fact_trackers) == ("BTCUSDT-PERP",)
+    assert tuple(runtime._market_mark_event_at) == (
+        _binance_mark_price_stream_name("BTCUSDT-PERP"),
     )
-
-    facts = runtime._market_fact_trackers[
-        "BTCUSDT-PERP"
-    ].direct_condition_facts(
-        "BTCUSDT-PERP.BINANCE",
-        cutoff_ns=observed_at_ns,
-        observed_at=observed_at,
-        activated_at=observed_at,
-        price_move_bps_by_window={},
-        market_source="BINANCE_DEMO_PUBLIC",
-    )
-    assert facts.bid_price == "98"
-    assert facts.ask_price == "102"
-    assert facts.mark_price == "100"
-    assert resumes == [("btc", "btc-activation")]
+    assert events == [
+        (
+            "direct_condition_bar_stream_released",
+            {"instrument_ref": "ETHUSDT-PERP"},
+        ),
+    ]
 
 
 def test_closed_bar_fact_stream_is_shared_warmed_and_resumes_matching_direct() -> (

@@ -112,6 +112,12 @@ ACCOUNT_OBSERVATION_FAILURE_MIGRATION = (
     / "versions"
     / "20260815_0015_account_observation_failures.py"
 )
+SCALP_CYCLE_MIGRATION = (
+    ROOT
+    / "migrations"
+    / "versions"
+    / "20260816_0016_scalp_cycles.py"
+)
 
 
 def _revision_module():
@@ -135,7 +141,8 @@ def test_migration_history_is_one_unambiguous_fresh_root() -> None:
         (item.revision, item.down_revision)
         for item in script.walk_revisions()
     ] == [
-        (HEAD_REVISION, "20260813_0014"),
+        (HEAD_REVISION, "20260815_0015"),
+        ("20260815_0015", "20260813_0014"),
         ("20260813_0014", "20260813_0013"),
         ("20260813_0013", "20260803_0012"),
         ("20260803_0012", "20260802_0011"),
@@ -173,6 +180,7 @@ def test_migration_history_is_one_unambiguous_fresh_root() -> None:
             PLAN_AI_REVIEW_MIGRATION.name,
             PLAN_AI_REVIEW_CONFIGURATION_MIGRATION.name,
             ACCOUNT_OBSERVATION_FAILURE_MIGRATION.name,
+            SCALP_CYCLE_MIGRATION.name,
         ]
     )
 

@@ -64,6 +64,27 @@ class VenueAccountFacts:
     server_time_ms: int
 
 
+def require_live_venue_symbols(
+    facts: VenueAccountFacts,
+    required_symbols: tuple[str, ...],
+) -> VenueAccountFacts:
+    """Validate an activation's symbols against already-cached account facts."""
+
+    normalized_symbols = tuple(sorted(set(required_symbols)))
+    if not normalized_symbols or any(
+        not symbol or symbol != symbol.upper() for symbol in normalized_symbols
+    ):
+        raise VenueAccountQualificationError(
+            "VENUE_ACCOUNT_REQUIRED_SYMBOLS_INVALID"
+        )
+    if facts.venue_account_type is VenueAccountType.USDM_COPY_LEAD:
+        if set(normalized_symbols) - set(facts.lead_symbols):
+            raise VenueAccountQualificationError(
+                "VENUE_ACCOUNT_COPY_LEAD_SYMBOL_NOT_ALLOWED"
+            )
+    return facts
+
+
 @dataclass(frozen=True)
 class _HttpResponse:
     status_code: int
@@ -262,7 +283,7 @@ def qualify_live_venue_account(
     }:
         raise VenueAccountQualificationError("VENUE_ACCOUNT_LIVE_TYPE_REQUIRED")
     normalized_symbols = tuple(sorted(set(required_symbols)))
-    if not normalized_symbols or any(
+    if any(
         not symbol or symbol != symbol.upper() for symbol in normalized_symbols
     ):
         raise VenueAccountQualificationError("VENUE_ACCOUNT_REQUIRED_SYMBOLS_INVALID")

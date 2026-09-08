@@ -37,7 +37,6 @@ from halpha.executor.runtime import (
     ExecutorRuntimeError,
     ProductExecutorRuntime,
     _connect_product_database,
-    product_profile_symbols,
     query_execution_hedge_mode,
 )
 from halpha.live_write_gate import (
@@ -58,6 +57,7 @@ from halpha.source_identity import (
 from halpha.venue_account_qualification import (
     LiveVenueAccountQualifier,
     VenueAccountQualificationError,
+    require_live_venue_symbols,
 )
 from halpha.winvault import SecretResolutionError, executor_secret_resolver
 from halpha.windows_filesystem import (
@@ -403,6 +403,34 @@ def main(argv: Sequence[str] | None = None) -> int:
                             current_status,
                             api_key,
                         )
+                        if activation_id not in current_status.authorized_activation_ids:
+                            raise LiveWriteGateError(
+                                "LIVE_WRITE_ACTIVATION_SCOPE_MISMATCH"
+                            )
+                        activation_row = current_connection.execute(
+                            """
+                            SELECT instrument_ref
+                            FROM halpha.plan_activation
+                            WHERE environment_id = %s
+                              AND activation_id = %s
+                              AND account_ref = %s
+                            """,
+                            (
+                                settings.release.environment_id,
+                                activation_id,
+                                settings.release.account_id,
+                            ),
+                        ).fetchone()
+                        if activation_row is None:
+                            raise LiveWriteGateError(
+                                "LIVE_WRITE_ACTIVATION_SCOPE_MISMATCH"
+                            )
+                        instrument_ref = str(activation_row[0])
+                        symbol = instrument_ref.removesuffix("-PERP")
+                        if not symbol or symbol == instrument_ref:
+                            raise LiveWriteGateError(
+                                "LIVE_WRITE_ACTIVATION_INSTRUMENT_INVALID"
+                            )
                         if live_venue_account_qualifier is None:
                             raise VenueAccountQualificationError(
                                 "VENUE_ACCOUNT_QUALIFICATION_UNAVAILABLE"
@@ -411,13 +439,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                         # event loop.  The final write boundary only validates
                         # the bounded cached evidence and therefore cannot
                         # stall order-event processing on SAPI latency.
-                        live_venue_account_qualifier.require_cached_current()
+                        current_account_facts = (
+                            live_venue_account_qualifier.require_cached_current()
+                        )
+                        require_live_venue_symbols(
+                            current_account_facts,
+                            (symbol,),
+                        )
                     finally:
                         current_connection.close()
-                    if activation_id not in current_status.authorized_activation_ids:
-                        raise LiveWriteGateError(
-                            "LIVE_WRITE_ACTIVATION_SCOPE_MISMATCH"
-                        )
             if read_only and not private_account_observation:
                 api_key = None
                 api_secret = None
@@ -455,9 +485,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     settings.release.venue_account_type,
                     api_key=api_key,
                     api_secret=api_secret,
-                    required_symbols=product_profile_symbols(
-                        settings.release.profile
-                    ),
+                    # Startup proves the account type and caches the complete
+                    # lead-symbol set. Each activation checks its exact symbol
+                    # at discovery and again at final submission.
+                    required_symbols=(),
                     proxy_url=proxy_url,
                 )
                 live_venue_account_qualifier.require_current()

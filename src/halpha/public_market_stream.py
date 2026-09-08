@@ -14,8 +14,10 @@ from nautilus_trader.adapters.binance.common.enums import (
     BinanceEnvironment,
 )
 from nautilus_trader.adapters.binance.common.schemas.market import (
+    BinanceAggregatedTradeMsg,
     BinanceCandlestickMsg,
     BinanceDataMsgWrapper,
+    BinanceOrderBookMsg,
     BinanceQuoteMsg,
 )
 from nautilus_trader.adapters.binance.common.urls import (
@@ -30,6 +32,11 @@ from nautilus_trader.common.component import LiveClock
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from halpha.domain_values import canonical_decimal
+from halpha.public_instrument_rules import (
+    InstrumentRulesUnavailable,
+    perpetual_instrument_for_symbol,
+    symbol_for_perpetual_instrument,
+)
 from halpha.public_market import (
     MARKET_INTERVAL_MILLISECONDS,
     MARKET_INTERVALS,
@@ -40,9 +47,17 @@ from halpha.public_market import (
 )
 
 
-_INSTRUMENT_SYMBOLS = {"BTCUSDT-PERP": "BTCUSDT"}
 _QUEUE_CAPACITY = 256
 _DEFAULT_CLOSE_TIMEOUT_SECONDS = 5.0
+_ORDER_BOOK_DEPTH_LEVELS = 10
+_ORDER_BOOK_SPEED_MILLISECONDS = 100
+
+
+def _positive_finite_decimal(value: str) -> Decimal:
+    decimal = Decimal(value)
+    if not decimal.is_finite() or decimal <= 0:
+        raise ValueError("MARKET_STREAM_DECIMAL_INVALID")
+    return decimal
 
 
 class MarketStreamStatus(BaseModel):
@@ -114,8 +129,85 @@ class MarketStreamFunding(BaseModel):
         return self
 
 
+class MarketStreamBookLevel(BaseModel):
+    """One current venue depth level used only for the bounded DOM view."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    price: str
+    quantity: str
+
+    @model_validator(mode="after")
+    def values_are_positive(self) -> MarketStreamBookLevel:
+        _positive_finite_decimal(self.price)
+        _positive_finite_decimal(self.quantity)
+        return self
+
+
+class MarketStreamDepth(BaseModel):
+    """Top-of-book snapshot; it deliberately is not a persisted order book."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    type: Literal["depth"] = "depth"
+    instrument_ref: str
+    source: str
+    source_cutoff: datetime
+    received_at: datetime
+    update_id: int
+    bids: tuple[MarketStreamBookLevel, ...]
+    asks: tuple[MarketStreamBookLevel, ...]
+
+    @model_validator(mode="after")
+    def depth_is_ordered_and_not_crossed(self) -> MarketStreamDepth:
+        if self.update_id <= 0:
+            raise ValueError("MARKET_STREAM_DEPTH_UPDATE_INVALID")
+        if not (1 <= len(self.bids) <= _ORDER_BOOK_DEPTH_LEVELS):
+            raise ValueError("MARKET_STREAM_DEPTH_BIDS_INVALID")
+        if not (1 <= len(self.asks) <= _ORDER_BOOK_DEPTH_LEVELS):
+            raise ValueError("MARKET_STREAM_DEPTH_ASKS_INVALID")
+        bid_prices = tuple(_positive_finite_decimal(level.price) for level in self.bids)
+        ask_prices = tuple(_positive_finite_decimal(level.price) for level in self.asks)
+        if any(left <= right for left, right in zip(bid_prices, bid_prices[1:])):
+            raise ValueError("MARKET_STREAM_DEPTH_BIDS_UNORDERED")
+        if any(left >= right for left, right in zip(ask_prices, ask_prices[1:])):
+            raise ValueError("MARKET_STREAM_DEPTH_ASKS_UNORDERED")
+        if bid_prices[0] >= ask_prices[0]:
+            raise ValueError("MARKET_STREAM_DEPTH_CROSSED")
+        return self
+
+
+class MarketStreamTrade(BaseModel):
+    """One public aggregate print, bounded by the browser tape buffer."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    type: Literal["trade"] = "trade"
+    instrument_ref: str
+    source: str
+    source_cutoff: datetime
+    received_at: datetime
+    trade_id: str
+    price: str
+    quantity: str
+    aggressor_side: Literal["BUYER", "SELLER"]
+
+    @model_validator(mode="after")
+    def trade_values_are_valid(self) -> MarketStreamTrade:
+        if not self.trade_id.strip():
+            raise ValueError("MARKET_STREAM_TRADE_ID_INVALID")
+        _positive_finite_decimal(self.price)
+        _positive_finite_decimal(self.quantity)
+        return self
+
+
 MarketStreamEvent: TypeAlias = (
-    MarketStreamStatus | MarketStreamQuote | MarketStreamBar | MarketStreamFunding
+    MarketStreamStatus
+    | MarketStreamQuote
+    | MarketStreamBar
+    | MarketStreamFunding
+    | MarketStreamDepth
+    | MarketStreamTrade
 )
 
 
@@ -128,9 +220,37 @@ class PublicMarketStreamProvider(Protocol):
 class BinanceWebSocketPort(Protocol):
     async def subscribe_book_ticker(self, symbol: str | None = None) -> None: ...
 
+    async def unsubscribe_book_ticker(self, symbol: str | None = None) -> None: ...
+
+    async def subscribe_partial_book_depth(
+        self,
+        symbol: str,
+        depth: int,
+        speed: int,
+    ) -> None: ...
+
+    async def unsubscribe_partial_book_depth(
+        self,
+        symbol: str,
+        depth: int,
+        speed: int,
+    ) -> None: ...
+
+    async def subscribe_agg_trades(self, symbol: str) -> None: ...
+
+    async def unsubscribe_agg_trades(self, symbol: str) -> None: ...
+
     async def subscribe_bars(self, symbol: str, interval: str) -> None: ...
 
+    async def unsubscribe_bars(self, symbol: str, interval: str) -> None: ...
+
     async def subscribe_mark_price(
+        self,
+        symbol: str | None = None,
+        speed: int | None = None,
+    ) -> None: ...
+
+    async def unsubscribe_mark_price(
         self,
         symbol: str | None = None,
         speed: int | None = None,
@@ -180,7 +300,8 @@ class BinancePublicMarketStream:
             "market": False,
             "public": False,
         }
-        self._subscribers: set[asyncio.Queue[MarketStreamEvent]] = set()
+        self._subscribers: dict[asyncio.Queue[MarketStreamEvent], str] = {}
+        self._subscribed_symbols: set[str] = set()
         self._overflowed_subscribers: set[
             asyncio.Queue[MarketStreamEvent]
         ] = set()
@@ -195,6 +316,8 @@ class BinancePublicMarketStream:
         )
         self._wrapper_decoder = msgspec.json.Decoder(BinanceDataMsgWrapper)
         self._quote_decoder = msgspec.json.Decoder(BinanceQuoteMsg)
+        self._depth_decoder = msgspec.json.Decoder(BinanceOrderBookMsg)
+        self._trade_decoder = msgspec.json.Decoder(BinanceAggregatedTradeMsg)
         self._candlestick_decoder = msgspec.json.Decoder(BinanceCandlestickMsg)
         self._mark_price_decoder = msgspec.json.Decoder(BinanceFuturesMarkPriceMsg)
 
@@ -202,14 +325,16 @@ class BinancePublicMarketStream:
         self,
         instrument_ref: str,
     ) -> AsyncIterator[MarketStreamEvent]:
-        if instrument_ref not in _INSTRUMENT_SYMBOLS:
+        try:
+            symbol = symbol_for_perpetual_instrument(instrument_ref)
+        except InstrumentRulesUnavailable:
             raise MarketContextUnavailable("MARKET_CONTEXT_INSTRUMENT_UNSUPPORTED")
         queue: asyncio.Queue[MarketStreamEvent] = asyncio.Queue(
             maxsize=_QUEUE_CAPACITY,
         )
-        self._subscribers.add(queue)
+        self._subscribers[queue] = instrument_ref
         try:
-            await self._ensure_started()
+            await self._ensure_started(symbol)
             if queue.empty():
                 self._put(queue, self._status)
             while True:
@@ -232,8 +357,10 @@ class BinancePublicMarketStream:
                     continue
                 yield event
         finally:
-            self._subscribers.discard(queue)
+            self._subscribers.pop(queue, None)
             self._overflowed_subscribers.discard(queue)
+            if instrument_ref not in self._subscribers.values():
+                await self._unsubscribe_symbol(symbol)
 
     async def close(self) -> None:
         self._closed = True
@@ -242,6 +369,7 @@ class BinancePublicMarketStream:
                 async with self._start_lock:
                     clients = tuple(self._clients.values())
                     self._clients.clear()
+                    self._subscribed_symbols.clear()
                     self._route_live = {"market": False, "public": False}
                     self._loop = None
                 if clients:
@@ -256,46 +384,106 @@ class BinancePublicMarketStream:
             # boundary lets the process finish even when a venue/proxy close
             # handshake never returns.
             self._clients.clear()
+            self._subscribed_symbols.clear()
             self._route_live = {"market": False, "public": False}
             self._loop = None
 
-    async def _ensure_started(self) -> None:
+    async def _ensure_started(self, symbol: str) -> None:
         if self._closed:
             raise MarketContextUnavailable("MARKET_STREAM_CLOSED")
-        if self._clients:
+        if self._clients and symbol in self._subscribed_symbols:
             return
         async with self._start_lock:
             if self._closed:
                 raise MarketContextUnavailable("MARKET_STREAM_CLOSED")
-            if self._clients:
+            if self._clients and symbol in self._subscribed_symbols:
                 return
             self._loop = asyncio.get_running_loop()
             self._set_status("CONNECTING")
-            clients: dict[StreamRoute, BinanceWebSocketPort] = {}
+            clients: dict[StreamRoute, BinanceWebSocketPort] = dict(self._clients)
             try:
-                clients["public"] = self._make_client("public")
-                clients["market"] = self._make_client("market")
-                self._clients = clients
-                await clients["public"].subscribe_book_ticker("BTCUSDT")
+                if not clients:
+                    clients["public"] = self._make_client("public")
+                    clients["market"] = self._make_client("market")
+                    self._clients = clients
+                await clients["public"].subscribe_book_ticker(symbol)
+                await clients["public"].subscribe_partial_book_depth(
+                    symbol,
+                    _ORDER_BOOK_DEPTH_LEVELS,
+                    _ORDER_BOOK_SPEED_MILLISECONDS,
+                )
                 self._route_live["public"] = True
                 for interval in MARKET_INTERVALS:
-                    await clients["market"].subscribe_bars("BTCUSDT", interval)
-                await clients["market"].subscribe_mark_price("BTCUSDT", speed=1000)
+                    await clients["market"].subscribe_bars(symbol, interval)
+                await clients["market"].subscribe_mark_price(symbol, speed=1000)
+                await clients["market"].subscribe_agg_trades(symbol)
                 self._route_live["market"] = True
+                self._subscribed_symbols.add(symbol)
                 self._set_status("LIVE")
             except Exception as exc:
                 self._set_status(
                     "FAILED",
                     f"MARKET_STREAM_CONNECT_FAILED_{type(exc).__name__.upper()}",
                 )
-                self._clients.clear()
-                await asyncio.gather(
-                    *(client.disconnect() for client in clients.values()),
-                    return_exceptions=True,
-                )
+                if not self._subscribed_symbols:
+                    self._clients.clear()
+                    await asyncio.gather(
+                        *(client.disconnect() for client in clients.values()),
+                        return_exceptions=True,
+                    )
                 raise MarketContextUnavailable(
                     f"MARKET_STREAM_CONNECT_FAILED_{type(exc).__name__.upper()}"
                 ) from None
+
+    async def _unsubscribe_symbol(self, symbol: str) -> None:
+        """Release streams no longer used by any workbench consumer."""
+
+        async with self._start_lock:
+            if (
+                symbol not in self._subscribed_symbols
+                or perpetual_instrument_for_symbol(symbol)
+                in self._subscribers.values()
+            ):
+                return
+            public_client = self._clients.get("public")
+            market_client = self._clients.get("market")
+            if public_client is None or market_client is None:
+                return
+            # Any successful unsubscription makes the old complete-feed marker
+            # invalid. A later consumer must subscribe every feed again, even
+            # when a subsequent unsubscribe fails or times out.
+            self._subscribed_symbols.discard(symbol)
+            try:
+                async with asyncio.timeout(self._close_timeout_seconds):
+                    await public_client.unsubscribe_book_ticker(symbol)
+                    await public_client.unsubscribe_partial_book_depth(
+                        symbol,
+                        _ORDER_BOOK_DEPTH_LEVELS,
+                        _ORDER_BOOK_SPEED_MILLISECONDS,
+                    )
+                    for interval in MARKET_INTERVALS:
+                        await market_client.unsubscribe_bars(symbol, interval)
+                    await market_client.unsubscribe_mark_price(symbol, speed=1000)
+                    await market_client.unsubscribe_agg_trades(symbol)
+            except Exception:
+                pass
+            finally:
+                if not self._subscribed_symbols:
+                    # With no remaining consumer, discard the entire pair even
+                    # after partial cleanup. Bound a stalled venue handshake so
+                    # the next subscriber can acquire the startup lock.
+                    clients = tuple(self._clients.values())
+                    self._clients.clear()
+                    self._route_live = {"market": False, "public": False}
+                    self._loop = None
+                    try:
+                        async with asyncio.timeout(self._close_timeout_seconds):
+                            await asyncio.gather(
+                                *(client.disconnect() for client in clients),
+                                return_exceptions=True,
+                            )
+                    except TimeoutError:
+                        pass
 
     def _make_client(self, route: StreamRoute) -> BinanceWebSocketPort:
         async def reconnected() -> None:
@@ -362,10 +550,14 @@ class BinancePublicMarketStream:
                 return
             if route == "public" and "@bookTicker" in stream:
                 event = self._quote_event(self._quote_decoder.decode(raw))
+            elif route == "public" and "@depth" in stream:
+                event = self._depth_event(self._depth_decoder.decode(raw))
             elif route == "market" and "@kline_" in stream:
                 event = self._bar_event(self._candlestick_decoder.decode(raw))
             elif route == "market" and "@markPrice" in stream:
                 event = self._funding_event(self._mark_price_decoder.decode(raw))
+            elif route == "market" and "@aggTrade" in stream:
+                event = self._trade_event(self._trade_decoder.decode(raw))
             else:
                 return
         except (InvalidOperation, TypeError, ValueError, msgspec.DecodeError):
@@ -377,14 +569,14 @@ class BinancePublicMarketStream:
 
     def _quote_event(self, message: BinanceQuoteMsg) -> MarketStreamQuote:
         data = message.data
-        if data.s != "BTCUSDT" or data.T is None or data.T <= 0:
+        if data.s not in self._subscribed_symbols or data.T is None or data.T <= 0:
             raise ValueError("MARKET_STREAM_QUOTE_INVALID")
         bid = Decimal(data.b)
         ask = Decimal(data.a)
         if bid <= 0 or ask <= 0 or ask < bid:
             raise ValueError("MARKET_STREAM_QUOTE_INVALID")
         return MarketStreamQuote(
-            instrument_ref="BTCUSDT-PERP",
+            instrument_ref=perpetual_instrument_for_symbol(data.s),
             source=self._route_sources["public"],
             source_cutoff=datetime.fromtimestamp(data.T / 1000, tz=UTC),
             received_at=datetime.now(UTC),
@@ -398,8 +590,8 @@ class BinancePublicMarketStream:
         candle = data.k
         interval = candle.i.value
         if (
-            data.s != "BTCUSDT"
-            or candle.s != "BTCUSDT"
+            data.s not in self._subscribed_symbols
+            or candle.s != data.s
             or interval not in MARKET_INTERVALS
             or data.E <= 0
             or candle.t <= 0
@@ -420,7 +612,7 @@ class BinancePublicMarketStream:
         ):
             raise ValueError("MARKET_STREAM_BAR_INVALID")
         return MarketStreamBar(
-            instrument_ref="BTCUSDT-PERP",
+            instrument_ref=perpetual_instrument_for_symbol(data.s),
             interval=interval,
             source=self._route_sources["market"],
             source_cutoff=datetime.fromtimestamp(data.E / 1000, tz=UTC),
@@ -437,12 +629,46 @@ class BinancePublicMarketStream:
             ),
         )
 
+    def _depth_event(self, message: BinanceOrderBookMsg) -> MarketStreamDepth:
+        data = message.data
+        source_time = data.T if data.T is not None and data.T > 0 else data.E
+        if (
+            data.s not in self._subscribed_symbols
+            or data.E <= 0
+            or source_time <= 0
+            or data.u <= 0
+        ):
+            raise ValueError("MARKET_STREAM_DEPTH_INVALID")
+        bids = tuple(
+            MarketStreamBookLevel(
+                price=canonical_decimal(_positive_finite_decimal(level.price)),
+                quantity=canonical_decimal(_positive_finite_decimal(level.size)),
+            )
+            for level in data.b
+        )
+        asks = tuple(
+            MarketStreamBookLevel(
+                price=canonical_decimal(_positive_finite_decimal(level.price)),
+                quantity=canonical_decimal(_positive_finite_decimal(level.size)),
+            )
+            for level in data.a
+        )
+        return MarketStreamDepth(
+            instrument_ref=perpetual_instrument_for_symbol(data.s),
+            source=self._route_sources["public"],
+            source_cutoff=datetime.fromtimestamp(source_time / 1000, tz=UTC),
+            received_at=datetime.now(UTC),
+            update_id=data.u,
+            bids=bids,
+            asks=asks,
+        )
+
     def _funding_event(
         self,
         message: BinanceFuturesMarkPriceMsg,
     ) -> MarketStreamFunding:
         data = message.data
-        if data.s != "BTCUSDT" or data.E <= 0 or data.T <= 0:
+        if data.s not in self._subscribed_symbols or data.E <= 0 or data.T <= 0:
             raise ValueError("MARKET_STREAM_FUNDING_INVALID")
         mark_price = Decimal(data.p)
         index_price = Decimal(data.i)
@@ -457,7 +683,7 @@ class BinancePublicMarketStream:
         ):
             raise ValueError("MARKET_STREAM_FUNDING_INVALID")
         return MarketStreamFunding(
-            instrument_ref="BTCUSDT-PERP",
+            instrument_ref=perpetual_instrument_for_symbol(data.s),
             source=self._route_sources["market"],
             source_cutoff=datetime.fromtimestamp(data.E / 1000, tz=UTC),
             received_at=datetime.now(UTC),
@@ -465,6 +691,28 @@ class BinancePublicMarketStream:
             index_price=canonical_decimal(index_price),
             funding_rate=canonical_decimal(funding_rate),
             next_funding_at=datetime.fromtimestamp(data.T / 1000, tz=UTC),
+        )
+
+    def _trade_event(self, message: BinanceAggregatedTradeMsg) -> MarketStreamTrade:
+        data = message.data
+        if (
+            data.s not in self._subscribed_symbols
+            or data.E <= 0
+            or data.T <= 0
+            or data.a <= 0
+        ):
+            raise ValueError("MARKET_STREAM_TRADE_INVALID")
+        price = _positive_finite_decimal(data.p)
+        quantity = _positive_finite_decimal(data.q)
+        return MarketStreamTrade(
+            instrument_ref=perpetual_instrument_for_symbol(data.s),
+            source=self._route_sources["market"],
+            source_cutoff=datetime.fromtimestamp(data.T / 1000, tz=UTC),
+            received_at=datetime.now(UTC),
+            trade_id=str(data.a),
+            price=canonical_decimal(price),
+            quantity=canonical_decimal(quantity),
+            aggressor_side="SELLER" if data.m else "BUYER",
         )
 
     def _set_status(
@@ -481,8 +729,10 @@ class BinancePublicMarketStream:
         self._publish(self._status)
 
     def _publish(self, event: MarketStreamEvent) -> None:
-        for queue in tuple(self._subscribers):
-            self._put(queue, event)
+        event_instrument = getattr(event, "instrument_ref", None)
+        for queue, instrument_ref in tuple(self._subscribers.items()):
+            if event_instrument is None or event_instrument == instrument_ref:
+                self._put(queue, event)
 
     def _put(
         self,

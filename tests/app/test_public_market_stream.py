@@ -12,10 +12,13 @@ from halpha.public_market import MarketBar, MarketContextUnavailable
 from halpha.public_market_stream import (
     BinancePublicMarketStream,
     MarketStreamBar,
+    MarketStreamBookLevel,
+    MarketStreamDepth,
     MarketStreamEvent,
     MarketStreamFunding,
     MarketStreamQuote,
     MarketStreamStatus,
+    MarketStreamTrade,
 )
 
 
@@ -28,15 +31,50 @@ class FakeWebSocketClient:
         self.handler = handler
         self.reconnect = reconnect
         self.book_tickers: list[str | None] = []
+        self.unsubscribed_book_tickers: list[str | None] = []
+        self.partial_depths: list[tuple[str, int, int]] = []
+        self.unsubscribed_partial_depths: list[tuple[str, int, int]] = []
+        self.agg_trades: list[str] = []
+        self.unsubscribed_agg_trades: list[str] = []
         self.bars: list[tuple[str, str]] = []
+        self.unsubscribed_bars: list[tuple[str, str]] = []
         self.mark_prices: list[tuple[str | None, int | None]] = []
+        self.unsubscribed_mark_prices: list[tuple[str | None, int | None]] = []
         self.disconnected = False
 
     async def subscribe_book_ticker(self, symbol: str | None = None) -> None:
         self.book_tickers.append(symbol)
 
+    async def unsubscribe_book_ticker(self, symbol: str | None = None) -> None:
+        self.unsubscribed_book_tickers.append(symbol)
+
+    async def subscribe_partial_book_depth(
+        self,
+        symbol: str,
+        depth: int,
+        speed: int,
+    ) -> None:
+        self.partial_depths.append((symbol, depth, speed))
+
+    async def unsubscribe_partial_book_depth(
+        self,
+        symbol: str,
+        depth: int,
+        speed: int,
+    ) -> None:
+        self.unsubscribed_partial_depths.append((symbol, depth, speed))
+
+    async def subscribe_agg_trades(self, symbol: str) -> None:
+        self.agg_trades.append(symbol)
+
+    async def unsubscribe_agg_trades(self, symbol: str) -> None:
+        self.unsubscribed_agg_trades.append(symbol)
+
     async def subscribe_bars(self, symbol: str, interval: str) -> None:
         self.bars.append((symbol, interval))
+
+    async def unsubscribe_bars(self, symbol: str, interval: str) -> None:
+        self.unsubscribed_bars.append((symbol, interval))
 
     async def subscribe_mark_price(
         self,
@@ -44,6 +82,13 @@ class FakeWebSocketClient:
         speed: int | None = None,
     ) -> None:
         self.mark_prices.append((symbol, speed))
+
+    async def unsubscribe_mark_price(
+        self,
+        symbol: str | None = None,
+        speed: int | None = None,
+    ) -> None:
+        self.unsubscribed_mark_prices.append((symbol, speed))
 
     async def disconnect(self) -> None:
         self.disconnected = True
@@ -95,6 +140,33 @@ def test_market_stream_bar_requires_boundary_matching_declared_interval() -> Non
             received_at=open_at + timedelta(minutes=1),
             closed=False,
             bar=mismatched_bar,
+        )
+
+
+def test_market_stream_depth_rejects_crossed_or_unordered_levels() -> None:
+    observed_at = datetime(2027, 1, 15, 8, 0, tzinfo=UTC)
+    with pytest.raises(ValueError, match="MARKET_STREAM_DEPTH_CROSSED"):
+        MarketStreamDepth(
+            instrument_ref="BTCUSDT-PERP",
+            source="BINANCE_DEMO_PUBLIC",
+            source_cutoff=observed_at,
+            received_at=observed_at,
+            update_id=1,
+            bids=(MarketStreamBookLevel(price="101", quantity="1"),),
+            asks=(MarketStreamBookLevel(price="101", quantity="2"),),
+        )
+    with pytest.raises(ValueError, match="MARKET_STREAM_DEPTH_BIDS_UNORDERED"):
+        MarketStreamDepth(
+            instrument_ref="BTCUSDT-PERP",
+            source="BINANCE_DEMO_PUBLIC",
+            source_cutoff=observed_at,
+            received_at=observed_at,
+            update_id=2,
+            bids=(
+                MarketStreamBookLevel(price="101", quantity="1"),
+                MarketStreamBookLevel(price="102", quantity="1"),
+            ),
+            asks=(MarketStreamBookLevel(price="103", quantity="1"),),
         )
 
 
@@ -164,6 +236,7 @@ def test_public_market_stream_routes_every_feed_to_the_profile_environment(
             "market": expected_environment,
         }
         assert clients["public"].book_tickers == ["BTCUSDT"]
+        assert clients["public"].partial_depths == [("BTCUSDT", 10, 100)]
         assert clients["market"].bars == [
             ("BTCUSDT", "1m"),
             ("BTCUSDT", "5m"),
@@ -173,6 +246,7 @@ def test_public_market_stream_routes_every_feed_to_the_profile_environment(
             ("BTCUSDT", "1d"),
         ]
         assert clients["market"].mark_prices == [("BTCUSDT", 1000)]
+        assert clients["market"].agg_trades == ["BTCUSDT"]
 
         clients["public"].emit(
             {
@@ -195,6 +269,53 @@ def test_public_market_stream_routes_every_feed_to_the_profile_environment(
         assert quote.reference_price == "101.2"
         assert quote.source == expected_source
         assert quote.source_cutoff.isoformat() == "2027-01-15T08:01:40+00:00"
+
+        clients["public"].emit(
+            {
+                "stream": "btcusdt@depth10@100ms",
+                "data": {
+                    "e": "depthUpdate",
+                    "E": 1_800_000_100_100,
+                    "T": 1_800_000_100_090,
+                    "s": "BTCUSDT",
+                    "U": 40,
+                    "u": 42,
+                    "pu": 39,
+                    "b": [["101.1", "2"], ["101.0", "3"]],
+                    "a": [["101.3", "4"], ["101.4", "5"]],
+                },
+            }
+        )
+        depth = await _next_kind(stream, MarketStreamDepth)
+        assert isinstance(depth, MarketStreamDepth)
+        assert depth.update_id == 42
+        assert depth.bids[0].price == "101.1"
+        assert depth.asks[0].quantity == "4"
+        assert depth.source == expected_source
+
+        clients["market"].emit(
+            {
+                "stream": "btcusdt@aggTrade",
+                "data": {
+                    "e": "aggTrade",
+                    "E": 1_800_000_100_150,
+                    "s": "BTCUSDT",
+                    "a": 501,
+                    "p": "101.2",
+                    "q": "0.25",
+                    "f": 20,
+                    "l": 21,
+                    "T": 1_800_000_100_140,
+                    "m": False,
+                },
+            }
+        )
+        trade = await _next_kind(stream, MarketStreamTrade)
+        assert isinstance(trade, MarketStreamTrade)
+        assert trade.trade_id == "501"
+        assert trade.price == "101.2"
+        assert trade.aggressor_side == "BUYER"
+        assert trade.source == expected_source
 
         clients["market"].emit(
             {
@@ -324,6 +445,198 @@ def test_public_market_stream_ignores_malformed_or_wrong_symbol_payloads() -> No
         await asyncio.gather(pending, return_exceptions=True)
         await stream.aclose()
         await provider.close()
+
+    asyncio.run(scenario())
+
+
+def test_public_market_stream_routes_dynamic_contracts_and_releases_unused_symbol() -> None:
+    async def scenario() -> None:
+        clients: dict[str, FakeWebSocketClient] = {}
+
+        def factory(route, _environment, handler, reconnect):
+            client = FakeWebSocketClient(handler, reconnect)
+            clients[route] = client
+            return client
+
+        provider = BinancePublicMarketStream(
+            "BINANCE_DEMO",
+            client_factory=factory,
+        )
+        stream = provider.stream("ETHUSDT-PERP")
+        await _next_live_status(stream)
+
+        assert clients["public"].book_tickers == ["ETHUSDT"]
+        assert clients["public"].partial_depths == [("ETHUSDT", 10, 100)]
+        assert clients["market"].mark_prices == [("ETHUSDT", 1000)]
+        assert clients["market"].agg_trades == ["ETHUSDT"]
+        clients["public"].emit(
+            {
+                "stream": "ethusdt@bookTicker",
+                "data": {
+                    "s": "ETHUSDT",
+                    "u": 7,
+                    "b": "2000.1",
+                    "B": "2",
+                    "a": "2000.3",
+                    "A": "3",
+                    "T": 1_800_000_100_000,
+                },
+            }
+        )
+        quote = await _next_kind(stream, MarketStreamQuote)
+        assert isinstance(quote, MarketStreamQuote)
+        assert quote.instrument_ref == "ETHUSDT-PERP"
+
+        await stream.aclose()
+        released_clients = dict(clients)
+        assert released_clients["public"].unsubscribed_book_tickers == ["ETHUSDT"]
+        assert released_clients["public"].unsubscribed_partial_depths == [
+            ("ETHUSDT", 10, 100),
+        ]
+        assert released_clients["market"].unsubscribed_mark_prices == [("ETHUSDT", 1000)]
+        assert released_clients["market"].unsubscribed_agg_trades == ["ETHUSDT"]
+        assert "ETHUSDT" not in provider._subscribed_symbols
+        assert provider._clients == {}
+        assert released_clients["public"].disconnected is True
+        assert released_clients["market"].disconnected is True
+
+        next_stream = provider.stream("BTCUSDT-PERP")
+        await _next_live_status(next_stream)
+        assert clients["public"] is not released_clients["public"]
+        assert clients["market"] is not released_clients["market"]
+        assert clients["public"].book_tickers == ["BTCUSDT"]
+        await next_stream.aclose()
+        await provider.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("keep_other_symbol", (False, True))
+def test_partial_unsubscribe_reopens_all_feeds_without_disrupting_other_symbols(
+    keep_other_symbol: bool,
+) -> None:
+    async def scenario() -> None:
+        clients: dict[str, FakeWebSocketClient] = {}
+
+        class PartialUnsubscribeClient(FakeWebSocketClient):
+            fail_next_depth_unsubscribe = False
+
+            async def unsubscribe_partial_book_depth(self, symbol, depth, speed):
+                if self.fail_next_depth_unsubscribe:
+                    self.fail_next_depth_unsubscribe = False
+                    raise RuntimeError("fixture unsubscribe failure")
+                await super().unsubscribe_partial_book_depth(symbol, depth, speed)
+
+        def factory(route, _environment, handler, reconnect):
+            client = PartialUnsubscribeClient(handler, reconnect)
+            clients[route] = client
+            return client
+
+        provider = BinancePublicMarketStream("BINANCE_DEMO", client_factory=factory)
+        first = provider.stream("SOLUSDT-PERP")
+        other = provider.stream("BTCUSDT-PERP") if keep_other_symbol else None
+        reopened = None
+        try:
+            await _next_live_status(first)
+            if other is not None:
+                await _next_live_status(other)
+            released_clients = dict(clients)
+            public_client = clients["public"]
+            public_client.fail_next_depth_unsubscribe = True
+
+            await first.aclose()
+
+            assert public_client.unsubscribed_book_tickers == ["SOLUSDT"]
+            assert "SOLUSDT" not in provider._subscribed_symbols
+            if keep_other_symbol:
+                assert provider._subscribed_symbols == {"BTCUSDT"}
+                assert all(not client.disconnected for client in clients.values())
+            else:
+                assert provider._clients == {}
+                assert all(client.disconnected for client in released_clients.values())
+
+            reopened = provider.stream("SOLUSDT-PERP")
+            await _next_live_status(reopened)
+
+            expected_subscribe_count = 2 if keep_other_symbol else 1
+            assert clients["public"].book_tickers.count("SOLUSDT") == expected_subscribe_count
+            assert clients["public"].partial_depths.count(
+                ("SOLUSDT", 10, 100)
+            ) == expected_subscribe_count
+            assert clients["market"].mark_prices.count(
+                ("SOLUSDT", 1000)
+            ) == expected_subscribe_count
+            clients["public"].emit(
+                {
+                    "stream": "solusdt@bookTicker",
+                    "data": {
+                        "s": "SOLUSDT", "u": 8,
+                        "b": "100", "B": "2", "a": "101", "A": "3",
+                        "T": 1_800_000_100_000,
+                    },
+                }
+            )
+            quote = await _next_kind(reopened, MarketStreamQuote)
+            assert quote.instrument_ref == "SOLUSDT-PERP"
+        finally:
+            await first.aclose()
+            if reopened is not None:
+                await reopened.aclose()
+            if other is not None:
+                await other.aclose()
+            await provider.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("hanging_operation", ("unsubscribe", "disconnect"))
+def test_last_subscriber_release_is_bounded_and_allows_a_new_connection(
+    hanging_operation: str,
+) -> None:
+    async def scenario() -> None:
+        hang_started = asyncio.Event()
+        never_finishes = asyncio.Event()
+        clients: list[FakeWebSocketClient] = []
+
+        class HangingClient(FakeWebSocketClient):
+            async def unsubscribe_partial_book_depth(self, symbol, depth, speed):
+                if hanging_operation == "unsubscribe":
+                    hang_started.set()
+                    await never_finishes.wait()
+                await super().unsubscribe_partial_book_depth(symbol, depth, speed)
+
+            async def disconnect(self):
+                if hanging_operation == "disconnect":
+                    hang_started.set()
+                    await never_finishes.wait()
+                await super().disconnect()
+
+        def factory(_route, _environment, handler, reconnect):
+            client = HangingClient(handler, reconnect)
+            clients.append(client)
+            return client
+
+        provider = BinancePublicMarketStream(
+            "BINANCE_DEMO", client_factory=factory, close_timeout_seconds=0.01,
+        )
+        first = provider.stream("SOLUSDT-PERP")
+        reopened = None
+        try:
+            await _next_live_status(first)
+            await asyncio.wait_for(first.aclose(), timeout=0.2)
+            assert hang_started.is_set()
+            assert provider._clients == {}
+            assert provider._subscribed_symbols == set()
+
+            reopened = provider.stream("SOLUSDT-PERP")
+            await _next_live_status(reopened)
+            assert len(clients) == 4
+        finally:
+            never_finishes.set()
+            await first.aclose()
+            if reopened is not None:
+                await reopened.aclose()
+            await provider.close()
 
     asyncio.run(scenario())
 

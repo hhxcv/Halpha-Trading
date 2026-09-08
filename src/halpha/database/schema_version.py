@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 
-CURRENT_SCHEMA_REVISION = "20260815_0015"
+CURRENT_SCHEMA_REVISION = "20260816_0016"
 _SCHEMA_VERSION_QUERY = "SELECT version_num FROM halpha_meta.alembic_version"
 
 

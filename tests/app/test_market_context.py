@@ -20,15 +20,16 @@ from halpha.public_market import (
 
 
 class FakeMarketApi:
-    def __init__(self, *, complete: bool = True) -> None:
+    def __init__(self, *, complete: bool = True, expected_symbol: str = "BTCUSDT") -> None:
         self.complete = complete
+        self.expected_symbol = expected_symbol
         self.server_time_ms = 1_800_000_100_000
         self.ticker_query_count = 0
         self.kline_query_count = 0
 
     async def query_ticker_book(self, symbol=None, symbols=None):
         self.ticker_query_count += 1
-        assert symbol == "BTCUSDT"
+        assert symbol == self.expected_symbol
         assert symbols is None
         return [
             SimpleNamespace(
@@ -48,7 +49,7 @@ class FakeMarketApi:
         end_time=None,
     ):
         self.kline_query_count += 1
-        assert symbol == "BTCUSDT"
+        assert symbol == self.expected_symbol
         assert end_time is not None
         count = int(limit)
         start = int(start_time)
@@ -116,6 +117,22 @@ def test_public_market_context_uses_closed_contiguous_bars_and_exact_prices() ->
     )
     assert Decimal(context.long_breakout_gap_pct) == Decimal(1) / Decimal(120) * 100
     assert Decimal(context.short_breakout_gap_pct) == Decimal(22) / Decimal(120) * 100
+
+
+def test_public_market_context_maps_any_supported_perpetual_symbol() -> None:
+    api = FakeMarketApi(expected_symbol="ETHUSDT")
+    provider = BinancePublicMarketContext(
+        "BINANCE_DEMO",
+        market_api=api,
+        observed_at_provider=lambda: _observed_after(api),
+    )
+
+    context = asyncio.run(provider.fetch("ETHUSDT-PERP", 20))
+
+    assert context.instrument_ref == "ETHUSDT-PERP"
+    assert context.reference_price == "120"
+    assert api.ticker_query_count == 1
+    assert api.kline_query_count == 2
 
 
 def test_public_market_context_reads_recent_settled_funding_rates_for_local_estimates() -> None:

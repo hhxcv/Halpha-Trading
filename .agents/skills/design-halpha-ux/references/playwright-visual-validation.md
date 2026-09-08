@@ -1,32 +1,30 @@
-# Playwright Visual Validation
+# Browser Validation for Halpha UX
 
-## Scope and Authority
+## Scope and Tool Choice
 
-Use this workflow for executable Halpha prototypes, implemented frontend changes, or rendered-UI reviews when browser evidence is proportionate to the impact. It applies the current HALPHA-UX-001, HALPHA-UX-002 and L4 plan; it does not create routes, states, commands, breakpoints, or product semantics.
+Use real rendering to verify executable visual and interaction changes under current `HALPHA-UX-001`/`HALPHA-UX-002`. This reference does not create product routes, states, commands or permission.
 
-Use the `playwright` skill and a real browser. An available interactive browser debugger may supplement diagnosis, but preserve reproducible Playwright evidence. Vitest, component tests, DOM inspection, axe, and static screenshots are complementary; none replaces this visual interaction loop.
+Use an available supported browser tool for direct inspection. Use the `playwright` skill when automation improves repeatability, exercises a multi-step flow or provides a valuable regression check; Playwright is not a prerequisite for every visual repair. Component tests and static inspection can supplement the browser, but cannot establish unseen rendering or interactions.
 
-## Mandatory Debug Loop
+## Size the Check to the Change
 
-1. **Establish the target.** Read the current L4 route, viewport, browser, deterministic fixture or data profile, and build state. Use an authorized profile; never perform a real-account trading action merely to obtain UI evidence.
-2. **Start the actual surface.** Serve the exact build or executable prototype under review. Record the startup command, URL, build identity, data profile, and known unavailable dependencies. If the surface cannot run, report `BLOCKED` instead of substituting a mock screenshot.
-3. **Open specified viewports.** Inspect the target desktop viewport and the current narrow-screen breakpoint. Add an intermediate width when layout behavior changes between them.
-4. **Capture the baseline.** Navigate to each in-scope route with Playwright, wait for stable rendering, and capture a full-page or region screenshot. Inspect the image at native size before interacting.
-5. **Exercise behavior.** Use accessible roles, labels, and keyboard input to walk the primary task. Capture the screen after disclosure, selection, validation, submission acknowledgement, processing, final result, rejection/failure, stale/unknown, risk confirmation, refresh, and navigation transitions as applicable.
-6. **Inspect layout.** Check clipping, overlap, unintended scroll, sticky-region collisions, drawer/dialog bounds, text truncation, numeric alignment, target size, density, breakpoint reflow, and whether critical state disappears below or behind another layer.
-7. **Inspect interaction logic.** Check focus order and return, dialog trapping, keyboard reachability, disabled reasons, duplicate-click prevention, loading and interruption, stale-preview invalidation, refresh/resume, drawer close behavior, error persistence, and distinction between acknowledgement and authoritative result.
-8. **Inspect runtime signals.** Review page errors, console warnings/errors, failed requests, redirect loops, missing assets, and unhandled promises for each flow. Keep secret-bearing payloads out of captured evidence.
-9. **Iterate and rerun.** Fix each in-scope critical issue, repeat the affected flow, and capture the corrected state. Do not declare completion from a single happy-path screenshot or from tests that were not visually inspected.
+| Change | Browser scope |
+|---|---|
+| Local copy, alignment, overflow or component state | Inspect the affected region at the width and state that can expose the defect; check keyboard or focus if affected. |
+| Responsive layout, navigation or common workflow | Exercise the affected task at desktop and narrow widths; add intermediate widths when they expose a distinct layout risk. |
+| Consequential command or async behavior | Cover affected normal, rejection/failure, stale/unknown and duplicate/interruption paths with isolated deterministic inputs. Verify that acknowledgement is distinct from authoritative result. |
+| Static image or document only | Inspect at intended size and state that interaction was not tested. No special status marker or browser run is required. |
 
-## Required Evidence
+The detailed cases in `HALPHA-UX-002` are selected by changed behavior. Do not run every route or state for a local repair.
 
-Record:
+## Gather Evidence
 
-- exact command, URL, build/profile, browser, route, and viewport;
-- states and interaction steps exercised;
-- screenshots, snapshots, or traces before and after critical transitions;
-- console, page-error, request-failure, and axe results where applicable;
-- each layout or logic finding, its severity, disposition, and rerun result;
-- unresolved limitations and whether they are implementation defects, unavailable runtime evidence, or formal design gaps.
+Identify the implementation or prototype under review, the route, relevant data conditions and viewport. Use the actual code and task context for selectable test parameters; L4 supplies recorded choices where present, not a required inventory of browser settings. Do not invent missing runtime facts.
 
-Keep static image review separate. When no executable DOM exists, use `NOT_APPLICABLE_STATIC_ARTIFACT`, inspect the artifact at native resolution, and do not claim keyboard, focus, responsive, async, or interaction validation.
+Run the intended surface with an isolated authorized fixture or profile. A mock can test presentation, but does not prove a live product or external action works. Never use real-account trading actions merely to obtain UI evidence. If the surface cannot run, complete independent static work and report exactly what remains unverified.
+
+Observe the changed result and affected transitions, checking legibility, clipping, alignment, critical control visibility and applicable focus behavior. Review relevant browser errors or failed requests when they could explain the defect. Fix in-scope issues and repeat the affected check.
+
+Keep only evidence needed to understand or reproduce the result: route, relevant width/state, outcome and material limits. Add inspected screenshots, traces or exact non-secret commands when they help a reviewer or reproduce a failure; do not generate an artifact for every checklist item. Follow `HALPHA-ENG-002` for privacy.
+
+Finish with the lifecycle cleanup required by `AGENTS.md`: close only task-owned browsers/helpers and verify their cleanup. Do not claim browser validation from an image or command that was never inspected.

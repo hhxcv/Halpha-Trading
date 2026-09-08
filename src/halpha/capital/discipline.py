@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+import re
 from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
 
@@ -27,10 +28,8 @@ from halpha.domain_values import canonical_decimal
 
 _OWNER_TIMEZONE = ZoneInfo("Asia/Shanghai")
 _MAX_FUTURE_SKEW_SECONDS = 5
-_CORRELATION_CLUSTERS = {
-    "BTCUSDT-PERP": "CRYPTO_MAJOR_BETA",
-    "ETHUSDT-PERP": "CRYPTO_MAJOR_BETA",
-}
+_USDT_PERPETUAL_INSTRUMENT_REF = re.compile(r"^[A-Z0-9]+USDT-PERP$")
+_USDT_PERPETUAL_CORRELATION_CLUSTER = "CRYPTO_USDM_BETA"
 
 
 @dataclass(frozen=True)
@@ -102,7 +101,18 @@ def _equity(snapshot: AccountEquitySnapshot) -> Decimal:
 
 
 def _cluster(instrument_ref: str) -> str | None:
-    return _CORRELATION_CLUSTERS.get(instrument_ref)
+    """Keep every workbench-supported USDT perpetual in one conservative bucket.
+
+    The contract catalog remains the authority for whether a symbol is currently
+    tradeable.  This evaluator only assigns the common portfolio-risk bucket to
+    the normalized instrument form used by that catalog, so a malformed or
+    out-of-scope account fact still fails closed instead of silently bypassing
+    correlated-exposure checks.
+    """
+
+    if _USDT_PERPETUAL_INSTRUMENT_REF.fullmatch(instrument_ref):
+        return _USDT_PERPETUAL_CORRELATION_CLUSTER
+    return None
 
 
 def _risk_limits(
@@ -698,6 +708,50 @@ def _account_equity_from_fact(
         return None
 
 
+def _reliable_discipline_result(row: Any) -> NewRiskResult | None:
+    (
+        activation_id, review_status, workflow_kind,
+        account_result, responsibilities, fact_cutoff,
+    ) = row
+    if review_status != "COMPLETE" and workflow_kind != "SCALP_CYCLE":
+        return None
+    if (
+        not isinstance(account_result, dict)
+        or account_result.get("classification")
+        not in {"ATTRIBUTED_FACTS_AVAILABLE", "ACCOUNT_FACTS_WITH_EXTERNAL_CLOSURE"}
+        or account_result.get("missing_refs") != []
+        or not isinstance(responsibilities, dict)
+        or responsibilities.get("execution_action_refs") != []
+        or responsibilities.get("unknown_action_refs") != []
+    ):
+        return None
+    trade_result = account_result.get("trade_result")
+    if not isinstance(trade_result, dict) or any(
+        trade_result.get(field) is not True
+        for field in (
+            "calculation_complete",
+            "execution_cost_complete",
+            "closed",
+        )
+    ):
+        return None
+    net_pnl = _decimal(trade_result.get("net_pnl"))
+    commission = _decimal(trade_result.get("commission"))
+    if (
+        net_pnl is None
+        or commission is None
+        or commission < 0
+        or _decimal(trade_result.get("gross_pnl")) is None
+        or _decimal(trade_result.get("funding")) is None
+    ):
+        return None
+    return NewRiskResult(
+        activation_id=str(activation_id),
+        net_pnl=canonical_decimal(net_pnl),
+        closed_at=_aware_utc(fact_cutoff),
+    )
+
+
 def read_new_risk_discipline(
     connection: Connection[Any],
     *,
@@ -731,7 +785,24 @@ def read_new_risk_discipline(
         (environment_id, account_ref),
     ).fetchall()
     result_rows = connection.execute(
-        """SELECT DISTINCT ON (review.activation_id) review.activation_id, review.account_result -> 'trade_result' ->> 'net_pnl', review.fact_cutoff FROM halpha.review review JOIN halpha.plan_activation activation ON activation.environment_id = review.environment_id AND activation.activation_id = review.activation_id WHERE review.environment_id = %s AND activation.account_ref = %s AND activation.position_alignment IS NULL AND review.status = 'COMPLETE' AND review.account_result -> 'trade_result' ->> 'calculation_complete' = 'true' AND review.account_result -> 'trade_result' ->> 'closed' = 'true' AND review.account_result -> 'trade_result' ->> 'net_pnl' IS NOT NULL ORDER BY review.activation_id, review.review_version DESC""",
+        """
+        SELECT DISTINCT ON (review.activation_id)
+               review.activation_id, review.status,
+               version.terms ->> 'workflow_kind',
+               review.account_result, review.open_responsibilities,
+               review.fact_cutoff
+        FROM halpha.review review
+        JOIN halpha.plan_activation activation
+          ON activation.environment_id = review.environment_id
+         AND activation.activation_id = review.activation_id
+        JOIN halpha.trade_plan_version version
+          ON version.environment_id = activation.environment_id
+         AND version.plan_version_id = activation.plan_version_ref
+        WHERE review.environment_id = %s
+          AND activation.account_ref = %s
+          AND activation.position_alignment IS NULL
+        ORDER BY review.activation_id, review.review_version DESC
+        """,
         (environment_id, account_ref),
     ).fetchall()
     peak_rows = connection.execute(
@@ -756,11 +827,13 @@ def read_new_risk_discipline(
         )
         for row in attempts_rows
     )
+    # Select the latest authority before checking reliability, so later unknown
+    # facts cannot fall back to an older completed review. Scalp cycles retain
+    # their machine-derived DRAFT review without requiring an owner evaluation.
     results = tuple(
-        NewRiskResult(
-            activation_id=str(row[0]), net_pnl=str(row[1]), closed_at=_aware_utc(row[2])
-        )
+        result
         for row in result_rows
+        if (result := _reliable_discipline_result(row)) is not None
     )
     peaks = tuple(
         _equity(item)

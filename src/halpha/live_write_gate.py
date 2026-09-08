@@ -95,8 +95,6 @@ class LiveWriteGateStatus(_FrozenModel):
             and self.configured_runtime_real_write_gate != "OPEN"
         ):
             raise ValueError("LIVE_WRITE_EFFECTIVE_GATE_CONFIGURATION_MISMATCH")
-        if self.runtime_real_write_gate == "OPEN" and not self.authorized_activation_ids:
-            raise ValueError("LIVE_WRITE_EFFECTIVE_ACTIVATION_REQUIRED")
         if self.risk_control_only and (
             self.runtime_real_write_gate != "CLOSED"
             or not self.authorized_activation_ids
@@ -283,8 +281,6 @@ def _database_assessment(
         """,
         (settings.release.environment_id, settings.release.account_id),
     ).fetchall()
-    if not rows:
-        return ["LIVE_WRITE_CURRENT_ACTIVATION_MISSING"], ()
     return [], tuple(str(row[0]) for row in rows)
 
 

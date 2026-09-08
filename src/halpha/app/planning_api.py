@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 from uuid import NAMESPACE_URL, uuid5
+from zoneinfo import ZoneInfo
 
 import psycopg
 from pydantic import (
@@ -64,6 +65,7 @@ from halpha.planning.models import (
     PlanCreatorKind,
     PlanDecisionContext,
     PlanDecisionIntent,
+    PlanSetupFamily,
     PositionAlignmentSpec,
     RequestedLimits,
     TradePlanContent,
@@ -85,7 +87,9 @@ from halpha.planning.live_profit_qualification import (
 )
 from halpha.planning.control_service import ActivationControlService
 from halpha.planning.registry import (
+    DIRECT_EXECUTION_REF,
     DecisionBasisKind,
+    Direction,
     DraftDecisionBasis,
     FixedDecisionBasis,
     FixedStrategyPlanBasis,
@@ -104,7 +108,18 @@ from halpha.planning.service import (
     plan_runtime_incompatibility,
 )
 from halpha.planning.transitions import ControlIntent
+from halpha.scalping.models import (
+    SCALP_WORKFLOW_KIND,
+    ScalpCycleCreateResponse,
+    ScalpCycleRecord,
+    ScalpResultsResponse,
+    ScalpTriggerPayload,
+    scalp_playbook_ref,
+)
+from halpha.scalping.repository import PostgreSQLScalpRepository
+from halpha.scalping.results import summarize_scalp_results
 from halpha.user_workbench.commands import build_command
+from halpha.user_workbench.repository import PostgreSQLCommandRepository
 
 
 _FIXED_DECISION_BASIS_ADAPTER = TypeAdapter(FixedDecisionBasis)
@@ -409,6 +424,7 @@ class PostgreSQLPlanningApi:
         live_profit_qualification_provider: (
             LiveProfitQualificationProvider | None
         ) = None,
+        scalp_executor_ready_provider: Callable[[], bool] | None = None,
     ) -> None:
         self._database_name = database_name
         self._database_role_name = database_role_name
@@ -438,6 +454,7 @@ class PostgreSQLPlanningApi:
         self._live_profit_qualification_provider = (
             live_profit_qualification_provider
         )
+        self._scalp_executor_ready_provider = scalp_executor_ready_provider
         self._gate_status_provider = (
             gate_status_provider or closed_live_write_gate_status
         )
@@ -578,6 +595,10 @@ class PostgreSQLPlanningApi:
                   ON r.environment_id = d.environment_id
                  AND r.review_id = v.ai_review_ref
                 WHERE d.environment_id = %s
+                  AND COALESCE(
+                    d.content -> 'terms' ->> 'workflow_kind',
+                    'PLAN'
+                  ) <> 'SCALP_CYCLE'
                 ORDER BY d.updated_at DESC
                 """,
                 (self._environment_id,),
@@ -682,6 +703,353 @@ class PostgreSQLPlanningApi:
                 }
             )
         return result
+
+    def scalp_cycle_preview(
+        self,
+        payload: ScalpTriggerPayload,
+        *,
+        idempotency_key: str,
+        maker_limit_price: str | None = None,
+    ) -> dict[str, Any]:
+        """Return the exact server-built schedule input for one trigger request."""
+
+        plan_version_id = _stable_id(
+            self._environment_id,
+            "scalp-plan-version",
+            idempotency_key,
+        )
+        spec = payload.template.order_schedule_spec(
+            maker_limit_price=maker_limit_price,
+        )
+        validate_new_direct_execution_schedule(spec)
+        return {
+            "plan_version_id": plan_version_id,
+            "decision_basis_kind": DecisionBasisKind.DIRECT_EXECUTION.value,
+            "venue_ref": "BINANCE_USDM",
+            "instrument_ref": payload.instrument_ref,
+            "direction": payload.direction.value,
+            "trade_amount": payload.template.notional,
+            "order_schedule_spec": spec.model_dump(mode="json"),
+        }
+
+    def scalp_cycle_replay(
+        self,
+        payload: ScalpTriggerPayload,
+        *,
+        idempotency_key: str,
+    ) -> ScalpCycleCreateResponse | None:
+        """Return an already-created cycle before any fresh market dependency."""
+
+        request_digest = content_digest(
+            {
+                "environment_id": self._environment_id,
+                "account_ref": self._account_ref,
+                "instrument_ref": payload.instrument_ref,
+                "direction": payload.direction,
+                "template": payload.template,
+            }
+        )
+        with self._connect() as connection, connection.transaction():
+            cycle = PostgreSQLScalpRepository(
+                connection,
+                self._environment_id,
+            ).get_by_idempotency(idempotency_key)
+            if cycle is None:
+                return None
+            if cycle.request_digest != request_digest:
+                raise ValueError("IDEMPOTENCY_CONTENT_CONFLICT")
+            activation = PostgreSQLPlanningRepository(
+                connection,
+                self._environment_id,
+            ).get_activation(cycle.activation_id)
+        return ScalpCycleCreateResponse(
+            cycle=cycle,
+            activation=activation.model_dump(mode="json"),
+            runtime_real_write_gate=self._gate_status().runtime_real_write_gate,
+        )
+
+    def scalp_cycle_lookup(
+        self,
+        *,
+        idempotency_key: str,
+    ) -> ScalpCycleCreateResponse | None:
+        """Read a committed request; absence does not settle an in-flight POST."""
+
+        _stable_id(self._environment_id, "scalp-cycle", idempotency_key)
+        with self._connect() as connection, connection.transaction():
+            cycle = PostgreSQLScalpRepository(
+                connection,
+                self._environment_id,
+            ).get_by_idempotency(idempotency_key)
+            if cycle is None or cycle.account_ref != self._account_ref:
+                return None
+            activation = PostgreSQLPlanningRepository(
+                connection,
+                self._environment_id,
+            ).get_activation(cycle.activation_id)
+        return ScalpCycleCreateResponse(
+            cycle=cycle,
+            activation=activation.model_dump(mode="json"),
+            runtime_real_write_gate=self._gate_status().runtime_real_write_gate,
+        )
+
+    def _require_scalp_write_gate(self) -> None:
+        self._require_product_mutation_allowed()
+        gate_status = self._gate_status()
+        if self._profile == "BINANCE_LIVE_WRITE":
+            if gate_status.product_build_consistent is not True:
+                raise ValueError("LIVE_WRITE_PRODUCT_BUILD_MISMATCH")
+            if gate_status.violations:
+                raise ValueError("LIVE_WRITE_GATE_BINDING_INVALID_FOR_ACTIVATION")
+            if gate_status.runtime_real_write_gate != "OPEN":
+                raise ValueError("LIVE_WRITE_GATE_MUST_BE_OPEN_FOR_SCALP")
+
+    def trigger_scalp_cycle(
+        self,
+        payload: ScalpTriggerPayload,
+        *,
+        idempotency_key: str,
+        observed_at: datetime,
+        order_schedule_snapshot: OrderSchedulePreview,
+        maker_limit_price: str | None = None,
+    ) -> ScalpCycleCreateResponse:
+        """Atomically create one bounded technical activation and cycle identity."""
+
+        self._require_scalp_write_gate()
+
+        plan_id = _stable_id(self._environment_id, "scalp-plan", idempotency_key)
+        plan_version_id = _stable_id(
+            self._environment_id,
+            "scalp-plan-version",
+            idempotency_key,
+        )
+        activation_id = _stable_id(
+            self._environment_id,
+            "scalp-activation",
+            idempotency_key,
+        )
+        cycle_id = _stable_id(self._environment_id, "scalp-cycle", idempotency_key)
+        request_digest = content_digest(
+            {
+                "environment_id": self._environment_id,
+                "account_ref": self._account_ref,
+                "instrument_ref": payload.instrument_ref,
+                "direction": payload.direction,
+                "template": payload.template,
+            }
+        )
+        expected_spec = payload.template.order_schedule_spec(
+            maker_limit_price=maker_limit_price,
+        )
+        protection = order_schedule_snapshot.full_fill_protection_estimate
+        if (
+            not order_schedule_snapshot.valid
+            or order_schedule_snapshot.schedule_ref != plan_version_id
+            or order_schedule_snapshot.instrument_ref != payload.instrument_ref
+            or order_schedule_snapshot.direction != payload.direction
+            or order_schedule_snapshot.max_notional != payload.template.notional
+            or order_schedule_snapshot.schedule_spec != expected_spec
+            or protection is None
+        ):
+            raise ValueError("SCALP_PREVIEW_MISMATCH")
+
+        direction_label = "做多" if payload.direction is Direction.LONG else "做空"
+        content = TradePlanContent(
+            plan_name=(
+                f"剥头皮 {payload.instrument_ref.removesuffix('-PERP')} "
+                f"{direction_label} {observed_at.astimezone(ZoneInfo('Asia/Shanghai')):%H:%M:%S}"
+            ),
+            created_at=observed_at,
+            creator_kind=PlanCreatorKind.HUMAN,
+            decision_context=PlanDecisionContext(
+                rationale="人工选择方向并触发剥头皮周期",
+                intent=PlanDecisionIntent.PROFIT_SEEKING,
+                setup_family=PlanSetupFamily.OTHER,
+                playbook_ref=scalp_playbook_ref(payload.template),
+                evidence_cutoff=observed_at,
+            ),
+            decision_basis=DraftDecisionBasis(
+                kind=DecisionBasisKind.DIRECT_EXECUTION,
+                decision_basis_ref=DIRECT_EXECUTION_REF,
+                parameters={},
+            ),
+            order_schedule_spec=expected_spec,
+            environment_id=self._environment_id,
+            environment_kind=self._environment_kind,
+            authority_class=self._authority_class,
+            account_ref=self._account_ref,
+            venue_ref="BINANCE_USDM",
+            instrument_ref=payload.instrument_ref,
+            direction=payload.direction,
+            target_exposure=payload.template.notional,
+            requested_limits=RequestedLimits(
+                max_margin=payload.template.notional,
+                max_notional=payload.template.notional,
+                max_allowed_loss=protection.maximum_projected_loss,
+            ),
+            valid_from=observed_at,
+            valid_until=observed_at
+            + timedelta(seconds=max(900, payload.template.max_holding_seconds + 300)),
+            allowed_actions=direct_allowed_action_profiles(expected_spec),
+            terms={
+                "one_entry_cycle": True,
+                "resume_policy": "MANUAL_PLAN_RESUME",
+                "workflow_kind": SCALP_WORKFLOW_KIND,
+                "scalp_template": payload.template.model_dump(mode="json"),
+                "scalp_template_digest": payload.template.digest,
+                "scalp_entry_limit_price": maker_limit_price,
+            },
+        )
+
+        with self._connect() as connection:
+            scalp_repository = PostgreSQLScalpRepository(
+                connection,
+                self._environment_id,
+            )
+            planning_repository = PostgreSQLPlanningRepository(
+                connection,
+                self._environment_id,
+            )
+            try:
+                with connection.transaction():
+                    scalp_repository.lock_open_cycle_scope(
+                        account_ref=self._account_ref,
+                    )
+                    existing_cycle = scalp_repository.get_by_idempotency(
+                        idempotency_key
+                    )
+                    if existing_cycle is not None:
+                        if existing_cycle.request_digest != request_digest:
+                            raise ValueError("IDEMPOTENCY_CONTENT_CONFLICT")
+                        activation = planning_repository.get_activation(
+                            existing_cycle.activation_id
+                        )
+                        return ScalpCycleCreateResponse(
+                            cycle=existing_cycle,
+                            activation=activation.model_dump(mode="json"),
+                            runtime_real_write_gate=(
+                                self._gate_status().runtime_real_write_gate
+                            ),
+                        )
+                    self._require_scalp_write_gate()
+                    try:
+                        executor_ready = (
+                            self._scalp_executor_ready_provider is not None
+                            and self._scalp_executor_ready_provider() is True
+                        )
+                    except Exception:
+                        executor_ready = False
+                    if not executor_ready:
+                        raise ValueError("EXECUTOR_NOT_READY")
+                    if self._profile == "BINANCE_LIVE_WRITE":
+                        try:
+                            require_live_activation_safety_index(connection)
+                        except LiveWriteGateError as exc:
+                            raise ValueError(str(exc)) from None
+                    cycle = ScalpCycleRecord(
+                        cycle_id=cycle_id,
+                        environment_id=self._environment_id,
+                        account_ref=self._account_ref,
+                        instrument_ref=payload.instrument_ref,
+                        direction=payload.direction,
+                        template=payload.template,
+                        template_digest=payload.template.digest,
+                        request_digest=request_digest,
+                        idempotency_key=idempotency_key,
+                        plan_id=plan_id,
+                        plan_version_id=plan_version_id,
+                        activation_id=activation_id,
+                        triggered_at=observed_at,
+                    )
+                    _version, activation = PlanningApplicationService(
+                        connection,
+                        self._environment_id,
+                    ).create_scalp_cycle(
+                        cycle=cycle,
+                        content=content,
+                        environment_kind=self._environment_kind,
+                        authority_class=self._authority_class,
+                        product_build_id=self._product_build_id,
+                        order_schedule_snapshot=order_schedule_snapshot,
+                        live_profit_qualification_checker=(
+                            lambda version: self._require_live_profit_qualification_snapshot(
+                                version,
+                                observed_at,
+                            )
+                        ),
+                        new_risk_discipline_policy=self._new_risk_discipline_policy,
+                    )
+            except psycopg.errors.UniqueViolation:
+                connection.rollback()
+                with connection.transaction():
+                    existing_cycle = scalp_repository.get_by_idempotency(
+                        idempotency_key
+                    )
+                    if (
+                        existing_cycle is None
+                        or existing_cycle.request_digest != request_digest
+                    ):
+                        raise ValueError("IDEMPOTENCY_CONTENT_CONFLICT") from None
+                    activation = planning_repository.get_activation(
+                        existing_cycle.activation_id
+                    )
+                    cycle = existing_cycle
+        return ScalpCycleCreateResponse(
+            cycle=cycle,
+            activation=activation.model_dump(mode="json"),
+            runtime_real_write_gate=self._gate_status().runtime_real_write_gate,
+        )
+
+    def scalp_results(
+        self,
+        *,
+        scope: Literal["ALL", "TODAY", "ANCHOR"],
+        anchor_at: datetime | None,
+        observed_at: datetime,
+    ) -> ScalpResultsResponse:
+        if observed_at.utcoffset() is None:
+            raise ValueError("SCALP_RESULT_TIME_INVALID")
+        if scope == "ALL":
+            range_start = None
+        elif scope == "TODAY":
+            local_now = observed_at.astimezone(ZoneInfo("Asia/Shanghai"))
+            range_start = local_now.replace(
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            ).astimezone(UTC)
+        else:
+            if (
+                anchor_at is None
+                or anchor_at.utcoffset() is None
+                or anchor_at > observed_at
+            ):
+                raise ValueError("SCALP_RESULT_ANCHOR_INVALID")
+            range_start = anchor_at.astimezone(UTC)
+        with self._connect() as connection, connection.transaction():
+            repository = PostgreSQLScalpRepository(
+                connection,
+                self._environment_id,
+            )
+            rows = repository.result_rows(
+                account_ref=self._account_ref,
+                range_start=range_start,
+                range_end=observed_at,
+            )
+            latest = repository.latest_result_row(
+                account_ref=self._account_ref,
+                range_end=observed_at,
+            )
+        return summarize_scalp_results(
+            environment_id=self._environment_id,
+            account_ref=self._account_ref,
+            scope=scope,
+            range_start=range_start,
+            range_end=observed_at.astimezone(UTC),
+            rows=rows,
+            latest_row=latest,
+        )
 
     def get_plan(self, plan_id: str) -> dict[str, Any]:
         with self._connect() as connection, connection.transaction():
@@ -1753,7 +2121,9 @@ class PostgreSQLPlanningApi:
                     ORDER BY review.review_version DESC
                     LIMIT 1
                 ) latest_review ON true
-                WHERE a.environment_id = %s ORDER BY a.created_at DESC
+                WHERE a.environment_id = %s
+                  AND COALESCE(v.terms ->> 'workflow_kind', 'PLAN') <> 'SCALP_CYCLE'
+                ORDER BY a.created_at DESC
                 """,
                 (self._environment_id,),
             ).fetchall()
@@ -2869,6 +3239,37 @@ class PostgreSQLPlanningApi:
         public_receipt = receipt.model_dump(mode="json")
         public_receipt.pop("environment_id", None)
         return public_receipt
+
+    def exit_receipt_lookup(
+        self,
+        activation_id: str,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any] | None:
+        """Read the exact submitted exit without creating or retrying a command."""
+
+        _stable_id(self._environment_id, "command", idempotency_key)
+        with self._connect() as connection, connection.transaction():
+            found = PostgreSQLCommandRepository(
+                connection,
+                self._environment_id,
+            ).find_by_idempotency("local-owner", idempotency_key)
+            if found is None:
+                return None
+            command, receipt = found
+            if (
+                command.target_kind != "PLAN_ACTIVATION"
+                or command.target_ref != activation_id
+                or command.intent is not ControlIntent.EXIT_STRATEGY
+            ):
+                return None
+            activation = PostgreSQLPlanningRepository(
+                connection,
+                self._environment_id,
+            ).get_activation(activation_id)
+            if activation.account_ref != self._account_ref:
+                return None
+        return receipt.model_dump(mode="json", exclude={"environment_id"})
 
     def receipt(self, receipt_id: str) -> dict[str, Any]:
         query = """

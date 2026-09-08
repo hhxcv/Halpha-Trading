@@ -64,6 +64,12 @@ from halpha.planning.registry import (
 )
 from halpha.planning.repository import PostgreSQLPlanningRepository
 from halpha.planning.strategies.one_shot import StrategyProposal
+from halpha.scalping.models import (
+    SCALP_WORKFLOW_KIND,
+    ScalpCycleRecord,
+    is_internal_scalp_cycle,
+)
+from halpha.scalping.repository import PostgreSQLScalpRepository
 from halpha.planning.transitions import (
     ControlIntent,
     build_plan_event,
@@ -487,6 +493,29 @@ class PlanningApplicationService:
         ai_review_ref: str | None = None,
         new_risk_discipline_policy: NewRiskDisciplinePolicy | None = None,
     ) -> TradePlanVersion:
+        return self._build_activation_snapshot(
+            plan_id=plan_id,
+            expected_draft_version=expected_draft_version,
+            plan_version_id=plan_version_id,
+            product_build_id=product_build_id,
+            snapshot_at=snapshot_at,
+            ai_review_ref=ai_review_ref,
+            new_risk_discipline_policy=new_risk_discipline_policy,
+            scalp_cycle=None,
+        )
+
+    def _build_activation_snapshot(
+        self,
+        *,
+        plan_id: str,
+        expected_draft_version: int,
+        plan_version_id: str,
+        product_build_id: str,
+        snapshot_at: datetime,
+        ai_review_ref: str | None,
+        new_risk_discipline_policy: NewRiskDisciplinePolicy | None,
+        scalp_cycle: ScalpCycleRecord | None,
+    ) -> TradePlanVersion:
         """Build the immutable executor input without persisting it.
 
         A snapshot is an implementation detail of a successful start, not a
@@ -501,12 +530,18 @@ class PlanningApplicationService:
         if self._planning.has_activation(plan_id):
             raise ValueError("PLAN_ALREADY_STARTED")
         content = draft.content
+        self._require_scalp_cycle_binding(content, scalp_cycle)
+        if scalp_cycle is not None and (
+            plan_id != scalp_cycle.plan_id
+            or plan_version_id != scalp_cycle.plan_version_id
+        ):
+            raise ValueError("SCALP_CYCLE_IDENTITY_MISMATCH")
         basis = build_fixed_decision_basis(
             content.decision_basis,
             product_build_id=product_build_id,
         )
         if content.position_alignment is None:
-            if not ai_review_ref:
+            if not ai_review_ref and scalp_cycle is None:
                 raise ValueError("PLAN_AI_REVIEW_REQUIRED")
             context_incompatibility = new_risk_decision_context_incompatibility(
                 decision_basis_kind=basis.kind,
@@ -606,24 +641,65 @@ class PlanningApplicationService:
             Callable[[TradePlanVersion], Mapping[str, Any]] | None
         ) = None,
     ) -> PlanActivation:
+        return self._activate_version(
+            plan_version_id=plan_version_id,
+            activation_id=activation_id,
+            environment_kind=environment_kind,
+            authority_class=authority_class,
+            observed_at=observed_at,
+            order_schedule_snapshot=order_schedule_snapshot,
+            new_risk_discipline_policy=new_risk_discipline_policy,
+            live_profit_qualification_checker=live_profit_qualification_checker,
+            ai_review_checker=ai_review_checker,
+            scalp_cycle=None,
+        )
+
+    def _activate_version(
+        self,
+        *,
+        plan_version_id: str,
+        activation_id: str,
+        environment_kind: EnvironmentKind,
+        authority_class: AuthorityClass,
+        observed_at: datetime,
+        order_schedule_snapshot: OrderSchedulePreview | None,
+        new_risk_discipline_policy: NewRiskDisciplinePolicy | None,
+        live_profit_qualification_checker: (
+            Callable[[TradePlanVersion], Mapping[str, Any]] | None
+        ),
+        ai_review_checker: (
+            Callable[[TradePlanVersion], Mapping[str, Any]] | None
+        ),
+        scalp_cycle: ScalpCycleRecord | None,
+    ) -> PlanActivation:
         version = self._planning.get_version(plan_version_id)
+        self._require_scalp_cycle_binding(version, scalp_cycle)
+        if scalp_cycle is not None and (
+            version.plan_id != scalp_cycle.plan_id
+            or plan_version_id != scalp_cycle.plan_version_id
+            or activation_id != scalp_cycle.activation_id
+        ):
+            raise ValueError("SCALP_CYCLE_IDENTITY_MISMATCH")
         ai_review_snapshot: dict[str, Any] | None = None
         if version.position_alignment is None:
-            if not version.ai_review_ref:
+            if not version.ai_review_ref and scalp_cycle is None:
                 raise ValueError("PLAN_AI_REVIEW_REQUIRED")
-            if ai_review_checker is None:
+            if version.ai_review_ref is None:
+                pass
+            elif ai_review_checker is None:
                 raise ValueError("PLAN_AI_REVIEW_NOT_CONFIGURED")
-            review_result = ai_review_checker(version)
-            if not isinstance(review_result, Mapping):
-                raise ValueError("PLAN_AI_REVIEW_SNAPSHOT_INVALID")
-            ai_review_snapshot = dict(review_result)
-            if (
-                ai_review_snapshot.get("review_id") != version.ai_review_ref
-                or ai_review_snapshot.get("status") != "APPROVED"
-                or ai_review_snapshot.get("decision") != "APPROVE"
-                or ai_review_snapshot.get("draft_content_digest") is None
-            ):
-                raise ValueError("PLAN_AI_REVIEW_NOT_APPROVED")
+            else:
+                review_result = ai_review_checker(version)
+                if not isinstance(review_result, Mapping):
+                    raise ValueError("PLAN_AI_REVIEW_SNAPSHOT_INVALID")
+                ai_review_snapshot = dict(review_result)
+                if (
+                    ai_review_snapshot.get("review_id") != version.ai_review_ref
+                    or ai_review_snapshot.get("status") != "APPROVED"
+                    or ai_review_snapshot.get("decision") != "APPROVE"
+                    or ai_review_snapshot.get("draft_content_digest") is None
+                ):
+                    raise ValueError("PLAN_AI_REVIEW_NOT_APPROVED")
         live_profit_qualification_snapshot: dict[str, Any] | None = None
         if (
             environment_kind is EnvironmentKind.LIVE
@@ -1378,6 +1454,85 @@ class PlanningApplicationService:
                 expected_version=activation.state_version,
             )
         return consumed, event
+
+    def _require_scalp_cycle_binding(
+        self,
+        value: TradePlanContent | TradePlanVersion,
+        cycle: ScalpCycleRecord | None,
+    ) -> None:
+        if cycle is None:
+            if value.terms.get("workflow_kind") == SCALP_WORKFLOW_KIND:
+                raise ValueError("SCALP_CYCLE_INTERNAL_COMMAND_REQUIRED")
+            return
+        if (
+            not is_internal_scalp_cycle(value)
+            or cycle.environment_id != self._environment_id
+            or value.environment_id != cycle.environment_id
+            or value.account_ref != cycle.account_ref
+            or value.instrument_ref != cycle.instrument_ref
+            or value.direction is not cycle.direction
+            or value.created_at != cycle.triggered_at
+            or cycle.template_digest != cycle.template.digest
+            or value.terms.get("scalp_template_digest") != cycle.template_digest
+        ):
+            raise ValueError("SCALP_CYCLE_IDENTITY_MISMATCH")
+
+    def create_scalp_cycle(
+        self,
+        *,
+        cycle: ScalpCycleRecord,
+        content: TradePlanContent,
+        environment_kind: EnvironmentKind,
+        authority_class: AuthorityClass,
+        product_build_id: str,
+        order_schedule_snapshot: OrderSchedulePreview,
+        live_profit_qualification_checker: (
+            Callable[[TradePlanVersion], Mapping[str, Any]] | None
+        ),
+        new_risk_discipline_policy: NewRiskDisciplinePolicy,
+    ) -> tuple[TradePlanVersion, PlanActivation]:
+        """Create the server-built cycle and its only activation in one transaction.
+
+        Only the dedicated scalping command calls this entry point. The ordinary
+        plan methods cannot accept a cycle identity or request the review exemption.
+        The caller owns the transaction and has resolved request idempotency.
+        """
+
+        self._require_scalp_cycle_binding(content, cycle)
+        repository = PostgreSQLScalpRepository(self._connection, self._environment_id)
+        repository.lock_open_cycle_scope(account_ref=cycle.account_ref)
+        if repository.has_open_cycle(account_ref=cycle.account_ref):
+            raise ValueError("SCALP_CYCLE_ALREADY_OPEN")
+        self.create_draft(
+            plan_id=cycle.plan_id,
+            content=content,
+            observed_at=cycle.triggered_at,
+        )
+        version = self._build_activation_snapshot(
+            plan_id=cycle.plan_id,
+            expected_draft_version=1,
+            plan_version_id=cycle.plan_version_id,
+            product_build_id=product_build_id,
+            snapshot_at=cycle.triggered_at,
+            ai_review_ref=None,
+            new_risk_discipline_policy=new_risk_discipline_policy,
+            scalp_cycle=cycle,
+        )
+        self._planning.insert_version(version)
+        activation = self._activate_version(
+            plan_version_id=cycle.plan_version_id,
+            activation_id=cycle.activation_id,
+            environment_kind=environment_kind,
+            authority_class=authority_class,
+            observed_at=cycle.triggered_at,
+            order_schedule_snapshot=order_schedule_snapshot,
+            new_risk_discipline_policy=new_risk_discipline_policy,
+            live_profit_qualification_checker=live_profit_qualification_checker,
+            ai_review_checker=None,
+            scalp_cycle=cycle,
+        )
+        repository.insert(cycle)
+        return version, activation
 
     def fix_and_activate(
         self,

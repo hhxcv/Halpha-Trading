@@ -9,8 +9,20 @@ from uuid import uuid4
 import keyring
 import psycopg
 
+from halpha.app.plan_ai_review import (
+    PlanAiReviewConfiguration,
+    PlanAiReviewDecision,
+    PlanAiReviewResult,
+    PostgreSQLPlanAiReviewStore,
+)
 from halpha.capital.models import AuthorityClass, EnvironmentKind
-from halpha.planning.models import RequestedLimits, TradePlanContent
+from halpha.planning.models import (
+    PlanDecisionContext,
+    PlanDecisionIntent,
+    PlanSetupFamily,
+    RequestedLimits,
+    TradePlanContent,
+)
 from halpha.planning.registry import (
     ONE_SHOT_STRATEGY_ID,
     DecisionBasisKind,
@@ -88,6 +100,15 @@ def plan_content(
 ) -> TradePlanContent:
     strategy = describe_strategy(ONE_SHOT_STRATEGY_ID)
     return TradePlanContent(
+        decision_context=PlanDecisionContext(
+            rationale="Validate the bounded workbench fixture plan.",
+            evidence="Deterministic fixture market and venue facts.",
+            limitations="Future price, fill and funding remain uncertain.",
+            intent=PlanDecisionIntent.VALIDATION,
+            setup_family=PlanSetupFamily.BREAKOUT_CONTINUATION,
+            invalidation="Do not enter after the fixed fixture boundary.",
+            evidence_cutoff=now,
+        ),
         decision_basis=DraftDecisionBasis(
             kind=DecisionBasisKind.STRATEGY_SIGNAL,
             decision_basis_ref=strategy.strategy_id,
@@ -128,7 +149,7 @@ def create_and_activate(
         "activation_id": str(uuid4()),
     }
     service = PlanningApplicationService(connection, environment_id)
-    service.create_draft(
+    draft = service.create_draft(
         plan_id=ids["plan_id"],
         content=plan_content(
             environment_id=environment_id,
@@ -136,6 +157,31 @@ def create_and_activate(
             instrument_ref=instrument_ref,
             now=now,
             limits=limits,
+        ),
+        observed_at=now,
+    )
+    review_id = str(uuid4())
+    review_store = PostgreSQLPlanAiReviewStore(connection, environment_id)
+    review_store.create_queued(
+        review_id=review_id,
+        plan_id=ids["plan_id"],
+        draft_version=draft.draft_version,
+        draft_content_digest=draft.content_digest,
+        configuration=PlanAiReviewConfiguration(),
+        idempotency_key=f"fixture-ai-review:{review_id}",
+        observed_at=now,
+    )
+    review_store.mark_running(
+        review_id,
+        market_context_digest="b" * 64,
+        market_source_cutoff=now,
+        observed_at=now,
+    )
+    review = review_store.complete(
+        review_id,
+        result=PlanAiReviewResult(
+            decision=PlanAiReviewDecision.APPROVE,
+            reason="Deterministic workbench fixture approval.",
         ),
         observed_at=now,
     )
@@ -148,6 +194,13 @@ def create_and_activate(
         authority_class=AuthorityClass.DEMO_VALIDATION,
         product_build_id="a" * 64,
         observed_at=now,
+        ai_review_ref=review.review_id,
+        ai_review_checker=lambda _version: {
+            "review_id": review.review_id,
+            "status": review.status.value,
+            "decision": review.decision.value if review.decision is not None else None,
+            "draft_content_digest": review.draft_content_digest,
+        },
     )
     return ids
 
@@ -160,6 +213,7 @@ def cleanup_app(connection: psycopg.Connection[Any], environment_id: str) -> Non
         "plan_activation",
         "command",
         "trade_plan_version",
+        "plan_ai_review",
         "trade_plan_draft",
     ):
         connection.execute(

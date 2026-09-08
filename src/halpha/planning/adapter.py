@@ -153,6 +153,7 @@ class HalphaStrategyAdapter(Strategy):
         state_provider: Callable[[], ActivationStrategyState] | None = None,
         proposal_sink: ProposalSink | None = None,
         instrument_ref: str | None = None,
+        market_data_required: bool = True,
         persisted_action_capability: object | None = None,
         execution_event_sink: ExecutionEventSink | None = None,
         bar_evaluator: BarEvaluatorPort | None = None,
@@ -180,6 +181,7 @@ class HalphaStrategyAdapter(Strategy):
             if instrument_ref is not None
             else None
         )
+        self._market_data_required = market_data_required
         self._persisted_action_capability = persisted_action_capability
         self._execution_event_sink = execution_event_sink
         self._bar_evaluator = bar_evaluator
@@ -193,6 +195,7 @@ class HalphaStrategyAdapter(Strategy):
         self._history_cache_provider = history_cache_provider
         self._history_request_id: str | None = None
         self._live_bar_subscriptions_started = False
+        self._quote_ticks_subscribed = False
         self._stopping = False
         self._persisted_orders: dict[str, Any] = {}
 
@@ -212,6 +215,17 @@ class HalphaStrategyAdapter(Strategy):
             and self._live_bar_subscriptions_started
         )
 
+    @property
+    def market_data_instrument_id(self) -> InstrumentId | None:
+        """Return the instrument only when this responsibility consumes its feeds."""
+
+        if (
+            self._instrument_id is None
+            or not self._market_data_required
+        ):
+            return None
+        return self._instrument_id
+
     def evaluate_normalized_entry(self, evaluation: EntryEvaluationInput) -> None:
         if (
             self._logic is None
@@ -228,9 +242,10 @@ class HalphaStrategyAdapter(Strategy):
             for bar_type in self._bar_evaluator.subscribed_bar_types:
                 self.subscribe_bars(bar_type)
             self._live_bar_subscriptions_started = True
-        if self._instrument_id is not None:
+        if self._instrument_id is not None and self._market_data_required:
             self.subscribe_mark_prices(self._instrument_id)
             self.subscribe_quote_ticks(self._instrument_id)
+            self._quote_ticks_subscribed = True
         if self._bar_evaluator is not None and self._live_history_warmup:
             try:
                 if self._try_live_history_cache_warmup():
@@ -326,10 +341,11 @@ class HalphaStrategyAdapter(Strategy):
         if self._bar_evaluator is not None and self._live_bar_subscriptions_started:
             for bar_type in reversed(self._bar_evaluator.subscribed_bar_types):
                 self.unsubscribe_bars(bar_type)
-        if self._instrument_id is not None:
+        if self._instrument_id is not None and self._quote_ticks_subscribed:
             self.unsubscribe_quote_ticks(self._instrument_id)
-            # The fixed Binance client has no mark-price unsubscribe coroutine.
-            # The single node disconnect owns teardown of that stream.
+            self._quote_ticks_subscribed = False
+        # The fixed Binance data client does not implement mark-price
+        # unsubscription. The single node disconnect owns that stream teardown.
         self._persisted_orders.clear()
 
     def on_bar(self, bar: object) -> None:

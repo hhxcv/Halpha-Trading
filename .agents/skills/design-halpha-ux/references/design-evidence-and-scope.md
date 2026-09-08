@@ -17,13 +17,13 @@ Use the current documents and plan; do not hard-code an older Git revision from 
 
 ## Page Need Check
 
-Create a page or major surface only when these short answers justify it:
+For a new page or major surface, establish the user job, its authoritative facts/actions and why the chosen carrier fits. Use the relevant questions below to resolve uncertainty; a field-by-field record is optional.
 
-| Field | Required evidence |
+| Concern | Useful context |
 |---|---|
 | Proposed route or surface | Stable name; route only if navigation or deep-link identity is needed |
 | Current semantic owner | Exact L2/L3 owner and relevant clause |
-| Current use | L4 objective and implementation status that actually consume it |
+| Current use | Authorized task and relevant current scope; keep implementation status separate from the proposed result |
 | Professional user job | Time-sensitive decision or repeated expert task it enables |
 | Authoritative information | Facts, plan, action or domain result shown |
 | Entry and exit | How the owner reaches, resumes, completes, or abandons it |
@@ -32,7 +32,7 @@ Create a page or major surface only when these short answers justify it:
 | Minimal carrier | Dedicated route, existing page region, drawer, dialog, popover, disclosure, or no UI |
 | Minimality | Why an existing surface or smaller carrier cannot meet the job |
 
-Fail the gate when the surface is justified only by convention, a framework route, competitor imitation, visual balance, or implementation convenience.
+Convention, framework routing, competitor imitation or visual balance alone do not justify a new surface. An explicitly requested user job can justify a design even when an older L4 focus has not recorded it.
 
 ## Capability Does Not Imply Visual Expansion
 
@@ -52,7 +52,7 @@ For each proposed element, ask:
 4. Does it introduce another state, component family, dependency, route, or concept to maintain?
 5. Is its lifecycle cost offset by decision value or risk reduction?
 
-Remove elements that fail questions 1 and 2. Prefer merging or disclosure when question 3 is yes. Challenge additions with high costs under questions 4 and 5.
+Keep necessary recovery controls even when rarely used. Prefer merging or disclosure when an existing surface preserves critical meaning; remove additions whose lifecycle cost exceeds current decision value or risk reduction. These questions inform judgment rather than establish a scoring gate.
 
 Minimalism means:
 
@@ -73,4 +73,4 @@ It does not mean:
 
 ## Design Gap Rule
 
-If page inclusion, risk behavior, state ownership, or limited-operation access cannot be derived from current documents, do not settle it through visual design. Isolate the affected slice, describe the missing decision, and route formal changes through `write-halpha-docs` when authorized.
+Choose page layout and carriers within the authorized user job and existing product meaning. When a new risk behavior, ownership or access rule is needed, update its semantic owner through `write-halpha-docs` within the task's authorization. Ask only for a material decision still missing from current design and user instructions; continue independent work while it is unresolved.

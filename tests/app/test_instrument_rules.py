@@ -151,6 +151,72 @@ def test_public_instrument_rules_are_limit_rules_and_short_lived_cached() -> Non
     assert api.calls == 1
 
 
+def test_contract_catalog_contains_every_active_usdt_perpetual_and_is_cached() -> None:
+    class CatalogApi:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def query_futures_exchange_info(self) -> object:
+            self.calls += 1
+            return {
+                "serverTime": 1_800_000_100_000,
+                "symbols": [
+                    {
+                        "symbol": "ETHUSDT",
+                        "baseAsset": "ETH",
+                        "quoteAsset": "USDT",
+                        "status": "TRADING",
+                        "contractType": "PERPETUAL",
+                    },
+                    {
+                        "symbol": "BTCUSDT",
+                        "baseAsset": "BTC",
+                        "quoteAsset": "USDT",
+                        "status": "TRADING",
+                        "contractType": "PERPETUAL",
+                    },
+                    {
+                        "symbol": "BTCUSDC",
+                        "baseAsset": "BTC",
+                        "quoteAsset": "USDC",
+                        "status": "TRADING",
+                        "contractType": "PERPETUAL",
+                    },
+                    {
+                        "symbol": "XRPUSDT_260925",
+                        "baseAsset": "XRP",
+                        "quoteAsset": "USDT",
+                        "status": "TRADING",
+                        "contractType": "CURRENT_QUARTER",
+                    },
+                    {
+                        "symbol": "OLDUSDT",
+                        "baseAsset": "OLD",
+                        "quoteAsset": "USDT",
+                        "status": "SETTLING",
+                        "contractType": "PERPETUAL",
+                    },
+                ],
+            }
+
+    api = CatalogApi()
+    provider = BinancePublicInstrumentRules("BINANCE_LIVE_READ_ONLY", market_api=api)
+
+    async def exercise():
+        return await provider.list_contracts(), await provider.list_contracts()
+
+    first, second = asyncio.run(exercise())
+
+    assert first == second
+    assert first.source == "BINANCE_LIVE_EXCHANGE_INFO"
+    assert [item.instrument_ref for item in first.contracts] == [
+        "BTCUSDT-PERP",
+        "ETHUSDT-PERP",
+    ]
+    assert first.contracts[0].base_asset == "BTC"
+    assert api.calls == 1
+
+
 def test_public_instrument_rules_reject_unknown_instrument_shape() -> None:
     provider = BinancePublicInstrumentRules(
         "BINANCE_DEMO",

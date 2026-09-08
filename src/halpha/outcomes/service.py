@@ -198,6 +198,12 @@ class OutcomeApplicationService:
     def list_reviews(self) -> list[dict[str, Any]]:
         return [item.model_dump(mode="json") for item in self._repository.list_reviews()]
 
+    def list_evidence_reviews(self) -> list[dict[str, Any]]:
+        return [
+            item.model_dump(mode="json")
+            for item in self._repository.list_evidence_reviews()
+        ]
+
     def create_stage_review(
         self,
         *,

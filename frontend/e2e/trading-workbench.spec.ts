@@ -176,7 +176,7 @@ test("the workbench preserves the available protection, exit, takeover, closure 
   await expect(page.getByRole("table", { name: "交易与复盘记录" })).toBeVisible();
   await page.getByRole("tab", { name: /全部记录/ }).click();
   await expect(page.getByText("账户累计手续费", { exact: true }).locator(".."))
-    .toContainText("0.0604 USDT");
+    .toContainText("-0.06 USDT");
   await expect(page.getByText("已完成交易", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("待评价").first()).toBeVisible();
   await page.getByRole("table", { name: "交易与复盘记录" }).locator("tbody tr").first().click();
@@ -454,32 +454,78 @@ test("unknown activation creation retries with the original request identity", a
   await assertAccessible(page, testInfo, "activation-idempotent-retry");
 });
 
-test("the workbench rejects a stale control submission instead of applying a newer activation version", async ({ page, context }, testInfo) => {
+test("the workbench rejects a stale control submission instead of applying a newer activation version", async ({ page, context, browser }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium-desktop", "One state-changing stale-version drill is sufficient.");
   await page.goto("/overview");
   const items = await activations(page);
   const staleControl = items.find((item) => item.instrument_ref === "XRPUSDT-PERP" && item.lifecycle === "RUNNING");
   test.skip(!staleControl, "This stale-version drill needs the seeded running XRP activation.");
 
-  const stalePage = await context.newPage();
-  await Promise.all([
-    page.goto(`/activations/${staleControl!.activation_id}`),
-    stalePage.goto(`/activations/${staleControl!.activation_id}`),
-  ]);
-  await expect(page.getByText("XRPUSDT-PERP / 做多", { exact: true })).toBeVisible();
-  await expect(stalePage.getByText("XRPUSDT-PERP / 做多", { exact: true })).toBeVisible();
-  await stalePage.route(
-    new RegExp(`/api/v1/activations/${staleControl!.activation_id}$`),
-    (route) => route.abort(),
-  );
+  const activationPath = `/api/v1/activations/${staleControl!.activation_id}`;
+  const initialResponse = await context.request.get(activationPath);
+  expect(initialResponse.ok()).toBeTruthy();
+  const frozenDetail = await initialResponse.json() as { activation: { state_version: number } };
+  const initialVersion = frozenDetail.activation.state_version;
 
-  await page.getByRole("button", { name: "退出策略" }).click();
-  await page.getByRole("button", { name: "确认退出策略" }).click();
-  await expect(page.getByRole("alert").filter({ hasText: "命令已生效，当前执行责任已经核对" })).toBeVisible();
+  // A separate browser context isolates the stale client from query-cache
+  // broadcasts. Replay its actual initial read while both control requests
+  // continue to use the fixture service and its current version checks.
+  const staleContext = await browser.newContext({
+    baseURL: new URL(page.url()).origin,
+    storageState: await context.storageState(),
+    viewport: page.viewportSize(),
+  });
+  try {
+    await staleContext.route(new RegExp(`${activationPath}$`), (route) => (
+      route.fulfill({ json: frozenDetail })
+    ));
+    const stalePage = await staleContext.newPage();
+    await Promise.all([
+      page.goto(`/activations/${staleControl!.activation_id}`),
+      stalePage.goto(`/activations/${staleControl!.activation_id}`),
+    ]);
+    await expect(page.getByText("XRPUSDT-PERP / 做多", { exact: true })).toBeVisible();
+    await expect(stalePage.getByText("XRPUSDT-PERP / 做多", { exact: true })).toBeVisible();
+    const [previewResponse] = await Promise.all([
+      stalePage.waitForResponse((response) => (
+        new URL(response.url()).pathname === `${activationPath}/control-preview`
+        && response.request().method() === "POST"
+      )),
+      stalePage.getByRole("button", { name: /^用户接管；/ }).click(),
+    ]);
+    expect(previewResponse.ok()).toBeTruthy();
+    const preview = await previewResponse.json() as { activation: { state_version: number } };
+    expect(preview.activation.state_version).toBe(initialVersion);
+    await expect(stalePage.getByRole("button", { name: "确认用户接管" })).toBeVisible();
 
-  await stalePage.getByRole("button", { name: "用户接管" }).click();
-  await stalePage.getByRole("button", { name: "确认用户接管" }).click();
-  await expect(stalePage.getByRole("alert").filter({ hasText: "PLAN_VERSION_CONFLICT" })).toBeVisible();
-  await assertAccessible(stalePage, testInfo, "trading-stale-control-rejected");
-  await stalePage.close();
+    await page.getByRole("button", { name: "退出策略" }).click();
+    await page.getByRole("button", { name: "确认退出策略" }).click();
+    await expect(page.getByRole("alert").filter({ hasText: "命令已生效，当前执行责任已经核对" })).toBeVisible();
+    const afterExit = await (await context.request.get(activationPath)).json() as {
+      activation: { state_version: number; lifecycle: string };
+    };
+    expect(afterExit.activation.state_version).toBeGreaterThan(initialVersion);
+
+    const [rejection] = await Promise.all([
+      stalePage.waitForResponse((response) => (
+        new URL(response.url()).pathname === `${activationPath}/takeover`
+        && response.request().method() === "POST"
+      )),
+      stalePage.getByRole("button", { name: "确认用户接管" }).click(),
+    ]);
+    expect(rejection.request().postDataJSON().expected_version).toBe(initialVersion);
+    expect(await rejection.json()).toMatchObject({
+      state: "REJECTED", reason_code: "PLAN_VERSION_CONFLICT",
+    });
+    await expect(stalePage.getByRole("alert").filter({ hasText: "PLAN_VERSION_CONFLICT" })).toBeVisible();
+    const afterRejection = await (await context.request.get(activationPath)).json() as {
+      activation: { state_version: number; lifecycle: string };
+    };
+    expect(afterRejection.activation.state_version).toBe(afterExit.activation.state_version);
+    expect(afterRejection.activation.lifecycle).toBe(afterExit.activation.lifecycle);
+    expect(afterRejection.activation.lifecycle).not.toBe("USER_TAKEOVER");
+    await assertAccessible(stalePage, testInfo, "trading-stale-control-rejected");
+  } finally {
+    await staleContext.close();
+  }
 });

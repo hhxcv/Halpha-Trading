@@ -486,13 +486,16 @@ class HalphaCoordinator:
                 authority_class != "LIVE_REAL_CAPITAL"
                 or execution_profile_ref != "BINANCE_LIVE_WRITE"
                 or runtime_real_write_gate not in {"CLOSED", "OPEN"}
-                or not live_write_activation_ids
                 or live_write_submission_guard is None
                 or (
                     runtime_real_write_gate == "CLOSED"
                     and not live_write_risk_control_only
                 )
                 or (runtime_real_write_gate == "OPEN" and live_write_risk_control_only)
+                or (
+                    live_write_risk_control_only
+                    and not live_write_activation_ids
+                )
             ):
                 raise ValueError("EXECUTION_PROFILE_MISMATCH")
         else:
@@ -552,6 +555,21 @@ class HalphaCoordinator:
 
     def get_activation_snapshot(self, activation_id: str) -> PlanActivation:
         return self._planning.get_activation(activation_id)
+
+    def authorize_live_write_activation(self, activation_id: str) -> None:
+        """Admit one newly discovered Live activation after a current gate check."""
+
+        if (
+            self._environment_kind != "LIVE"
+            or self._runtime_real_write_gate != "OPEN"
+            or self._live_write_risk_control_only
+            or not activation_id
+        ):
+            raise RuntimeError("RUNTIME_REAL_WRITE_GATE_CLOSED")
+        self._require_current_live_write_gate(activation_id)
+        self._live_write_activation_ids = frozenset(
+            (*self._live_write_activation_ids, activation_id)
+        )
 
     def record_runtime_condition_state(
         self,

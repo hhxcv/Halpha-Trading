@@ -147,28 +147,37 @@ async function goToEntryMilestone(page: Page) {
 }
 
 async function goToProtectionMilestone(page: Page) {
-  await goToEntryMilestone(page);
-  await page.getByRole("button", { name: "下一步", exact: true }).click();
+  await page.getByRole("navigation", { name: "计划创建步骤" })
+    .getByRole("button", { name: /保护$/ }).click();
   await expect(page.getByRole("heading", { name: "成交后立即保护", exact: true }))
     .toBeVisible();
 }
 
 async function goToExitMilestone(page: Page) {
-  await goToProtectionMilestone(page);
-  await page.getByRole("button", { name: "下一步", exact: true }).click();
+  await page.getByRole("navigation", { name: "计划创建步骤" })
+    .getByRole("button", { name: /退出$/ }).click();
   await expect(page.getByRole("heading", { name: "自动退出", exact: true }))
     .toBeVisible();
 }
 
 async function goToReviewMilestone(page: Page) {
-  await goToExitMilestone(page);
-  await page.getByRole("button", { name: "下一步", exact: true }).click();
+  await page.getByRole("navigation", { name: "计划创建步骤" })
+    .getByRole("button", { name: /核对$/ }).click();
   await expect(page.getByRole("heading", { name: "计划概要", exact: true }))
     .toBeVisible();
 }
 
+async function expectSubmitProblem(page: Page, message: string) {
+  const submit = page.getByRole("button", { name: "提交并启动", exact: true });
+  await expect(submit).toBeDisabled();
+  await submit.locator("..").hover();
+  await expect(page.getByRole("tooltip")).toContainText(message);
+  await page.mouse.move(8, 8);
+  await expect(page.getByRole("tooltip")).toBeHidden();
+}
+
 async function revealPlanOptions(page: Page) {
-  await goToReviewMilestone(page);
+  await goToEntryMilestone(page);
   await expect(page.getByLabel("计划名称")).toBeVisible();
 }
 
@@ -238,7 +247,7 @@ async function selectToggle(
 ) {
   await goToEntryMilestone(page);
   const toggle = name === "区间阶梯"
-    ? page.getByRole("radio", { name: "价格区间分批 多个价格档依次入场" })
+    ? page.getByRole("radio", { name: "价格阶梯入场" })
     : page.getByRole("button", { name, exact: true });
   await expect(toggle).toBeVisible();
   const stateAttribute = name === "区间阶梯" ? "aria-checked" : "aria-pressed";
@@ -497,90 +506,72 @@ async function assertNoPageOverflow(page: Page, testInfo: TestInfo, name: string
   expect(layout.scrollWidth).toBe(layout.clientWidth);
 }
 
-test("direct plan creation enforces entry, protection, automatic exit, and review milestones", async ({ page }, testInfo) => {
+test("direct plan creation keeps five tabs available while enforcing protection and price exit at submission", async ({ page }, testInfo) => {
   test.setTimeout(120_000);
-  await page.goto("/plans/new?mode=direct");
+  await page.goto("/plans/new?mode=direct&creator_kind=AI");
   await expect(page.getByRole("heading", { name: "直接执行", exact: true }))
     .toBeVisible({ timeout: 30_000 });
-  const chart = page.getByRole("group", {
-    name: /订单计划 .* K 线主图/,
-  });
+  const chart = page.getByRole("group", { name: /订单计划 .* K 线主图/ });
   await expect(chart).toBeVisible();
-  await expect(page.getByRole("navigation", { name: "计划创建步骤" }))
-    .toBeVisible();
+  const navigation = page.getByRole("navigation", { name: "计划创建步骤" });
+  await expect(navigation.getByRole("button")).toHaveCount(5);
+  for (const label of ["入场", "保护", "退出", "核对", "AI审核"]) {
+    await expect(navigation.getByRole("button", { name: new RegExp(`${label}$`) })).toBeEnabled();
+  }
+  await expect(page.getByRole("heading", { name: "计划基础信息", exact: true })).toBeVisible();
 
-  await expect(page.getByRole("radio", {
-    name: "一次性入场 条件满足后提交一笔",
-  })).toBeChecked();
-  await page.getByRole("radio", {
-    name: "价格区间分批 多个价格档依次入场",
-  }).click();
+  await expect(page.getByRole("radio", { name: "一次性入场", exact: true })).toBeChecked();
+  await page.getByRole("radio", { name: "价格阶梯入场", exact: true }).click();
   await expect(page.getByLabel("价格档位数")).toHaveValue("5");
-  await expect(page.getByRole("button", { name: "市价", exact: true }))
-    .toBeDisabled();
+  await expect(page.getByRole("button", { name: "市价", exact: true })).toBeDisabled();
   await expect(chart).toBeVisible();
 
-  await page.getByRole("radio", {
-    name: "时间分批 按固定时间间隔释放",
-  }).click();
+  await page.getByRole("radio", { name: "时间分批", exact: true }).click();
   await expect(page.getByLabel("分批数量")).toHaveValue("4");
   await expect(page.getByRole("button", { name: "市价", exact: true }))
     .toHaveAttribute("aria-pressed", "true");
-  await expect(page.getByRole("switch", { name: "Maker only" }))
-    .toBeDisabled();
+  await expect(page.getByRole("switch", { name: "Maker only" })).toHaveCount(0);
   await page.getByRole("button", { name: "限价", exact: true }).click();
   await revealAdvancedVenueSettings(page);
   await page.getByRole("combobox", { name: "有效方式" }).click();
-  await expect(page.getByRole("option", { name: "GTC · 持续有效" }))
-    .toHaveCount(0);
-  await expect(page.getByRole("option", { name: "GTD · 指定到期" }))
-    .toHaveCount(0);
+  await expect(page.getByRole("option", { name: "GTC · 持续有效" })).toHaveCount(0);
+  await expect(page.getByRole("option", { name: "GTD · 指定到期" })).toHaveCount(0);
   await page.getByRole("option", { name: "FOK · 全成或全撤" }).click();
-  await expect(page.getByRole("switch", { name: "Maker only" }))
-    .toBeDisabled();
-  await expect(page.getByRole("button", { name: "下一步", exact: true }))
-    .toBeEnabled();
+  await expect(page.getByRole("switch", { name: "Maker only" })).toHaveCount(0);
 
-  await page.getByRole("radio", {
-    name: "事件触发入场 价格或短时异动触发",
-  }).click();
-  await expect(page.getByRole("heading", { name: "入场前置条件", exact: true }))
-    .toBeVisible();
+  await page.getByRole("radio", { name: "事件触发入场", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "入场前置条件", exact: true })).toBeVisible();
   await expect(page.getByLabel("观察窗口（秒）")).toHaveValue("30");
   await expect(page.getByLabel("变动阈值（bps）")).toHaveValue("30");
-
-  await page.getByRole("radio", {
-    name: "一次性入场 条件满足后提交一笔",
-  }).click();
-  await page.getByRole("button", { name: "下一步", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "成交后立即保护", exact: true }))
-    .toBeVisible();
+  await page.getByRole("radio", { name: "一次性入场", exact: true }).click();
+  await goToProtectionMilestone(page);
   await page.getByLabel("初始止损距离（bps）").fill("0");
-  await expect(page.getByRole("button", { name: "下一步", exact: true }))
-    .toBeDisabled();
+  await expectSubmitProblem(page, "初始止损距离必须大于 0 且低于 10000 bps。");
+  await expect(navigation.getByRole("button", { name: /退出$/ })).toBeEnabled();
   await page.getByLabel("初始止损距离（bps）").fill("100");
-  await expect(page.getByRole("button", { name: "下一步", exact: true }))
-    .toBeEnabled();
 
-  await page.getByRole("button", { name: "下一步", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "自动退出", exact: true }))
-    .toBeVisible();
+  await goToExitMilestone(page);
   await page.getByRole("button", { name: "移除分级止盈" }).click();
-  await expect(page.getByRole("button", { name: "下一步", exact: true }))
-    .toBeDisabled();
+  await goToReviewMilestone(page);
+  await choose(page, "本次目的", "盈利导向交易");
+  await choose(page, "交易形态", "突破延续");
+  await page.getByRole("textbox", { name: "交易理由" })
+    .fill("闭合价格确认突破后入场，失效边界与初始止损控制风险，价格目标覆盖本次交易风险。");
+  await expectSubmitProblem(page, "价格退出的计划加权收益 / 风险必须达到");
   await addTimeExit(page);
-  await expect(page.getByLabel("首笔成交后整组退出（秒）"))
-    .toHaveValue("86400");
+  await expect(page.getByLabel("首笔成交后整组退出（秒）")).toHaveValue("86400");
+  await goToReviewMilestone(page);
+  await expectSubmitProblem(page, "时间退出不能替代该新增风险纪律");
 
-  await page.getByRole("button", { name: "下一步", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "计划信息", exact: true }))
-    .toBeVisible();
-  await expect(page.getByRole("heading", { name: "计划概要", exact: true }))
-    .toBeVisible();
-  await expect(page.getByText("首笔成交后 86400 秒发起整组退出", { exact: true }))
-    .toBeVisible();
-  await expect(page.getByText(/^技术预览可保存 · 1 档/))
-    .toBeVisible({ timeout: 30_000 });
+  await goToExitMilestone(page);
+  await page.getByRole("button", { name: "＋ 添加退出方式" }).click();
+  await page.getByRole("button", { name: "固定 / 分级止盈 · 1–4 个价格目标", exact: true }).click();
+  await goToReviewMilestone(page);
+  const summary = page.getByRole("region", { name: "计划概要", exact: true });
+  await expect(summary).toContainText("首笔成交后 86400 秒发起整组退出");
+  await expect(summary).toContainText("TP1 1R / 50% · TP2 2R / 50%");
+  await expect(page.getByText(/^技术预览可保存 · 1 档/)).toBeVisible({ timeout: 30_000 });
+  await expectSubmitProblem(page, "完成当前草稿的 AI 审核并获得批准。");
   await expect(chart).toBeVisible();
   await assertNoPageOverflow(page, testInfo, "direct-plan-milestones");
 });
@@ -681,7 +672,7 @@ test("direct order schedules preview a composed ladder and complete a protected 
 
     await goToEntryMilestone(page);
     await page.getByRole("radio", {
-      name: "一次性入场 条件满足后提交一笔",
+      name: "一次性入场",
     }).click();
     await selectToggle(page, "市价");
     await page.getByLabel("资金上限（USDT）").fill("500");
