@@ -558,9 +558,12 @@ def build_binance_client_configs(
     if not read_only and (api_key is None or api_secret is None):
         raise ExecutorRuntimeError("BINANCE_CREDENTIAL_REQUIRED")
     provider = BinanceInstrumentProviderConfig(
-        load_all=False,
+        # The workbench can activate any currently listed USDT perpetual.
+        # Keep the small configured set as the reconciliation warm baseline,
+        # while Nautilus loads the full venue catalog for dynamic activations.
+        load_all=True,
         load_ids=instrument_ids,
-        query_commission_rates=not read_only,
+        query_commission_rates=False,
     )
     # The read-only data client remains public even when the separate account
     # observer has private credentials. This prevents an authenticated client
@@ -1240,8 +1243,11 @@ class ProductExecutorRuntime:
             )
             if (
                 not (full_write or risk_control_only)
-                or not self._live_write_activation_ids
                 or self._live_write_submission_guard is None
+                or (
+                    risk_control_only
+                    and not self._live_write_activation_ids
+                )
             ):
                 raise ExecutorRuntimeError("RUNTIME_REAL_WRITE_GATE_CLOSED")
         database_password = self._database_password
@@ -1879,6 +1885,7 @@ class ProductExecutorRuntime:
                 factory=lambda: HalphaStrategyAdapter(
                     activation_id=activation_id,
                     instrument_ref=instrument_ref,
+                    market_data_required=False,
                     persisted_action_capability=capability,
                     execution_event_sink=self._guard_component_sink(
                         "position_alignment_execution_event_processing_failed",
@@ -1964,70 +1971,31 @@ class ProductExecutorRuntime:
             instrument_ref=instrument_ref,
         )
 
-    def _start_market_fact_streams(self) -> None:
-        """Keep one framework-owned quote/mark stream warm per product instrument."""
+    def _release_unused_closed_bar_fact_streams(self) -> None:
+        """Stop shared closed-bar feeds after their last direct duty closes."""
 
         lifecycle = getattr(self, "_market_fact_lifecycle", None)
         if lifecycle is None:
-            raise ExecutorRuntimeError("PRODUCT_RUNTIME_NOT_BUILT")
-        profile = self._settings.release.profile
-        if profile == "BINANCE_LIVE_READ_ONLY":
             return
-        try:
-            instrument_ids = _PROFILE_SPEC[profile][1]
-        except KeyError:
-            raise ExecutorRuntimeError("PRODUCT_PROFILE_UNSUPPORTED") from None
-        for instrument_id in instrument_ids:
-            instrument_ref = instrument_id.removesuffix(".BINANCE")
-            tracker = self._market_fact_trackers.setdefault(
-                instrument_ref,
-                LiveEntryFactTracker(instrument_ref),
+        active_instruments = set(
+            getattr(self, "_direct_schedule_instruments", {}).values()
+        )
+        prefix = "closed-bar-facts:"
+        for stream_id in tuple(lifecycle.activation_ids):
+            if not stream_id.startswith(prefix):
+                continue
+            instrument_ref = stream_id.removeprefix(prefix)
+            if instrument_ref in active_instruments:
+                continue
+            lifecycle.stop_and_remove(stream_id)
+            getattr(self, "_market_fact_trackers", {}).pop(instrument_ref, None)
+            getattr(self, "_market_mark_event_at", {}).pop(
+                _binance_mark_price_stream_name(instrument_ref),
+                None,
             )
-            tracker.configure_closed_bar_15m(instrument_ref)
-
-            def quote_sink(
-                tick: object,
-                *,
-                used_tracker: LiveEntryFactTracker = tracker,
-                used_instrument_ref: str = instrument_ref,
-            ) -> None:
-                used_tracker.record_quote(tick)
-                instruments = getattr(self, "_direct_schedule_instruments", {})
-                for activation_id, processor in tuple(
-                    getattr(self, "_direct_schedule_processors", {}).items()
-                ):
-                    if instruments.get(activation_id) == used_instrument_ref:
-                        processor.resume(activation_id)
-
-            def mark_price_sink(
-                update: object,
-                *,
-                used_tracker: LiveEntryFactTracker = tracker,
-                used_instrument_ref: str = instrument_ref,
-            ) -> None:
-                used_tracker.record_mark(update)
-                self._record_market_mark_event(used_instrument_ref)
-
-            lifecycle.start(
-                ActivationAdapterSpec(
-                    activation_id=f"market-facts:{instrument_ref}",
-                    factory=lambda instrument_ref=instrument_ref,
-                    tracker=tracker,
-                    quote_sink=quote_sink: HalphaStrategyAdapter(
-                        activation_id=f"market-facts:{instrument_ref}",
-                        instrument_ref=instrument_ref,
-                        quote_event_sink=self._guard_component_sink(
-                            "market_fact_quote_processing_failed",
-                            f"market-facts:{instrument_ref}",
-                            quote_sink,
-                        ),
-                        mark_price_event_sink=self._guard_component_sink(
-                            "market_fact_mark_price_processing_failed",
-                            f"market-facts:{instrument_ref}",
-                            mark_price_sink,
-                        ),
-                    ),
-                )
+            self._record_runtime_event(
+                "direct_condition_bar_stream_released",
+                instrument_ref=instrument_ref,
             )
 
     def _restore_paused_adapters(self, capability: object) -> None:
@@ -2079,14 +2047,7 @@ class ProductExecutorRuntime:
                         observed_at=observed_at,
                     )
             activations = list_runtime_activations()
-        if self._settings.release.profile == "BINANCE_LIVE_WRITE":
-            authorized_activation_ids = self._live_write_activation_ids
-            if (
-                not authorized_activation_ids
-                or {item.activation_id for item in activations}
-                != authorized_activation_ids
-            ):
-                raise ExecutorRuntimeError("LIVE_WRITE_ACTIVATION_SET_MISMATCH")
+        self._authorize_discovered_live_write_activations(activations)
         open_activation_ids = {activation.activation_id for activation in activations}
         removed_stale_adapter = False
         for activation_id in set(self._lifecycle.activation_ids) - open_activation_ids:
@@ -2112,6 +2073,7 @@ class ProductExecutorRuntime:
             if responsibility_processor is not None:
                 responsibility_processor.close()
         if removed_stale_adapter:
+            self._release_unused_closed_bar_fact_streams()
             # Nautilus requires no active subscription for the same underlying
             # market while aggregated history is requested. Give the controller
             # one sync cycle to finish the old adapter's unsubscriptions before
@@ -2424,6 +2386,65 @@ class ProductExecutorRuntime:
                 entry_valid_until=entry_valid_until.isoformat(),
             )
 
+    def _authorize_discovered_live_write_activations(
+        self,
+        activations: tuple[object, ...] | list[object],
+    ) -> None:
+        """Extend the startup scope only with activations accepted by the live gate."""
+
+        if self._settings.release.profile != "BINANCE_LIVE_WRITE":
+            return
+        authorized_activation_ids = getattr(
+            self,
+            "_live_write_activation_ids",
+            frozenset(),
+        )
+        runtime_real_write_gate = getattr(
+            self,
+            "_runtime_real_write_gate",
+            "CLOSED",
+        )
+        risk_control_only = getattr(
+            self,
+            "_live_write_risk_control_only",
+            False,
+        )
+        if (
+            (
+                runtime_real_write_gate != "OPEN"
+                and not risk_control_only
+            )
+            or (risk_control_only and not authorized_activation_ids)
+        ):
+            raise ExecutorRuntimeError("RUNTIME_REAL_WRITE_GATE_CLOSED")
+        activation_ids = {
+            str(getattr(activation, "activation_id"))
+            for activation in activations
+        }
+        if risk_control_only:
+            if not activation_ids <= authorized_activation_ids:
+                raise ExecutorRuntimeError(
+                    "LIVE_WRITE_ACTIVATION_SCOPE_MISMATCH"
+                )
+            return
+        discovered_ids = sorted(
+            activation_ids - authorized_activation_ids
+        )
+        for activation_id in discovered_ids:
+            try:
+                self.coordinator.authorize_live_write_activation(activation_id)
+            except Exception:
+                raise ExecutorRuntimeError(
+                    "LIVE_WRITE_ACTIVATION_SCOPE_MISMATCH"
+                ) from None
+            self._live_write_activation_ids = frozenset(
+                (*self._live_write_activation_ids, activation_id)
+            )
+            self._record_runtime_event(
+                "live_write_activation_discovered",
+                activation_id=activation_id,
+            )
+
     async def _wait_for_stop_and_sync_activations(
         self,
         stop_wait: Callable[[], object],
@@ -2432,9 +2453,14 @@ class ProductExecutorRuntime:
         interval_seconds: float = 1.0,
         stop_future: asyncio.Future[object] | None = None,
     ) -> None:
-        """Periodically advance time-based duties; Demo also discovers activations."""
+        """Advance duties and discover activations only in mutation-capable modes."""
 
-        discover_activations = self._settings.release.profile == "BINANCE_DEMO"
+        profile = self._settings.release.profile
+        discover_activations = profile == "BINANCE_DEMO" or (
+            profile == "BINANCE_LIVE_WRITE"
+            and getattr(self, "_runtime_real_write_gate", "CLOSED") == "OPEN"
+            and not getattr(self, "_live_write_risk_control_only", False)
+        )
         lifecycle = self._lifecycle
         if lifecycle is None:
             raise ExecutorRuntimeError("PRODUCT_RUNTIME_NOT_BUILT")
@@ -2598,21 +2624,19 @@ class ProductExecutorRuntime:
     def _required_market_data_streams(self) -> tuple[str, ...]:
         """Return every stream which current Halpha responsibilities require."""
 
-        settings = getattr(self, "_settings", None)
-        profile = getattr(getattr(settings, "release", None), "profile", None)
-        if profile is None:
-            return ()
-        try:
-            instrument_ids = _PROFILE_SPEC[profile][1]
-        except KeyError:
-            raise ExecutorRuntimeError("EXECUTION_PROFILE_MISMATCH") from None
         required: set[str] = set()
-        for instrument_id in instrument_ids:
-            symbol = instrument_id.removesuffix("-PERP.BINANCE").lower()
-            if not symbol or symbol == instrument_id.lower():
+
+        def require_quote_and_mark(instrument_ref: str) -> None:
+            symbol = instrument_ref.removesuffix("-PERP").lower()
+            if not symbol or symbol == instrument_ref.lower():
                 raise ExecutorRuntimeError("BINANCE_INSTRUMENT_ID_INVALID")
             required.add(f"{symbol}@bookTicker")
             required.add(f"{symbol}@markPrice@1s")
+
+        for instrument_ref in set(
+            getattr(self, "_direct_schedule_instruments", {}).values()
+        ):
+            require_quote_and_mark(instrument_ref)
         for lifecycle in (
             getattr(self, "_lifecycle", None),
             getattr(self, "_market_fact_lifecycle", None),
@@ -2621,6 +2645,11 @@ class ProductExecutorRuntime:
                 continue
             for activation_id in tuple(lifecycle.activation_ids):
                 adapter = lifecycle.adapter_for_activation(activation_id)
+                instrument_id = getattr(adapter, "market_data_instrument_id", None)
+                if instrument_id is not None:
+                    require_quote_and_mark(
+                        str(instrument_id).removesuffix(".BINANCE")
+                    )
                 evaluator = getattr(adapter, "_bar_evaluator", None)
                 if evaluator is None:
                     continue
@@ -2641,10 +2670,14 @@ class ProductExecutorRuntime:
     def _require_market_data_stream_recoverable(self) -> None:
         """Let Nautilus reconnect public streams briefly, then restart safely."""
 
+        required_streams = self._required_market_data_streams()
+        if not required_streams:
+            self._market_data_stream_unhealthy_since = None
+            self._market_data_stream_last_state = "IDLE"
+            return
         client = getattr(self, "_framework_data_client", None)
         if client is None:
             return
-        required_streams = self._required_market_data_streams()
         state = _binance_data_stream_state(
             client,
             required_streams=required_streams,
@@ -2968,7 +3001,6 @@ class ProductExecutorRuntime:
             else None
         )
         try:
-            self._start_market_fact_streams()
             self._restore_paused_adapters(self._capability)
             if not self._startup_recovery_prepared:
                 raise ExecutorRuntimeError("STARTUP_RECOVERY_NOT_PREPARED")

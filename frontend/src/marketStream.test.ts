@@ -8,8 +8,10 @@ import {
   isMarketStreamQuoteStale,
   isMarketSourceForEnvironment,
   isUsableExecutionQuote,
+  isUsableMarketStreamDepth,
   isUsableMarketStreamFunding,
   isUsableMarketStreamBar,
+  isUsableMarketStreamTrade,
   marketEnvironmentScopeKey,
   marketStreamPriceMoves,
   marketStreamQuoteThrottleDelayMs,
@@ -17,10 +19,13 @@ import {
   marketStreamWebSocketUrl,
   nextMarketStreamGeneration,
   parseMarketStreamEvent,
+  shouldObservePublicMarketStream,
   shouldUseMarketStreamBar,
   type MarketStreamBar,
+  type MarketStreamDepth,
   type MarketStreamFunding,
   type MarketStreamQuote,
+  type MarketStreamTrade,
 } from "./marketStream";
 
 const quoteEvent = {
@@ -65,6 +70,35 @@ const fundingEvent = {
   next_funding_at: "2026-07-23T16:00:00Z",
 };
 
+const depthEvent = {
+  type: "depth",
+  instrument_ref: "BTCUSDT-PERP",
+  source: "BINANCE_DEMO_PUBLIC",
+  source_cutoff: "2026-07-23T10:00:00.100Z",
+  received_at: "2026-07-23T10:00:00.120Z",
+  update_id: 42,
+  bids: [
+    { price: "65738.2", quantity: "1.5" },
+    { price: "65738.1", quantity: "2" },
+  ],
+  asks: [
+    { price: "65749", quantity: "1.2" },
+    { price: "65749.1", quantity: "3" },
+  ],
+};
+
+const tradeEvent = {
+  type: "trade",
+  instrument_ref: "BTCUSDT-PERP",
+  source: "BINANCE_DEMO_PUBLIC",
+  source_cutoff: "2026-07-23T10:00:00.100Z",
+  received_at: "2026-07-23T10:00:00.120Z",
+  trade_id: "1042",
+  price: "65743.6",
+  quantity: "0.025",
+  aggressor_side: "BUYER",
+};
+
 describe("public market stream event parser", () => {
   it("accepts each server event shape", () => {
     expect(parseMarketStreamEvent(JSON.stringify({
@@ -78,6 +112,8 @@ describe("public market stream event parser", () => {
     expect(parseMarketStreamEvent(JSON.stringify(quoteEvent))).toEqual(quoteEvent);
     expect(parseMarketStreamEvent(barEvent)).toEqual(barEvent);
     expect(parseMarketStreamEvent(fundingEvent)).toEqual(fundingEvent);
+    expect(parseMarketStreamEvent(depthEvent)).toEqual(depthEvent);
+    expect(parseMarketStreamEvent(tradeEvent)).toEqual(tradeEvent);
   });
 
   it("rejects invalid JSON, unknown events, and malformed status values", () => {
@@ -123,10 +159,32 @@ describe("public market stream event parser", () => {
       ...fundingEvent,
       next_funding_at: "2026-08-23T16:00:00Z",
     })).toBeNull();
+    expect(parseMarketStreamEvent({
+      ...depthEvent,
+      asks: [{ price: "65738.2", quantity: "1" }],
+    })).toBeNull();
+    expect(parseMarketStreamEvent({
+      ...depthEvent,
+      bids: [
+        { price: "65738.1", quantity: "1" },
+        { price: "65738.2", quantity: "1" },
+      ],
+    })).toBeNull();
+    expect(parseMarketStreamEvent({
+      ...tradeEvent,
+      quantity: "0",
+    })).toBeNull();
   });
 });
 
 describe("public market stream selection and recovery helpers", () => {
+  it("observes only while the enabled workbench document is visible", () => {
+    expect(shouldObservePublicMarketStream(false, "visible")).toBe(false);
+    expect(shouldObservePublicMarketStream(true, "hidden")).toBe(false);
+    expect(shouldObservePublicMarketStream(true, "visible")).toBe(true);
+    expect(shouldObservePublicMarketStream(true, undefined)).toBe(true);
+  });
+
   it("estimates bounded short-window moves and fails closed across gaps", () => {
     const quote = (
       seconds: number,
@@ -332,6 +390,40 @@ describe("public market stream selection and recovery helpers", () => {
       funding,
       "BINANCE_LIVE_PUBLIC",
       receivedAt + MARKET_STREAM_STALE_AFTER_MS,
+    )).toBe(false);
+  });
+
+  it("uses depth and aggregate prints only while their source and timestamps are current", () => {
+    const parsedDepth = parseMarketStreamEvent(depthEvent);
+    const parsedTrade = parseMarketStreamEvent(tradeEvent);
+    const depth = parsedDepth?.type === "depth" ? parsedDepth as MarketStreamDepth : null;
+    const trade = parsedTrade?.type === "trade" ? parsedTrade as MarketStreamTrade : null;
+    const receivedAt = Date.parse(depthEvent.received_at);
+
+    expect(isUsableMarketStreamDepth(
+      depth,
+      "BINANCE_DEMO_PUBLIC",
+      receivedAt + 1_000,
+    )).toBe(true);
+    expect(isUsableMarketStreamDepth(
+      depth,
+      "BINANCE_LIVE_PUBLIC",
+      receivedAt + 1_000,
+    )).toBe(false);
+    expect(isUsableMarketStreamTrade(
+      trade,
+      "BINANCE_DEMO_PUBLIC",
+      receivedAt + 1_000,
+    )).toBe(true);
+    expect(isUsableMarketStreamTrade(
+      trade ? {
+        ...trade,
+        received_at: new Date(
+          receivedAt - MARKET_STREAM_STALE_AFTER_MS,
+        ).toISOString(),
+      } : null,
+      "BINANCE_DEMO_PUBLIC",
+      receivedAt,
     )).toBe(false);
   });
 

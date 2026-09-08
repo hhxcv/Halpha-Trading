@@ -93,6 +93,23 @@ def test_workbench_fixture_returns_demo_instrument_rules() -> None:
     assert rules.limit_quantity_step == "0.001"
 
 
+def test_workbench_fixture_returns_searchable_scalping_contract_catalog() -> None:
+    provider = FixtureInstrumentRulesProvider()
+
+    catalog = asyncio.run(provider.list_contracts())
+
+    assert catalog.source == "BINANCE_DEMO_EXCHANGE_INFO"
+    assert [contract.instrument_ref for contract in catalog.contracts] == [
+        "ADAUSDT-PERP",
+        "BNBUSDT-PERP",
+        "BTCUSDT-PERP",
+        "ETHUSDT-PERP",
+        "SOLUSDT-PERP",
+        "XRPUSDT-PERP",
+    ]
+    assert catalog.contracts[2].base_asset == "BTC"
+
+
 def test_workbench_fixture_market_stream_stays_live_and_environment_scoped() -> None:
     async def first_events() -> list[object]:
         provider = FixtureMarketStreamProvider()

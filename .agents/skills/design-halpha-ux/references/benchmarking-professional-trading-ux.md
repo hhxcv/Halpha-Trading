@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Benchmark to understand professional interaction patterns, not to make Halpha look like another brand. Recheck current first-party material for every substantial redesign because product interfaces change.
+Benchmark when an unresolved interaction or substantial redesign needs outside evidence. Use current first-party material for the relevant pattern; an existing Halpha pattern can be sufficient for routine work.
 
 ## Relevant Benchmark Set
 
@@ -24,9 +24,9 @@ Useful first-party starting points, to be revalidated at task time:
 - Apple alerts: <https://developer.apple.com/design/human-interface-guidelines/alerts>
 - Apple progress indicators: <https://developer.apple.com/design/human-interface-guidelines/progress-indicators>
 
-## Comparison Matrix
+## Comparison Questions
 
-Record observations with screenshots or links and compare these dimensions:
+Use links or inspected screenshots to support borrowed patterns. Select the dimensions that can change the decision; a matrix is useful for competing options, not required for one direct precedent.
 
 | Dimension | Questions |
 |---|---|
@@ -45,7 +45,7 @@ Record observations with screenshots or links and compare these dimensions:
 | Customization | Whether expert efficiency depends on layouts and whether current Halpha use justifies that complexity |
 | Accessibility | Focus, contrast, non-color state, reduced motion, and readable density |
 
-For each borrowed pattern, record:
+Explain a borrowed pattern's fit and maintenance tradeoff briefly. The following questions can help when the choice is uncertain:
 
 1. the problem it solves;
 2. why the pattern fits Halpha's current semantics;
@@ -55,7 +55,7 @@ For each borrowed pattern, record:
 
 ## Halpha-Specific Interpretation
 
-Professional trading products demonstrate that compact tables, stable panels, activity monitors, direct manipulation, and continuous state feedback can reduce decision time. Halpha is not a discretionary order-entry terminal, so do not add charts, depth, hotkeys, watchlists, scanners, or instant order placement merely because benchmarks contain them.
+Compact tables, stable panels and continuous feedback are candidate patterns to evaluate against the current task. Halpha's supported trading behavior comes from its current domain owners; do not add charts, depth, hotkeys, scanners or order placement merely because benchmarks contain them.
 
 Borrow interaction qualities:
 

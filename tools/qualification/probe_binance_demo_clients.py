@@ -301,9 +301,9 @@ def _nonsecret_configuration(proxy_enabled: bool = False) -> dict[str, object]:
             "filter_position_reports": False,
         },
         "instrument_provider": {
-            "load_all": False,
+            "load_all": True,
             "load_ids": instrument_ids,
-            "query_commission_rates": True,
+            "query_commission_rates": False,
             "shared_by_data_and_execution": True,
         },
         "data_client": {
@@ -357,9 +357,9 @@ def _build_profile_client_configs(
         raise QualificationError("UNKNOWN_BINANCE_PROFILE")
     environment, instrument_ids = profile_specs[profile]
     provider = BinanceInstrumentProviderConfig(
-        load_all=False,
+        load_all=True,
         load_ids=frozenset(instrument_ids),
-        query_commission_rates=True,
+        query_commission_rates=False,
     )
     routing = RoutingConfig(default=True, venues=frozenset({BINANCE}))
     data_client = BinanceDataClientConfig(
@@ -804,7 +804,7 @@ async def _observe_running_node(
                 snapshot["node_running"]
                 and snapshot["data_engine_connected"]
                 and snapshot["execution_engine_connected"]
-                and cache_ids == expected_ids
+                and set(expected_ids).issubset(cache_ids)
                 and snapshot["account_count"] == 1
             )
             if ready:
@@ -859,13 +859,13 @@ async def _observe_running_node(
             str(instrument_id) for instrument_id in node.cache.instrument_ids(BINANCE_VENUE)
         )
         evidence["instrument_ids"] = {
-            "expected": expected_ids,
+            "required_baseline": expected_ids,
             "provider": provider_ids,
             "node_cache": node_cache_ids,
         }
-        if provider_ids != expected_ids:
+        if not set(expected_ids).issubset(provider_ids):
             errors.append("PROVIDER_INSTRUMENT_IDS_MISMATCH")
-        if node_cache_ids != expected_ids:
+        if not set(expected_ids).issubset(node_cache_ids):
             errors.append("NODE_CACHE_INSTRUMENT_IDS_MISMATCH")
         if http_cache_info.currsize != 1 or http_cache_info.hits < 2:
             errors.append("HTTP_CLIENT_NOT_SINGLETON")

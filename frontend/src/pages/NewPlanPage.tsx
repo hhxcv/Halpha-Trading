@@ -742,6 +742,12 @@ export default function NewPlanPage() {
     marketColorScheme: MarketColorScheme;
   }>();
   const liveReadOnly = status.profile === "BINANCE_LIVE_READ_ONLY";
+  const launchRuntimeUnavailableReason = status.executor_status === "BUILD_MISMATCH"
+    || status.app_executor_product_build_consistent === false
+    ? "应用与执行器版本不一致，不能提交并启动。"
+    : status.executor_status !== "READY"
+      ? "执行器未就绪，不能提交并启动。"
+      : null;
   const { planId } = useParams();
   const [searchParams] = useSearchParams();
   const sourcePlanId = searchParams.get("copyFrom");
@@ -856,6 +862,10 @@ export default function NewPlanPage() {
   const pendingSubmitAndStartIdentityRef = useRef<StableRequestIdentity | null>(null);
   const [reviewDraft, setReviewDraft] = useState<PlanDraft | null>(null);
   const latestPersistedDraftRef = useRef<PlanDraft | null>(null);
+  const pendingLocalCreateHydrationRef = useRef<{
+    planId: string;
+    draftVersion: number;
+  } | null>(null);
   const [draftSaveState, setDraftSaveState] = useState<DraftSaveState>({ status: "IDLE" });
   const [submitAndStartPhase, setSubmitAndStartPhase] =
     useState<SubmitAndStartPhase>("IDLE");
@@ -1041,6 +1051,17 @@ export default function NewPlanPage() {
   useEffect(() => {
     const source = draft.data?.content;
     if (!source) return;
+    const localCreate = pendingLocalCreateHydrationRef.current;
+    if (localCreate && editing) {
+      pendingLocalCreateHydrationRef.current = null;
+      if (draft.data?.plan_id === localCreate.planId
+        && draft.data.draft_version <= localCreate.draftVersion) {
+        // The first autosave navigates to this same editor.  Its initial GET
+        // must not overwrite input entered while the create request was pending.
+        // A newer server version and a separately opened editor still hydrate.
+        return;
+      }
+    }
     const sourceParameters = source.decision_basis.parameters;
     setParameters({
       ...DEFAULT_PARAMETERS,
@@ -1729,6 +1750,10 @@ export default function NewPlanPage() {
       autoSaveAttemptFingerprintRef.current = fingerprint;
       setDraftSaveState({ status: "SAVED", at: Date.now() });
       if (!editing) {
+        pendingLocalCreateHydrationRef.current = {
+          planId: saved.plan_id,
+          draftVersion: saved.draft_version,
+        };
         navigate(`/plans/${saved.plan_id}/edit`, { replace: true });
       }
     },
@@ -2036,6 +2061,7 @@ export default function NewPlanPage() {
     && accountDiscipline?.new_risk_allowed !== false;
   const canSubmit = !loading
     && !liveReadOnly
+    && launchRuntimeUnavailableReason === null
     && !loadFailed
     && !draftSave.isPending
     && !submitAndStart.isPending
@@ -2044,6 +2070,7 @@ export default function NewPlanPage() {
     && !marketSourceMismatch
     && expectedMarketSource !== null
     && (!directExecution || directMarketDataReady)
+    && (!directExecution || !entryBoundaryBreach)
     && configurationValid
     && planNameValid
     && decisionContextValid;
@@ -2751,7 +2778,13 @@ export default function NewPlanPage() {
                   fundingAmountAtPercentage(directFundingMaximum, next),
                 );
               }}
-              sx={{ mt: .4, mb: 2.5 }}
+              sx={{
+                mt: .4,
+                mb: 2.5,
+                "& .MuiSlider-markLabel[data-index='3']": {
+                  transform: "translateX(-100%)",
+                },
+              }}
             />
             <TextField
               fullWidth
@@ -2782,8 +2815,11 @@ export default function NewPlanPage() {
       </Box>
     );
     const directSubmissionProblems = Array.from(new Set([
+      ...directScheduleProblems,
       !activeDraft ? "等待当前草稿保存完成。" : null,
       !aiReviewApproved ? "完成当前草稿的 AI 审核并获得批准。" : null,
+      launchRuntimeUnavailableReason,
+      entryBoundaryBreachMessage,
       directBlockingReason,
       directFundingDisciplineIssue,
       directFundingCapacityExhausted ? "当前纪律名义敞口没有剩余容量。" : null,
@@ -2950,6 +2986,7 @@ export default function NewPlanPage() {
   const strategySubmissionProblems = Array.from(new Set([
     !activeDraft ? "等待当前草稿保存完成。" : null,
     !aiReviewApproved ? "完成当前草稿的 AI 审核并获得批准。" : null,
+    launchRuntimeUnavailableReason,
     !planNameValid ? "填写有效的计划名称。" : null,
     !planValidityValid ? "填写 15–10080 分钟的有效期。" : null,
     !decisionContextValid ? "选择交易目的、形态并填写交易理由。" : null,

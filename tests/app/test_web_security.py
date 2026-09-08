@@ -35,6 +35,13 @@ from halpha.configuration import load_settings
 from halpha.domain_values import content_digest
 from halpha.planning.registry import Direction, OneShotParameters
 from halpha.planning.order_schedule import InstrumentOrderRules
+from halpha.scalping.models import (
+    BinanceContract,
+    BinanceContractCatalog,
+    ScalpCycleCreateResponse,
+    ScalpCycleRecord,
+    ScalpTemplate,
+)
 from halpha.user_workbench.repository import CommandConflict
 
 
@@ -225,6 +232,24 @@ class FakeInstrumentRules:
             source_cutoff="2026-07-23T00:00:00+00:00",
         )
 
+    async def list_contracts(self) -> BinanceContractCatalog:
+        return BinanceContractCatalog(
+            source="BINANCE_DEMO_EXCHANGE_INFO",
+            source_cutoff=datetime(2026, 7, 23, tzinfo=UTC),
+            contracts=(
+                BinanceContract(
+                    instrument_ref="BTCUSDT-PERP",
+                    symbol="BTCUSDT",
+                    base_asset="BTC",
+                ),
+                BinanceContract(
+                    instrument_ref="ETHUSDT-PERP",
+                    symbol="ETHUSDT",
+                    base_asset="ETH",
+                ),
+            ),
+        )
+
 
 class FakeMarketStream:
     def stream(self, instrument_ref: str):
@@ -260,6 +285,7 @@ def make_client(
     instrument_rules_provider: InstrumentRulesProvider | None = None,
     monotonic_provider: Callable[[], float] | None = None,
     schema_guard: Callable[[], None] | None = None,
+    static_dist: Path | None = None,
 ) -> TestClient:
     settings = load_settings(
         config_path or ROOT / "config" / "halpha.example.toml"
@@ -276,7 +302,7 @@ def make_client(
         market_context_provider=market_context_provider,
         market_stream_provider=market_stream_provider,
         instrument_rules_provider=instrument_rules_provider,
-        static_dist=tmp_path / "missing-dist",
+        static_dist=static_dist or (tmp_path / "missing-dist"),
         monotonic_provider=monotonic_provider,
         schema_guard=schema_guard,
     )
@@ -566,6 +592,7 @@ def test_apps_use_port_scoped_csrf_and_report_atomic_context_targets(
         ("DELETE", "/api/v1/plans/plan-ro"),
         ("POST", "/api/v1/plans/plan-ro/submit-and-start"),
         ("POST", "/api/v1/activations"),
+        ("POST", "/api/v1/scalping/cycles"),
         ("POST", "/api/v1/activations/activation-ro/exit"),
         ("PUT", "/api/v1/reviews/review-ro"),
         ("POST", "/api/v1/reviews/review-ro/complete"),
@@ -621,6 +648,10 @@ def test_live_read_only_http_boundary_keeps_only_non_mutating_posts_open() -> No
     assert _live_read_only_request_is_non_mutating(
         "POST",
         "/api/v1/settings/test-email",
+    )
+    assert _live_read_only_request_is_non_mutating(
+        "POST",
+        "/api/v1/scalping/recommendation",
     )
     assert not _live_read_only_request_is_non_mutating(
         "POST",
@@ -876,6 +907,187 @@ def test_strategy_and_status_reads_need_no_session(tmp_path: Path) -> None:
     assert len(funding_history.json()["samples"]) == 6
     assert naive_market_window.status_code == 422
     assert naive_market_window.json()["detail"]["code"] == "MARKET_WINDOW_TIMEZONE_REQUIRED"
+
+
+def test_scalping_catalog_and_recommendation_are_read_only_current_context_inputs(
+    tmp_path: Path,
+) -> None:
+    client = make_client(
+        tmp_path,
+        market_context_provider=FakeMarketContext(),
+        instrument_rules_provider=FakeInstrumentRules(),
+    )
+    token = csrf(client)
+
+    catalog = client.get("/api/v1/scalping/contracts")
+    recommendation = client.post(
+        "/api/v1/scalping/recommendation",
+        headers={"Origin": ORIGIN, "X-CSRFToken": token},
+        json={
+            "instrument_ref": "BTCUSDT-PERP",
+            "template": {
+                "schema_version": "HALPHA_SCALP_TEMPLATE_V1",
+                "notional": "100",
+                "initial_stop_bps": "35",
+                "take_profit_r": "1.5",
+                "max_holding_seconds": 300,
+                "max_spread_bps": "5",
+                "entry_fee_bps": "6",
+                "exit_fee_bps": "6",
+            },
+        },
+    )
+
+    assert catalog.status_code == 200
+    assert [item["instrument_ref"] for item in catalog.json()["contracts"]] == [
+        "BTCUSDT-PERP",
+        "ETHUSDT-PERP",
+    ]
+    assert recommendation.status_code == 200
+    assert recommendation.json()["instrument_ref"] == "BTCUSDT-PERP"
+    assert recommendation.json()["recommended_template"]["notional"] == "100"
+    assert recommendation.json()["basis"] == ["15m ATR × 0.8", "当前价差 × 2.5"]
+
+
+def test_browser_scalping_trigger_compiles_fresh_rules_before_creating_cycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, Any] = {}
+    template = ScalpTemplate(entry_mode="MAKER_ONLY_SAME_SIDE")
+
+    monkeypatch.setattr(
+        PostgreSQLPlanningApi,
+        "scalp_cycle_replay",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        PostgreSQLPlanningApi,
+        "scalp_cycle_preview",
+        lambda _self, payload, *, idempotency_key, maker_limit_price=None: {
+            "plan_version_id": "scalp-preview-version",
+            "decision_basis_kind": "DIRECT_EXECUTION",
+            "venue_ref": "BINANCE_USDM",
+            "instrument_ref": payload.instrument_ref,
+            "direction": payload.direction.value,
+            "trade_amount": payload.template.notional,
+            "order_schedule_spec": payload.template.order_schedule_spec(
+                maker_limit_price=maker_limit_price,
+            ).model_dump(
+                mode="json"
+            ),
+        },
+    )
+
+    def trigger(_self, payload, **kwargs):
+        observed.update(kwargs)
+        assert kwargs["order_schedule_snapshot"].valid is True
+        return ScalpCycleCreateResponse(
+            cycle=ScalpCycleRecord(
+                cycle_id="20000000-0000-0000-0000-000000000001",
+                environment_id="demo-main",
+                account_ref="demo-account",
+                instrument_ref=payload.instrument_ref,
+                direction=payload.direction,
+                template=payload.template,
+                template_digest=payload.template.digest,
+                request_digest="a" * 64,
+                idempotency_key=kwargs["idempotency_key"],
+                plan_id="20000000-0000-0000-0000-000000000002",
+                plan_version_id="20000000-0000-0000-0000-000000000003",
+                activation_id="20000000-0000-0000-0000-000000000004",
+                triggered_at=kwargs["observed_at"],
+            ),
+            activation={"lifecycle": "RUNNING"},
+            runtime_real_write_gate="CLOSED",
+        )
+
+    monkeypatch.setattr(PostgreSQLPlanningApi, "trigger_scalp_cycle", trigger)
+    client = make_client(
+        tmp_path,
+        market_context_provider=FakeMarketContext(),
+        instrument_rules_provider=FakeInstrumentRules(),
+    )
+    token = csrf(client)
+
+    response = client.post(
+        "/api/v1/scalping/cycles",
+        headers={
+            "Origin": ORIGIN,
+            "X-CSRFToken": token,
+            "Idempotency-Key": "scalp-one-click-1",
+        },
+        json={
+            "instrument_ref": "BTCUSDT-PERP",
+            "direction": "SHORT",
+            "template": template.model_dump(mode="json"),
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["cycle"]["direction"] == "SHORT"
+    assert observed["idempotency_key"] == "scalp-one-click-1"
+    assert observed["maker_limit_price"] == "101"
+    assert observed["order_schedule_snapshot"].schedule_ref == "scalp-preview-version"
+
+
+def test_programmatic_monitor_cannot_invoke_browser_only_scalping_trigger(
+    tmp_path: Path,
+) -> None:
+    response = make_client(tmp_path).post(
+        "/api/v1/scalping/cycles",
+        headers={
+            "X-Halpha-Caller": "MONITOR",
+            "Idempotency-Key": "programmatic-scalp-forbidden",
+        },
+        json={},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == {"code": "PROGRAMMATIC_API_SCOPE_FORBIDDEN"}
+
+
+@pytest.mark.parametrize(
+    ("path", "method"),
+    (
+        ("/api/v1/scalping/cycles/by-idempotency", "scalp_cycle_lookup"),
+        (
+            "/api/v1/activations/20000000-0000-0000-0000-000000000004/exit-by-idempotency",
+            "exit_receipt_lookup",
+        ),
+    ),
+)
+def test_unknown_scalp_requests_can_be_queried_without_resubmitting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    method: str,
+) -> None:
+    observed: list[str] = []
+
+    def lookup(_self, *_args, idempotency_key):
+        observed.append(idempotency_key)
+        return None
+
+    monkeypatch.setattr(PostgreSQLPlanningApi, method, lookup)
+    monkeypatch.setattr(
+        PostgreSQLPlanningApi,
+        "trigger_scalp_cycle",
+        lambda *_args, **_kwargs: pytest.fail("GET must not submit a cycle"),
+    )
+    monkeypatch.setattr(
+        PostgreSQLPlanningApi,
+        "submit_control",
+        lambda *_args, **_kwargs: pytest.fail("GET must not submit a control"),
+    )
+    client = make_client(tmp_path)
+
+    response = client.get(path, params={"idempotency_key": "original-request"})
+
+    assert response.status_code == 200
+    assert response.json() is None
+    assert observed == ["original-request"]
+    assert client.get(path, params={"idempotency_key": "invalid key"}).status_code == 422
 
 
 def test_market_window_query_cannot_switch_away_from_the_app_environment(
@@ -1893,6 +2105,20 @@ def test_operations_remains_usable_without_static_dist_or_password(
     assert "password" not in script.text.lower()
     assert missing_static.status_code == 503
     assert client.get("/login").status_code == 404
+
+
+def test_scalping_route_serves_the_spa_shell(tmp_path: Path) -> None:
+    static_dist = tmp_path / "dist"
+    static_dist.mkdir()
+    (static_dist / "index.html").write_text(
+        "<!doctype html><title>Halpha scalping</title>",
+        encoding="utf-8",
+    )
+
+    response = make_client(tmp_path, static_dist=static_dist).get("/scalping")
+
+    assert response.status_code == 200
+    assert "Halpha scalping" in response.text
 
 
 def test_operations_projects_only_core_fallback_facts_and_controls(

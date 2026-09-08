@@ -25,12 +25,15 @@ from nautilus_trader.core.nautilus_pyo3.network import HttpMethod
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from halpha.domain_values import canonical_decimal, decimal_from_string
+from halpha.public_instrument_rules import (
+    InstrumentRulesUnavailable,
+    symbol_for_perpetual_instrument,
+)
 from halpha.planning.indicators import IndicatorBar, native_donchian_atr_snapshot
 
 
 FIFTEEN_MINUTES_MS = 15 * 60 * 1000
 ONE_MINUTE_MS = 60 * 1000
-_INSTRUMENT_SYMBOLS = {"BTCUSDT-PERP": "BTCUSDT"}
 PUBLIC_MARKET_TIMEOUT_SECONDS = 10
 PUBLIC_MARKET_TRANSIENT_READ_ATTEMPTS = 3
 PUBLIC_MARKET_TRANSIENT_RETRY_DELAY_SECONDS = 0.25
@@ -605,8 +608,9 @@ class BinancePublicMarketContext:
         self,
         instrument_ref: str,
     ) -> MarketFundingRateHistory:
-        symbol = _INSTRUMENT_SYMBOLS.get(instrument_ref)
-        if symbol is None:
+        try:
+            symbol = symbol_for_perpetual_instrument(instrument_ref)
+        except InstrumentRulesUnavailable:
             raise MarketContextUnavailable("MARKET_FUNDING_HISTORY_INSTRUMENT_UNSUPPORTED")
         if self._funding_rate_query is None:
             raise MarketContextUnavailable("MARKET_FUNDING_HISTORY_UNAVAILABLE")
@@ -673,8 +677,9 @@ class BinancePublicMarketContext:
         lookback: int,
         stop_reference_interval: MarketInterval,
     ) -> MarketContext:
-        symbol = _INSTRUMENT_SYMBOLS.get(instrument_ref)
-        if symbol is None:
+        try:
+            symbol = symbol_for_perpetual_instrument(instrument_ref)
+        except InstrumentRulesUnavailable:
             raise MarketContextUnavailable("MARKET_CONTEXT_INSTRUMENT_UNSUPPORTED")
         if not 4 <= lookback <= 96:
             raise MarketContextUnavailable("MARKET_CONTEXT_LOOKBACK_INVALID")
@@ -946,8 +951,9 @@ class BinancePublicMarketContext:
         start_at: datetime,
         end_at: datetime,
     ) -> MarketWindow:
-        symbol = _INSTRUMENT_SYMBOLS.get(instrument_ref)
-        if symbol is None:
+        try:
+            symbol = symbol_for_perpetual_instrument(instrument_ref)
+        except InstrumentRulesUnavailable:
             raise MarketContextUnavailable("MARKET_CONTEXT_INSTRUMENT_UNSUPPORTED")
         interval_ms = MARKET_INTERVAL_MILLISECONDS[interval]
         native_interval = BINANCE_KLINE_INTERVALS[interval]

@@ -513,6 +513,69 @@ def test_live_adapter_reuses_framework_cache_before_requesting_history() -> None
     ]
 
 
+def test_adapter_releases_supported_feeds_and_leaves_mark_teardown_to_node() -> None:
+    evaluator = _evaluator()
+    adapter = HalphaStrategyAdapter(
+        activation_id="market-feed-duty",
+        instrument_ref="BTCUSDT-PERP",
+        bar_evaluator=evaluator,
+        quote_event_sink=lambda _tick: None,
+        mark_price_event_sink=lambda _update: None,
+    )
+    events: list[tuple[str, object]] = []
+    adapter.subscribe_mark_prices = lambda instrument_id: events.append(
+        ("subscribe-mark", instrument_id)
+    )
+    adapter.subscribe_quote_ticks = lambda instrument_id: events.append(
+        ("subscribe-quote", instrument_id)
+    )
+    adapter.unsubscribe_mark_prices = lambda _instrument_id: pytest.fail(
+        "the fixed Binance data client has no mark-price unsubscribe implementation"
+    )
+    adapter.unsubscribe_quote_ticks = lambda instrument_id: events.append(
+        ("unsubscribe-quote", instrument_id)
+    )
+    adapter.subscribe_bars = lambda bar_type: events.append(("subscribe-bar", bar_type))
+    adapter.unsubscribe_bars = lambda bar_type: events.append(("unsubscribe-bar", bar_type))
+
+    adapter.on_start()
+    adapter.on_stop()
+
+    assert [event[0] for event in events] == [
+        "subscribe-bar",
+        "subscribe-bar",
+        "subscribe-mark",
+        "subscribe-quote",
+        "unsubscribe-bar",
+        "unsubscribe-bar",
+        "unsubscribe-quote",
+    ]
+    assert [value for kind, value in events if kind == "unsubscribe-bar"] == list(
+        reversed(evaluator.subscribed_bar_types)
+    )
+
+
+def test_adapter_does_not_subscribe_market_feeds_without_a_consumer() -> None:
+    adapter = HalphaStrategyAdapter(
+        activation_id="risk-reduction-only-duty",
+        instrument_ref="BTCUSDT-PERP",
+        market_data_required=False,
+        execution_event_sink=lambda _event: None,
+    )
+    events: list[tuple[str, object]] = []
+    adapter.subscribe_mark_prices = lambda instrument_id: events.append(
+        ("subscribe-mark", instrument_id)
+    )
+    adapter.subscribe_quote_ticks = lambda instrument_id: events.append(
+        ("subscribe-quote", instrument_id)
+    )
+
+    adapter.on_start()
+
+    assert events == []
+    assert adapter.market_data_instrument_id is None
+
+
 def test_adapter_reports_bar_evaluation_failure_before_reraising() -> None:
     evaluator = _evaluator()
     failures: list[tuple[object, Exception]] = []

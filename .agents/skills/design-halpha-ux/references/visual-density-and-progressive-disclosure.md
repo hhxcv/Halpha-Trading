@@ -34,7 +34,7 @@ Measure density with useful facts, comparisons, and reachable actions per viewpo
 
 ## Current Information Layers
 
-Map every item to the information layers described by HALPHA-UX-001 before choosing a component:
+Use the information layers described by HALPHA-UX-001 to choose components when hierarchy or disclosure is in scope; no separate per-item mapping artifact is required:
 
 | Current layer | Default presentation |
 |---|---|
@@ -47,7 +47,7 @@ Quick viewing normally stays in conclusion and decision. Critical counterevidenc
 
 ## Visual Carrier Annotation
 
-After the current semantic mapping, annotate one visual carrier for each item. These carriers are layout decisions, not another information taxonomy, page type, or persisted state.
+Choose carriers according to decision value and task continuity. The options below guide layout; they do not require annotations, another information taxonomy or persisted state.
 
 ### Always Visible
 
@@ -81,7 +81,7 @@ Use a dedicated route for full timelines, raw facts, review evidence, immutable 
 On the primary surface:
 
 - prefer a precise label, state, value, and next action over a paragraph;
-- allow at most one short contextual sentence when the title and state cannot carry the meaning;
+- add concise context when the title and state do not carry the meaning; let decision value determine its length;
 - move rationale, definitions, and detailed consequences into the appropriate disclosure layer;
 - show blocking reasons adjacent to disabled actions;
 - reveal full technical evidence on demand.

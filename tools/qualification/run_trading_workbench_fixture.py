@@ -63,6 +63,7 @@ from halpha.public_market_stream import (
     MarketStreamQuote,
     MarketStreamStatus,
 )
+from halpha.scalping.models import BinanceContract, BinanceContractCatalog
 from halpha.venue_integration.gateway import PersistedActionGate
 from halpha.venue_integration.facts import build_venue_fact
 from halpha.venue_integration.models import VenueFactKind, VenueFactSourceClass
@@ -187,6 +188,20 @@ class FixtureMarketContextProvider:
 class FixtureInstrumentRulesProvider:
     """Return stable Demo rules without reaching an exchange endpoint."""
 
+    async def list_contracts(self) -> BinanceContractCatalog:
+        return BinanceContractCatalog(
+            source="BINANCE_DEMO_EXCHANGE_INFO",
+            source_cutoff=datetime.now(UTC),
+            contracts=tuple(
+                BinanceContract(
+                    instrument_ref=instrument_ref,
+                    symbol=instrument_ref.removesuffix("-PERP"),
+                    base_asset=instrument_ref.removesuffix("USDT-PERP"),
+                )
+                for instrument_ref in sorted(FIXTURE_INSTRUMENT_REFS)
+            ),
+        )
+
     async def fetch(self, instrument_ref: str) -> InstrumentOrderRules:
         if instrument_ref not in FIXTURE_INSTRUMENT_REFS:
             raise InstrumentRulesUnavailable(
@@ -283,6 +298,12 @@ def _parse_args() -> argparse.Namespace:
         "--max-runtime-seconds",
         type=int,
         help="Gracefully stop and clean the fixture after this many seconds.",
+    )
+    parser.add_argument(
+        "--static-dist",
+        type=Path,
+        default=ROOT / "frontend" / "dist",
+        help="Serve an isolated frontend build without replacing the product assets.",
     )
     return parser.parse_args()
 
@@ -506,7 +527,7 @@ def _create_unknown_entry(
             sizing_taker_fee_rate="0.0006",
             sizing_effective_leverage="5",
             instrument_rules_digest="9" * 64,
-        ),
+        ).model_dump(mode="python", exclude_none=True),
     }
     proposal = StrategyProposal(
         **proposal_fields,
@@ -1029,7 +1050,8 @@ def main() -> int:
             market_context_provider=FixtureMarketContextProvider(),
             market_stream_provider=FixtureMarketStreamProvider(),
             instrument_rules_provider=FixtureInstrumentRulesProvider(),
-            static_dist=ROOT / "frontend" / "dist",
+            static_dist=args.static_dist,
+            product_build_id="a" * 64,
         )
         server_config = {
             "host": settings.app.bind,

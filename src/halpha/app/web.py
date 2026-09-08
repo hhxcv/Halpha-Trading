@@ -13,7 +13,7 @@ from typing import Annotated, Any, Literal
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -167,6 +167,15 @@ from halpha.planning.registry import (
 )
 from halpha.planning.transitions import ControlIntent
 from halpha.outcomes.repository import OutcomeConflict
+from halpha.scalping.models import (
+    BinanceContractCatalog,
+    ScalpCycleCreateResponse,
+    ScalpRecommendationPayload,
+    ScalpRecommendationResponse,
+    ScalpResultsResponse,
+    ScalpTriggerPayload,
+    recommended_scalp_template,
+)
 from halpha.user_workbench.repository import CommandConflict
 
 
@@ -178,6 +187,7 @@ LIVE_READ_ONLY_ALLOWED_POST_PATHS = frozenset(
         "/api/v1/decision-evidence/preview",
         "/api/v1/order-schedules/preview",
         "/api/v1/playbook-qualification/export",
+        "/api/v1/scalping/recommendation",
         "/api/v1/settings/test-email",
     }
 )
@@ -832,6 +842,9 @@ def create_app(
         gate_status_provider=current_gate_status,
         venue_account_type=settings.release.venue_account_type.value,
         live_profit_qualification_provider=current_live_profit_qualification,
+        scalp_executor_ready_provider=(
+            lambda: current_executor_status()["status"] == "READY"
+        ),
     )
     ai_review_coordinator = PlanAiReviewCoordinator(
         reviewer=(
@@ -1383,6 +1396,135 @@ def create_app(
                 status_code=503,
                 detail={"code": str(exc)},
             ) from None
+
+    @app.get(
+        "/api/v1/scalping/contracts",
+        response_model=BinanceContractCatalog,
+    )
+    async def scalping_contracts() -> BinanceContractCatalog:
+        try:
+            catalog = await public_instrument_rules.list_contracts()
+            require_current_instrument_rules_source(catalog.source)
+            return catalog
+        except InstrumentRulesUnavailable as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": str(exc)},
+            ) from None
+
+    @app.post(
+        "/api/v1/scalping/recommendation",
+        response_model=ScalpRecommendationResponse,
+    )
+    async def scalping_recommendation(
+        payload: ScalpRecommendationPayload,
+    ) -> ScalpRecommendationResponse:
+        try:
+            market = await public_market_context.fetch(payload.instrument_ref, 20)
+            require_current_market_source(market.source)
+        except MarketContextUnavailable as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": str(exc)},
+            ) from None
+        return domain_call(
+            lambda: recommended_scalp_template(payload.template, market)
+        )
+
+    @app.get(
+        "/api/v1/scalping/cycles/by-idempotency",
+        response_model=ScalpCycleCreateResponse | None,
+    )
+    def scalping_cycle_by_idempotency(
+        idempotency_key: Annotated[
+            str, Query(min_length=1, max_length=160, pattern=r"^\S+$")
+        ],
+    ) -> ScalpCycleCreateResponse | None:
+        return domain_call(
+            lambda: planning_api.scalp_cycle_lookup(idempotency_key=idempotency_key)
+        )
+
+    @app.post(
+        "/api/v1/scalping/cycles",
+        response_model=ScalpCycleCreateResponse,
+        status_code=201,
+    )
+    async def create_scalping_cycle(
+        payload: ScalpTriggerPayload,
+        idempotency_key: IdempotencyKey,
+    ) -> ScalpCycleCreateResponse:
+        replay = domain_call(
+            lambda: planning_api.scalp_cycle_replay(
+                payload,
+                idempotency_key=idempotency_key,
+            )
+        )
+        if replay is not None:
+            return replay
+        if settings.release.profile in {
+            "BINANCE_DEMO",
+            "BINANCE_LIVE_WRITE",
+        } and current_executor_status()["status"] != "READY":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "EXECUTOR_NOT_READY"},
+            )
+        maker_limit_price: str | None = None
+        if payload.template.entry_mode == "MAKER_ONLY_SAME_SIDE":
+            try:
+                market = await public_market_context.fetch(payload.instrument_ref, 20)
+                require_current_market_source(market.source)
+            except MarketContextUnavailable as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"code": str(exc)},
+                ) from None
+            maker_limit_price = (
+                market.bid_price
+                if payload.direction.value == "LONG"
+                else market.ask_price
+            )
+        preview = domain_call(
+            lambda: planning_api.scalp_cycle_preview(
+                payload,
+                idempotency_key=idempotency_key,
+                maker_limit_price=maker_limit_price,
+            )
+        )
+        schedule = await compile_activation_schedule(
+            preview,
+            refresh_rules=True,
+        )
+        if schedule is None or not schedule.valid:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "ORDER_SCHEDULE_INVALID"},
+            )
+        return domain_call(
+            lambda: planning_api.trigger_scalp_cycle(
+                payload,
+                idempotency_key=idempotency_key,
+                observed_at=datetime.now(UTC),
+                order_schedule_snapshot=schedule,
+                maker_limit_price=maker_limit_price,
+            )
+        )
+
+    @app.get(
+        "/api/v1/scalping/results",
+        response_model=ScalpResultsResponse,
+    )
+    def scalping_results(
+        scope: Literal["ALL", "TODAY", "ANCHOR"] = "TODAY",
+        anchor_at: datetime | None = None,
+    ) -> ScalpResultsResponse:
+        return domain_call(
+            lambda: planning_api.scalp_results(
+                scope=scope,
+                anchor_at=anchor_at,
+                observed_at=datetime.now(UTC),
+            )
+        )
 
     @app.get(
         "/api/v1/market-window",
@@ -2020,6 +2162,23 @@ def create_app(
             idempotency_key,
         )
 
+    @app.get(
+        "/api/v1/activations/{activation_id}/exit-by-idempotency",
+        response_model=ReceiptResponse | None,
+    )
+    def exit_by_idempotency(
+        activation_id: UUID,
+        idempotency_key: Annotated[
+            str, Query(min_length=1, max_length=160, pattern=r"^\S+$")
+        ],
+    ) -> dict[str, Any] | None:
+        return domain_call(
+            lambda: planning_api.exit_receipt_lookup(
+                str(activation_id),
+                idempotency_key=idempotency_key,
+            )
+        )
+
     @app.post("/api/v1/activations/{activation_id}/takeover", response_model=ReceiptResponse)
     def user_takeover(
         activation_id: UUID,
@@ -2397,7 +2556,14 @@ def create_app(
     def frontend(request: Request, requested_path: str) -> FileResponse | HTMLResponse | RedirectResponse:
         segments = requested_path.strip("/").split("/") if requested_path else []
         accepted = (
-            segments in (["overview"], ["plans"], ["plans", "new"], ["reviews"], ["settings"])
+            segments in (
+                ["overview"],
+                ["scalping"],
+                ["plans"],
+                ["plans", "new"],
+                ["reviews"],
+                ["settings"],
+            )
             or (len(segments) == 3 and segments[0] == "plans" and segments[2] == "activate")
             or (len(segments) == 3 and segments[0] == "plans" and segments[2] == "edit")
             or (len(segments) == 2 and segments[0] in {"activations", "reviews"})

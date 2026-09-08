@@ -133,6 +133,14 @@ class PostgreSQLOutcomeRepository:
         return tuple(_review_from_row(row) for row in rows)
 
     def list_reviews(self) -> tuple[Review, ...]:
+        return self._list_reviews(include_scalp=False)
+
+    def list_evidence_reviews(self) -> tuple[Review, ...]:
+        """Include hidden scalp reviews for exact-cohort evidence projections."""
+
+        return self._list_reviews(include_scalp=True)
+
+    def _list_reviews(self, *, include_scalp: bool) -> tuple[Review, ...]:
         rows = self._connection.execute(
             """
             SELECT DISTINCT ON (review_id)
@@ -140,11 +148,21 @@ class PostgreSQLOutcomeRepository:
                    previous_version, revision_reason, status, primary_result, fact_cutoff,
                    input_refs, input_digest, account_result, open_responsibilities,
                    evaluations, evidence_purpose, content_digest, created_at
-            FROM halpha.review
-            WHERE environment_id = %s
+            FROM halpha.review review
+            WHERE review.environment_id = %s
+              AND (%s OR NOT EXISTS (
+                SELECT 1
+                FROM halpha.plan_activation activation
+                JOIN halpha.trade_plan_version version
+                  ON version.environment_id = activation.environment_id
+                 AND version.plan_version_id = activation.plan_version_ref
+                WHERE activation.environment_id = review.environment_id
+                  AND activation.activation_id = review.activation_id
+                  AND version.terms ->> 'workflow_kind' = 'SCALP_CYCLE'
+              ))
             ORDER BY review_id, review_version DESC
             """,
-            (self._environment_id,),
+            (self._environment_id, include_scalp),
         ).fetchall()
         return tuple(_review_from_row(row) for row in rows)
 

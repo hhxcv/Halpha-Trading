@@ -186,7 +186,10 @@ function syntheticPlanAiReview(
   };
 }
 
-async function routeCurrentDemoMarketStream(page: Page) {
+async function routeCurrentDemoMarketStream(
+  page: Page,
+  referencePrice: () => string = () => "65001",
+) {
   // Creation flows require one coherent snapshot: history for chart/preview,
   // context for stops and the live stream for freshness.  Keep all three
   // deterministic whenever a test opts into the current Demo stream; tests
@@ -195,7 +198,10 @@ async function routeCurrentDemoMarketStream(page: Page) {
   await routeCurrentDemoMarketContext(page);
   await routeValidOrderSchedulePreview(page);
   await page.routeWebSocket(/\/api\/v1\/market-stream/, (socket) => {
+    let closed = false;
     const sendCurrentFrames = () => {
+      if (closed || page.isClosed()) return;
+      const price = referencePrice();
       const timestamp = new Date(Date.now() + 4_000).toISOString();
       socket.send(JSON.stringify({
         type: "status",
@@ -210,9 +216,9 @@ async function routeCurrentDemoMarketStream(page: Page) {
         source: "BINANCE_DEMO_PUBLIC",
         source_cutoff: timestamp,
         received_at: timestamp,
-        bid_price: "65000",
-        ask_price: "65002",
-        reference_price: "65001",
+        bid_price: String(Number(price) - 1),
+        ask_price: String(Number(price) + 1),
+        reference_price: price,
       }));
       socket.send(JSON.stringify({
         type: "bar",
@@ -235,7 +241,12 @@ async function routeCurrentDemoMarketStream(page: Page) {
     };
     sendCurrentFrames();
     const timer = setInterval(sendCurrentFrames, 1_000);
-    socket.onClose(() => clearInterval(timer));
+    const stop = () => {
+      closed = true;
+      clearInterval(timer);
+    };
+    socket.onClose(stop);
+    page.on("close", stop);
   });
 }
 
@@ -630,6 +641,84 @@ async function addBrowserScopedCsrfCookie(page: Page) {
   }]);
 }
 
+async function routeDirectDraftAutosave(
+  page: Page,
+  unexpectedTradingWrites: string[],
+  beforeCreateResponse?: () => Promise<void>,
+) {
+  const planId = "workspace-autosave-fixture";
+  let saved: ReturnType<typeof syntheticDirectDraft> | null = null;
+  await page.route(/\/api\/v1\/plans(?:\/.*)?(?:\?.*)?$/, async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    const isCreate = path === "/api/v1/plans" && request.method() === "POST";
+    const isUpdate = path === `/api/v1/plans/${planId}` && request.method() === "PUT";
+    if (isCreate || isUpdate) {
+      const payload = request.postDataJSON() as Record<string, unknown>;
+      const { max_margin, max_notional, max_allowed_loss, valid_minutes, ...content } = payload;
+      const now = new Date().toISOString();
+      const base = syntheticDirectDraft(planId, (saved?.draft_version ?? 0) + 1, String(payload.plan_name));
+      saved = {
+        ...base,
+        environment_id: "binance-demo-primary",
+        content: {
+          ...base.content,
+          environment_id: "binance-demo-primary",
+          account_ref: "binance-usdm-demo-owner-primary",
+          authority_class: "DEMO_SIMULATION",
+          creator_kind: saved?.content.creator_kind ?? base.content.creator_kind,
+          ...content,
+          created_at: saved?.content.created_at ?? now,
+          requested_limits: {
+            max_margin: String(max_margin),
+            max_notional: String(max_notional),
+            max_allowed_loss: String(max_allowed_loss),
+          },
+          valid_from: now,
+          valid_until: new Date(Date.parse(now) + Number(valid_minutes) * 60_000).toISOString(),
+        },
+        updated_at: now,
+      };
+      if (isCreate) await beforeCreateResponse?.();
+      await route.fulfill({ status: isCreate ? 201 : 200, json: saved });
+      return;
+    }
+    if (request.method() === "GET" && path === `/api/v1/plans/${planId}`) {
+      await route.fulfill({ json: saved });
+      return;
+    }
+    if (request.method() === "GET" && path === `/api/v1/plans/${planId}/ai-review/latest`) {
+      await route.fulfill({ json: null });
+      return;
+    }
+    if (request.method() !== "GET" && request.method() !== "HEAD") {
+      unexpectedTradingWrites.push(`${request.method()} ${path}`);
+      await route.abort();
+      return;
+    }
+    await route.fallback();
+  });
+  await page.route(/\/api\/v1\/activations(?:\/.*)?(?:\?.*)?$/, async (route) => {
+    const request = route.request();
+    if (request.method() !== "GET" && request.method() !== "HEAD") {
+      unexpectedTradingWrites.push(`${request.method()} ${new URL(request.url()).pathname}`);
+      await route.abort();
+      return;
+    }
+    await route.fallback();
+  });
+  return () => saved;
+}
+
+async function expectDirectSubmitProblem(page: Page, message: string | RegExp) {
+  const submit = page.getByRole("button", { name: "提交并启动", exact: true });
+  await expect(submit).toBeDisabled();
+  await submit.locator("..").hover();
+  await expect(page.getByRole("tooltip")).toContainText(message);
+  await page.mouse.move(8, 8);
+  await expect(page.getByRole("tooltip")).toBeHidden();
+}
+
 async function openDirectMilestone(
   page: Page,
   milestone: "1 入场" | "2 保护" | "3 退出" | "4 核对" | "5 AI审核",
@@ -640,11 +729,6 @@ async function openDirectMilestone(
   const button = navigation.getByRole("button", {
     name: new RegExp(`${milestoneLabel}$`),
   });
-  for (let step = 0; step < 5 && !await button.isEnabled(); step += 1) {
-    const nextButton = page.getByRole("button", { name: "下一步", exact: true });
-    await expect(nextButton).toBeEnabled({ timeout: 20_000 });
-    await nextButton.click();
-  }
   await expect(button).toBeEnabled();
   await button.click();
   await expect(button).toHaveAttribute("aria-current", "step");
@@ -890,24 +974,7 @@ test("direct execution layout stays usable without overlap or clipped chart deta
   await routeCurrentDemoMarketContext(page);
   await routeReadyDemoExecutor(page);
   await routeValidOrderSchedulePreview(page);
-  await page.route(/\/api\/v1\/plans(?:\/[^/?#]+\/activate)?(?:\?.*)?$/, async (route) => {
-    const request = route.request();
-    if (request.method() === "POST") {
-      attemptedTradingWrites.push(request.url());
-      await route.abort();
-      return;
-    }
-    await route.continue();
-  });
-  await page.route(/\/api\/v1\/activations(?:\/.*)?(?:\?.*)?$/, async (route) => {
-    const request = route.request();
-    if (request.method() !== "GET" && request.method() !== "HEAD") {
-      attemptedTradingWrites.push(request.url());
-      await route.abort();
-      return;
-    }
-    await route.continue();
-  });
+  await routeDirectDraftAutosave(page, attemptedTradingWrites);
 
   const viewports = testInfo.project.name === "chromium-narrow"
     ? directExecutionViewports.narrow
@@ -926,19 +993,19 @@ test("direct execution layout stays usable without overlap or clipped chart deta
 
     await openDirectMilestone(page, "1 入场");
     await assertChartHeaderClear(chartRegion);
-    await assertEditorSectionHeadingClear(page, "下单金额", "下单额模式");
+    await assertEditorSectionHeadingClear(page, "下单金额", "下单金额（USDT）");
     await openDirectMilestone(page, "2 保护");
     await assertEditorSectionHeadingClear(page, "成交后立即保护", "初始止损距离（bps）");
     await openDirectMilestone(page, "3 退出");
     await expect(page.getByRole("heading", { name: "自动退出", exact: true })).toBeVisible();
     await openDirectReview(page);
-    await expect(page.getByText("技术预览通过", { exact: true })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByText(/^技术预览可保存 · 1 档 · 标准化总额/)).toBeVisible({ timeout: 15_000 });
     await assertLastChartDetailReachable(chartRegion, testInfo, viewport.name);
     await assertNoDocumentHorizontalOverflow(page, testInfo, viewport.name);
   }
 
-  expect(attemptedTradingWrites, "布局回归只允许读取行情和生成安全预览").toEqual([]);
-  await expect(page).toHaveURL(/\/plans\/new\?mode=direct$/);
+  expect(attemptedTradingWrites, "布局回归允许内存草稿自动保存，不得确认或启动计划").toEqual([]);
+  await expect(page).toHaveURL(/\/plans\/workspace-autosave-fixture\/edit$/);
   await testInfo.attach(`direct-layout-${testInfo.project.name}.png`, {
     body: await page.screenshot({ fullPage: true }),
     contentType: "image/png",
@@ -952,38 +1019,21 @@ test("direct shortcut reaches a launch-ready workspace once its decision record 
   await routeCurrentDemoMarketContext(page);
   await routeReadyDemoExecutor(page);
   await routeValidOrderSchedulePreview(page);
-  await page.route(/\/api\/v1\/plans(?:\/.*)?(?:\?.*)?$/, async (route) => {
-    const request = route.request();
-    if (request.method() !== "GET" && request.method() !== "HEAD") {
-      attemptedTradingWrites.push(request.url());
-      await route.abort();
-      return;
-    }
-    await route.continue();
-  });
-  await page.route(/\/api\/v1\/activations(?:\/.*)?(?:\?.*)?$/, async (route) => {
-    const request = route.request();
-    if (request.method() !== "GET" && request.method() !== "HEAD") {
-      attemptedTradingWrites.push(request.url());
-      await route.abort();
-      return;
-    }
-    await route.continue();
-  });
+  await routeDirectDraftAutosave(page, attemptedTradingWrites);
 
   await page.goto("/plans");
   await page.getByRole("button", { name: "直接执行", exact: true }).click();
 
   await expect(page).toHaveURL(/\/plans\/new\?mode=direct$/);
   await expect(page.getByRole("heading", { name: "选择执行依据" })).toHaveCount(0);
-  await openDirectReview(page);
   await expect(page.getByLabel("计划名称")).toHaveValue(/^BTCUSDT 直接执行 .+/);
   await expect(page.getByLabel("计划有效分钟")).toHaveValue("60");
+  await openDirectReview(page);
   await expect(page.getByRole("button", {
     name: "提交并启动",
     exact: true,
   })).toBeDisabled({ timeout: 20_000 });
-  await expect(page.getByRole("heading", { name: "计划概要" }).locator(".."))
+  await expect(page.getByRole("region", { name: "计划概要", exact: true }))
     .toContainText("TP1 2R / 100%");
   expect(attemptedTradingWrites).toEqual([]);
 });
@@ -1237,6 +1287,71 @@ test("direct configuration allocates and autosaves an editable draft", async ({ 
   });
 });
 
+test("the first autosave reply preserves a protection edit made while creation was pending", async ({ page }) => {
+  const attemptedTradingWrites: string[] = [];
+  let firstCreateStarted = false;
+  let releaseCreate = () => {};
+  const createResponseGate = new Promise<void>((resolve) => { releaseCreate = resolve; });
+  await routeCurrentDemoMarketStream(page);
+  await routeReadyDemoExecutor(page);
+  const savedDraft = await routeDirectDraftAutosave(page, attemptedTradingWrites, async () => {
+    firstCreateStarted = true;
+    await createResponseGate;
+  });
+
+  try {
+    await page.goto("/plans/new?mode=direct&creator_kind=AI");
+    await expect.poll(() => firstCreateStarted, { timeout: 15_000 }).toBe(true);
+    expect(savedDraft()!.content.order_schedule_spec.protection_policy.initial_stop.distance_bps).toBe("100");
+    await openDirectMilestone(page, "2 保护");
+    const stopDistance = page.getByRole("spinbutton", { name: "初始止损距离（bps）" });
+    await stopDistance.fill("0");
+    await expect(stopDistance).toHaveValue("0");
+
+    const initialRead = page.waitForResponse((response) => (
+      response.request().method() === "GET"
+      && new URL(response.url()).pathname === "/api/v1/plans/workspace-autosave-fixture"
+    ));
+    releaseCreate();
+    await initialRead;
+    await expect(page).toHaveURL(/\/plans\/workspace-autosave-fixture\/edit$/);
+    await page.evaluate(() => new Promise<void>((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    }));
+    await expect(stopDistance).toHaveValue("0");
+    await expectDirectSubmitProblem(page, "初始止损距离必须大于 0 且低于 10000 bps。");
+    expect(attemptedTradingWrites).toEqual([]);
+
+    const serverDraft = savedDraft()!;
+    const protection = serverDraft.content.order_schedule_spec.protection_policy;
+    const reloadedDraft = {
+      ...serverDraft,
+      draft_version: serverDraft.draft_version + 1,
+      content_digest: "f".repeat(64),
+      content: {
+        ...serverDraft.content,
+        order_schedule_spec: {
+          ...serverDraft.content.order_schedule_spec,
+          protection_policy: {
+            ...protection,
+            initial_stop: { ...protection.initial_stop, distance_bps: "75" },
+          },
+        },
+      },
+    };
+    await page.route("**/api/v1/plans/workspace-autosave-fixture", async (route) => {
+      if (route.request().method() === "GET") await route.fulfill({ json: reloadedDraft });
+      else await route.fallback();
+    });
+    await page.reload();
+    await openDirectMilestone(page, "2 保护");
+    await expect(stopDistance).toHaveValue("75");
+    expect(attemptedTradingWrites).toEqual([]);
+  } finally {
+    releaseCreate();
+  }
+});
+
 test("plan creation entry explains a blocked new-risk discipline without disabling draft preparation", async ({ page }, testInfo) => {
   await routeReadyDemoExecutor(page);
   await page.route(/\/api\/v1\/overview(?:\?.*)?$/, async (route) => {
@@ -1278,7 +1393,8 @@ test("plan creation entry explains a blocked new-risk discipline without disabli
     hasText: "新增风险纪律未通过",
   });
   await expect(notice).toContainText("当日已实现亏损已触发新增风险停止");
-  await expect(notice).toContainText("2026-08-14 00:00:00 UTC+8");
+  await expect(notice).toContainText("2026-08-14 00:00:00");
+  await expect(notice).not.toContainText("UTC+8");
   await expect(notice).toContainText("不是恢复承诺");
   await expect(notice).toContainText("创建入口仍可用于准备或保存草稿");
   await expect(page.getByRole("button", { name: "直接执行", exact: true })).toBeEnabled();
@@ -1526,16 +1642,7 @@ test("protection milestone offers explainable stop references without silently c
   await routeCurrentDemoMarketContext(page);
   await routeReadyDemoExecutor(page);
   await routeValidOrderSchedulePreview(page, () => previewDelayMs);
-  page.on("request", (request) => {
-    const pathname = new URL(request.url()).pathname;
-    if (
-      request.method() !== "GET"
-      && request.method() !== "HEAD"
-      && (pathname === "/api/v1/plans" || pathname === "/api/v1/activations")
-    ) {
-      attemptedTradingWrites.push(`${request.method()} ${pathname}`);
-    }
-  });
+  const savedDraft = await routeDirectDraftAutosave(page, attemptedTradingWrites);
 
   await page.goto("/plans/new?mode=direct");
   const chartRegion = page.locator('section[aria-labelledby="order-schedule-chart-title"]');
@@ -1593,6 +1700,7 @@ test("protection milestone offers explainable stop references without silently c
   expect((await adoptSwing.boundingBox())?.width).toBe(
     (await alternativeAdopt.boundingBox())?.width,
   );
+  const adoptedStopDistance = await stopDistance.inputValue();
   previewDelayMs = 0;
   await expect(page.getByTestId("initial-stop-projection"))
     .toContainText("全档成交预计均价");
@@ -1638,7 +1746,9 @@ test("protection milestone offers explainable stop references without silently c
   await openDirectMilestone(page, "1 入场");
   await expect(limitPrice).toHaveValue(initialLimitPrice);
   await expect(chartPrices).not.toContainText("量价摆动位");
-  expect(attemptedTradingWrites, "止损推荐仅允许安全预览，不得保存或启动计划").toEqual([]);
+  await expect.poll(() => savedDraft()?.content.order_schedule_spec.protection_policy.initial_stop.distance_bps)
+    .toBe(adoptedStopDistance);
+  expect(attemptedTradingWrites, "采用候选后只允许内存草稿自动保存，不得确认或启动计划").toEqual([]);
 });
 
 test("direct review blocks launch when the live price has already crossed a fixed entry boundary", async ({ page }) => {
@@ -1651,8 +1761,7 @@ test("direct review blocks launch when the live price has already crossed a fixe
   await page.getByRole("spinbutton", { name: "失效价（USDT）" }).fill("65100");
   await openDirectReview(page);
 
-  const boundaryAlert = page.getByTestId("entry-boundary-breach");
-  await expect(boundaryAlert).toContainText(
+  await expectDirectSubmitProblem(page,
     "当前标记价 65,001.0 USDT 已达到或跌破入场失效价 65,100.0 USDT",
   );
   await expect(page.getByRole("button", {
@@ -1668,11 +1777,94 @@ test("direct review blocks launch when the live price has already crossed a fixe
   await page.getByRole("spinbutton", { name: "失效价（USDT）" }).fill("64900");
   await openDirectReview(page);
 
-  await expect(boundaryAlert).toHaveCount(0);
+  const submit = page.getByRole("button", { name: "提交并启动", exact: true });
+  await submit.locator("..").hover();
+  await expect(page.getByRole("tooltip")).not.toContainText("已达到或跌破入场失效价");
+  await page.mouse.move(8, 8);
   await expect(page.getByRole("button", {
     name: "提交并启动",
     exact: true,
   })).toBeDisabled();
+});
+
+test("an approved direct draft stops submission when its live entry boundary or executor becomes invalid", async ({ page }) => {
+  test.setTimeout(90_000);
+  let quote = "65001";
+  const statusOverrides: Record<string, unknown> = {};
+  const attemptedTradingWrites: string[] = [];
+  await routeCurrentDemoMarketStream(page, () => quote);
+  await routeReadyDemoExecutor(page, { statusOverrides });
+  await page.route(/\/api\/v1\/overview(?:\?.*)?$/, async (route) => {
+    await route.fulfill({ json: {
+      new_risk_discipline: {
+        status: "ALLOWED",
+        new_risk_allowed: true,
+        blocker_codes: [],
+        available_notional_capacity: "1000",
+        max_plan_loss: "100",
+        minimum_reward_risk_ratio: "1",
+        open_risk_limit: "200",
+        open_risk_committed: "0",
+      },
+    } });
+  });
+  const savedDraft = await routeDirectDraftAutosave(page, attemptedTradingWrites);
+  let review: ReturnType<typeof syntheticPlanAiReview> | null = null;
+  let reviewCount = 0;
+  await page.route("**/api/v1/plans/workspace-autosave-fixture/ai-review/latest", async (route) => {
+    await route.fulfill({ json: review });
+  });
+  await page.route("**/api/v1/plans/workspace-autosave-fixture/ai-review", async (route) => {
+    const saved = savedDraft();
+    expect(saved).not.toBeNull();
+    reviewCount += 1;
+    review = syntheticPlanAiReview(
+      "APPROVED", saved!.draft_version, saved!.content_digest, "guard-review", null, saved!.plan_id,
+    );
+    await route.fulfill({ status: 202, json: review });
+  });
+
+  await page.goto("/plans/new?mode=direct&creator_kind=AI");
+  await page.getByRole("button", { name: "＋ 添加入场条件或管理规则" }).click();
+  await page.getByRole("button", { name: /行情失效/ }).click();
+  await page.getByRole("spinbutton", { name: "失效价（USDT）" }).fill("64900");
+  await openDirectAiReview(page);
+  const requestReview = page.getByRole("button", { name: "提交 AI 审核", exact: true });
+  await expect(requestReview).toBeEnabled({ timeout: 20_000 });
+  await requestReview.click();
+  const approved = page.getByTestId("plan-ai-review-approved");
+  const submit = page.getByRole("button", { name: "提交并启动", exact: true });
+  await expect(approved).toBeVisible();
+  await expect(submit).toBeEnabled({ timeout: 15_000 });
+  const approvedVersion = savedDraft()!.draft_version;
+  const approvedDigest = savedDraft()!.content_digest;
+
+  quote = "64890";
+  await expectDirectSubmitProblem(page, "当前标记价 64,890.0 USDT 已达到或跌破入场失效价 64,900.0 USDT");
+  await expect(approved).toBeVisible();
+  expect(savedDraft()!.draft_version).toBe(approvedVersion);
+  expect(savedDraft()!.content_digest).toBe(approvedDigest);
+
+  quote = "65001";
+  await expect(submit).toBeEnabled({ timeout: 15_000 });
+  // Reload reads the changed runtime snapshot while retaining the same saved
+  // draft and approval.  Neither preparation nor an old approval grants runtime authority.
+  statusOverrides.executor_status = "READY";
+  statusOverrides.app_executor_product_build_consistent = false;
+  await page.reload();
+  await openDirectMilestone(page, "5 AI审核");
+  await expect(approved).toBeVisible();
+  await expectDirectSubmitProblem(page, "应用与执行器版本不一致，不能提交并启动。");
+  await expect(page.getByRole("button", { name: "保存草稿", exact: true })).toBeEnabled();
+
+  statusOverrides.executor_status = "STARTING";
+  statusOverrides.app_executor_product_build_consistent = true;
+  await page.reload();
+  await openDirectMilestone(page, "5 AI审核");
+  await expect(approved).toBeVisible();
+  await expectDirectSubmitProblem(page, "执行器未就绪，不能提交并启动。");
+  expect(reviewCount).toBe(1);
+  expect(attemptedTradingWrites).toEqual([]);
 });
 
 test("direct review keeps the Demo launch action visible when the executor is unavailable", async ({ page }) => {
@@ -1693,9 +1885,7 @@ test("direct review keeps the Demo launch action visible when the executor is un
     name: "提交并启动",
     exact: true,
   })).toBeDisabled();
-  await expect(page.getByText("Demo 执行暂不可用：应用与执行器版本不一致。", {
-    exact: false,
-  })).toBeVisible();
+  await expectDirectSubmitProblem(page, "应用与执行器版本不一致，不能提交并启动。");
   await expect(page.getByRole("button", {
     name: "保存草稿",
     exact: true,
@@ -1715,13 +1905,12 @@ test("direct plan creation does not consume or repeat review performance", async
   });
 
   await page.goto("/plans/new?mode=direct");
-  await openDirectReview(page);
-
-  await expect(page.getByRole("heading", { name: "计划信息", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "计划基础信息", exact: true })).toBeVisible();
   await expect(page.getByLabel("计划名称")).toBeVisible();
   await expect(page.getByRole("combobox", { name: "创建方式" })).toBeVisible();
   await expect(page.getByLabel("计划有效分钟")).toBeVisible();
   await expect(page.getByRole("combobox", { name: "创建方式" })).toContainText("人工创建");
+  await openDirectReview(page);
   await expect(page.getByText("近期同工具实际结果不利", { exact: false })).toHaveCount(0);
   await expect(page.getByText("当前样本未证明正期望", { exact: false })).toHaveCount(0);
   await expect(page.getByRole("region", { name: "费用后收益门槛" })).toHaveCount(0);
@@ -1736,16 +1925,15 @@ test("direct entry schemes clear incompatible fields and preserve compatible ord
   await routeReadyDemoExecutor(page);
   await page.goto("/plans/new?mode=direct");
 
-  const nextButton = page.getByRole("button", { name: "下一步", exact: true });
+  const protectionTab = page.getByRole("navigation", { name: "计划创建步骤" }).getByRole("button", { name: /保护$/ });
   const marketButton = page.getByRole("button", { name: "市价", exact: true });
   const limitButton = page.getByRole("button", { name: "限价", exact: true });
   const makerOnly = page.getByRole("switch", { name: "Maker only" });
 
   await page.getByRole("radio", { name: /时间分批/ }).click();
   await expect(marketButton).toHaveAttribute("aria-pressed", "true");
-  await expect(makerOnly).toBeDisabled();
+  await expect(makerOnly).toHaveCount(0);
   await limitButton.click();
-  await page.getByText(/交易所订单选项 · IOC/).click();
   const timeInForce = page.getByRole("combobox", { name: "有效方式" });
   await expect(timeInForce).toContainText("IOC");
   await timeInForce.click();
@@ -1757,9 +1945,9 @@ test("direct entry schemes clear incompatible fields and preserve compatible ord
   await page.getByRole("radio", { name: /一次性入场/ }).click();
   await expect(marketButton).toHaveAttribute("aria-pressed", "true");
   await expect(page.getByText("市价单不能设置限价。")).toHaveCount(0);
-  await expect(nextButton).toBeEnabled();
+  await expect(protectionTab).toBeEnabled();
 
-  await page.getByRole("radio", { name: /价格区间分批/ }).click();
+  await page.getByRole("radio", { name: /价格阶梯入场/ }).click();
   await expect(marketButton).toBeDisabled();
   await expect(page.getByRole("button", { name: "分档限价", exact: true }))
     .toHaveAttribute("aria-pressed", "true");
@@ -1767,11 +1955,10 @@ test("direct entry schemes clear incompatible fields and preserve compatible ord
 
   await page.getByRole("radio", { name: /事件触发入场/ }).click();
   await expect(page.getByRole("heading", { name: "入场前置条件" })).toBeVisible();
-  await expect(nextButton).toBeEnabled();
+  await expect(protectionTab).toBeEnabled();
   await page.getByRole("button", { name: "移除短时异动" }).click();
-  await expect(nextButton).toBeDisabled();
-  await expect(page.getByText("事件触发入场必须至少配置一个价格、K 线收盘或短时变动事件。"))
-    .toBeVisible();
+  await expect(protectionTab).toBeEnabled();
+  await expectDirectSubmitProblem(page, "事件触发入场必须至少配置一个价格、K 线收盘或短时变动事件。");
 
   await page.getByRole("radio", { name: /一次性入场/ }).click();
   await limitButton.click();
@@ -1818,34 +2005,30 @@ test("time-sliced amount growth uses time order instead of price order", async (
   await expect(page.getByRole("option", { name: "从低价到高价" })).toHaveCount(0);
 });
 
-test("direct milestones require protection and an automatic exit before review", async ({ page }) => {
+test("direct milestones remain switchable while submission requires protection and a price exit", async ({ page }) => {
   await routeCurrentDemoMarketStream(page);
   await routeReadyDemoExecutor(page);
   await page.goto("/plans/new?mode=direct");
+  await openDirectReview(page);
   await openDirectMilestone(page, "3 退出");
 
   const navigation = page.getByRole("navigation", { name: "计划创建步骤" });
   const reviewMilestone = navigation.getByRole("button", { name: /核对$/ });
-  const nextButton = page.getByRole("button", { name: "下一步", exact: true });
-
   await page.getByRole("button", { name: "移除分级止盈" }).click();
-  await expect(reviewMilestone).toBeDisabled();
-  await expect(nextButton).toBeDisabled();
-  await expect(navigation.locator("button").nth(0)).toContainText("✓");
-  await expect(navigation.locator("button").nth(1)).toContainText("✓");
-  await expect(navigation.locator("button").nth(1)).toBeEnabled();
-  await expect(page.getByText("必须保留至少一种自动止盈、收益锁定或时间退出方式。"))
-    .toBeVisible();
+  await expect(reviewMilestone).toBeEnabled();
+  await expect(navigation.getByRole("button", { name: /保护$/ })).toBeEnabled();
+  await expectDirectSubmitProblem(page, "价格退出的计划加权收益 / 风险必须达到");
 
   await page.getByRole("button", { name: "＋ 添加退出方式" }).click();
   await page.getByRole("button", { name: /比例锁盈/ }).click();
-  await expect(reviewMilestone).toBeEnabled();
-  await expect(nextButton).toBeEnabled();
-
-  await nextButton.click();
-  await expect(page.getByRole("heading", { name: "计划概要" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "计划概要" }).locator(".."))
-    .toContainText("达到 1R 后锁定峰值盈利 50%");
+  await expectDirectSubmitProblem(page, "价格退出的计划加权收益 / 风险必须达到");
+  await page.getByRole("button", { name: "＋ 添加退出方式" }).click();
+  await page.getByRole("button", { name: "固定 / 分级止盈 · 1–4 个价格目标", exact: true }).click();
+  await openDirectMilestone(page, "4 核对");
+  const summary = page.getByRole("region", { name: "计划概要", exact: true });
+  await expect(summary).toContainText("达到 1R 后锁定峰值盈利 50%");
+  await expect(summary).toContainText("TP1 1R / 50% · TP2 2R / 50%");
+  await expectDirectSubmitProblem(page, "完成当前草稿的 AI 审核并获得批准。");
 });
 
 test("direct exit uses attributed fees and current spread without inventing a live fee quote", async ({ page }) => {
@@ -1855,16 +2038,16 @@ test("direct exit uses attributed fees and current spread without inventing a li
   await openDirectMilestone(page, "3 退出");
 
   const summary = page.getByTestId("after-cost-estimate");
-  await expect(summary).toContainText("费用后风险收益 · 按标准化名义额");
+  await expect(summary).toContainText("费用后风险收益");
   await expect(summary).toContainText("预计手续费");
   await expect(summary).toContainText("0.40 USDT");
-  await expect(summary).toContainText("当前盘口成本");
-  await expect(summary).toContainText("0.015384 USDT");
+  await expect(summary).toContainText("费用后目标净收益");
+  await expect(summary).toContainText("+9.58 USDT");
   await expect(summary).toContainText("费用后净盈亏比");
   await expect(summary).toContainText("1.76 : 1");
   await expect(summary).toContainText("入场 Taker 4 bps，退出 Taker 4 bps");
-  await expect(summary).toContainText("不是当前交易所费率报价");
-  await expect(summary).toContainText("未计资金费与触发后滑点");
+  await expect(summary).toContainText("近期实付参考");
+  await expect(summary).toContainText("样本截至");
 
   await openDirectMilestone(page, "1 入场");
   await page.getByRole("switch", { name: "Maker only" }).click();
@@ -1911,15 +2094,15 @@ test("direct review exposes exact entry, invalidation, protection, and exit inte
   }).fill("900");
 
   await openDirectReview(page);
-  const summary = page.getByRole("heading", { name: "计划概要" }).locator("..");
+  const summary = page.getByRole("region", { name: "计划概要", exact: true });
   await expect(summary).toContainText("全部满足");
-  await expect(summary).toContainText("标记价 ≥ 63,600 USDT");
+  await expect(summary).toContainText("标记价 ≥ 63,600.00 USDT");
   await expect(summary).toContainText("30 秒下跌 ≥ 10 bps");
-  await expect(summary).toContainText("标记价 ≥ 63,850 USDT 时取消");
-  await expect(summary).toContainText("标记价 ≤ 63,300 USDT 时视为错过");
+  await expect(summary).toContainText("标记价 ≥ 63,850.00 USDT 时取消");
+  await expect(summary).toContainText("标记价 ≤ 63,300.00 USDT 时视为错过");
   await expect(summary).toContainText("30 秒反向上涨 ≥ 50 bps 时取消");
   await expect(summary).toContainText(
-    "每笔确认成交后建立标记价止损 · 距离 30 bps",
+    "标记价止损 · 30 bps",
   );
   await expect(summary).toContainText("TP1 2R / 100%");
   await expect(summary).toContainText("首笔成交后 900 秒发起整组退出");
@@ -3000,31 +3183,22 @@ test("direct execution milestones compose entry and exit capabilities without hi
   await routeCurrentDemoMarketContext(page);
   await routeReadyDemoExecutor(page);
   await routeValidOrderSchedulePreview(page);
-  page.on("request", (request) => {
-    const pathname = new URL(request.url()).pathname;
-    if (
-      request.method() !== "GET"
-      && request.method() !== "HEAD"
-      && (pathname === "/api/v1/plans" || pathname === "/api/v1/activations")
-    ) {
-      tradingWrites.push(`${request.method()} ${pathname}`);
-    }
-  });
+  await routeDirectDraftAutosave(page, tradingWrites);
 
   await page.goto("/plans/new?mode=direct");
   await expect(page.getByText("65,001.00", { exact: true })).toHaveText("65,001.00", {
     timeout: 15_000,
   });
   const milestones = page.getByRole("navigation", { name: "计划创建步骤" });
-  await expect(milestones.getByRole("button")).toHaveCount(4);
+  await expect(milestones.getByRole("button")).toHaveCount(5);
   await expect(page.getByRole("radio", {
-    name: "一次性入场 条件满足后提交一笔",
+    name: "一次性入场",
   })).toBeChecked();
   await expect(milestones.getByRole("button", { name: "1 入场" }))
     .toHaveAttribute("aria-current", "step");
 
   await page.getByRole("radio", {
-    name: "事件触发入场 价格或短时异动触发",
+    name: "事件触发入场",
   }).click();
   await expect(page.getByRole("heading", { name: "入场前置条件" })).toBeVisible();
   await expect(page.getByRole("button", { name: "移除短时异动" })).toBeVisible();
@@ -3033,7 +3207,7 @@ test("direct execution milestones compose entry and exit capabilities without hi
   await expect(page.getByRole("switch", { name: "Maker only" })).toBeEnabled();
 
   await page.getByRole("radio", {
-    name: "价格区间分批 多个价格档依次入场",
+    name: "价格阶梯入场",
   }).click();
   await expect(page.getByRole("heading", { name: "入场前置条件" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "市价", exact: true })).toBeDisabled();
@@ -3091,7 +3265,7 @@ test("direct execution milestones compose entry and exit capabilities without hi
   await expect(page.getByText("价格区间分批 · 5 档", { exact: true })).toBeVisible();
   await expect(page.getByText("限价 · GTC · 高→低", { exact: true })).toBeVisible();
   await expect(page.getByText(
-    "每笔确认成交后建立标记价止损 · 距离 100 bps",
+    "标记价止损 · 100 bps",
     { exact: true },
   )).toBeVisible();
   await expect(page.getByText(/TP1 2R \/ 100% · 阶梯保盈：1R → 止损 0R、2R → 止损 1R/))
@@ -3196,24 +3370,7 @@ test("direct execution uses one live stream while chart timeframes switch", asyn
       }
     }
   });
-  await page.route(/\/api\/v1\/plans(?:\/.*)?(?:\?.*)?$/, async (route) => {
-    const request = route.request();
-    if (request.method() !== "GET" && request.method() !== "HEAD") {
-      attemptedTradingWrites.push(request.url());
-      await route.abort();
-      return;
-    }
-    await route.continue();
-  });
-  await page.route(/\/api\/v1\/activations(?:\/.*)?(?:\?.*)?$/, async (route) => {
-    const request = route.request();
-    if (request.method() !== "GET" && request.method() !== "HEAD") {
-      attemptedTradingWrites.push(request.url());
-      await route.abort();
-      return;
-    }
-    await route.continue();
-  });
+  await routeDirectDraftAutosave(page, attemptedTradingWrites);
   await routeCurrentDemoMarketWindow(page);
   await routeCurrentDemoMarketContext(page);
   await routeReadyDemoExecutor(page);
@@ -4155,20 +4312,21 @@ test("direct execution reconnects the local market stream and resynchronizes his
 });
 
 test("direct execution keeps the K-line chart as the primary annotated workspace", async ({ page }, testInfo) => {
-  const attemptedPlanCreates: string[] = [];
+  const attemptedTradingWrites: string[] = [];
+  const invalidDraftWrites: unknown[] = [];
   await routeCurrentDemoMarketStream(page);
   await routeCurrentDemoMarketWindow(page);
   await routeCurrentDemoMarketContext(page);
   await routeReadyDemoExecutor(page);
   await routeValidOrderSchedulePreview(page);
-  await page.route(/\/api\/v1\/plans(?:\?.*)?$/, async (route) => {
-    const request = route.request();
-    if (request.method() === "POST") {
-      attemptedPlanCreates.push(request.url());
-      await route.abort();
-      return;
+  await routeDirectDraftAutosave(page, attemptedTradingWrites);
+  page.on("request", (request) => {
+    const path = new URL(request.url()).pathname;
+    if ((request.method() === "POST" && path === "/api/v1/plans")
+      || (request.method() === "PUT" && path === "/api/v1/plans/workspace-autosave-fixture")) {
+      const payload = request.postDataJSON() as { max_notional?: string };
+      if (!(Number(payload.max_notional) > 0)) invalidDraftWrites.push(payload);
     }
-    await route.continue();
   });
   if (testInfo.project.name === "chromium-desktop") {
     await page.setViewportSize({ width: 1123, height: 920 });
@@ -4211,7 +4369,7 @@ test("direct execution keeps the K-line chart as the primary annotated workspace
     await expect(chartRegion.getByRole("button", { name: "趋势线" })).toBeDisabled();
   }
 
-  await page.getByRole("radio", { name: /价格区间分批/ }).click();
+  await page.getByRole("radio", { name: /价格阶梯入场/ }).click();
   await page.getByLabel("下限（USDT）", { exact: true }).fill("65000");
   await page.getByLabel("上限（USDT）", { exact: true }).fill("66000");
   await page.getByLabel("每档金额（USDT）").fill("100");
@@ -4277,6 +4435,9 @@ test("direct execution keeps the K-line chart as the primary annotated workspace
     configClientHeight: document.querySelector<HTMLElement>("[data-testid='direct-order-config-scroll']")?.clientHeight ?? 0,
     configScrollHeight: document.querySelector<HTMLElement>("[data-testid='direct-order-config-scroll']")?.scrollHeight ?? 0,
   }));
+  if (layout.scrollWidth !== layout.clientWidth) {
+    await assertNoDocumentHorizontalOverflow(page, testInfo, `direct-chart-${testInfo.project.name}`);
+  }
   expect(layout.scrollWidth).toBe(layout.clientWidth);
   if (testInfo.project.name === "chromium-desktop") {
     expect(layout.pageHeight).toBe(layout.viewportHeight);
@@ -4290,11 +4451,12 @@ test("direct execution keeps the K-line chart as the primary annotated workspace
   const capitalLimit = page.getByLabel("资金上限（USDT）");
   await capitalLimit.fill("0");
   await capitalLimit.press("Enter");
-  await expect(page.getByRole("button", { name: "下一步", exact: true })).toBeDisabled();
-  await expect(page.getByText("计划交易金额必须大于 0。")).toBeVisible();
+  await expectDirectSubmitProblem(page, "计划交易金额必须大于 0。");
+  await expect(page.getByRole("button", { name: "保存草稿", exact: true })).toBeDisabled();
   await page.waitForTimeout(300);
-  expect(attemptedPlanCreates).toEqual([]);
-  await expect(page).toHaveURL(/\/plans\/new$/);
+  expect(invalidDraftWrites).toEqual([]);
+  expect(attemptedTradingWrites).toEqual([]);
+  await expect(page).toHaveURL(/\/plans\/workspace-autosave-fixture\/edit$/);
 });
 
 test("direct execution binds funding, loss preview, and discipline capacity before launch", async ({ page }, testInfo) => {

@@ -160,7 +160,7 @@ class PostgreSQLOutcomesApi:
         with self._connect() as connection, connection.transaction():
             reviews = OutcomeApplicationService(
                 connection, self._environment_id
-            ).list_reviews()
+            ).list_evidence_reviews()
             resolved_reviews = self._attach_trade_context(connection, reviews)
             return summarize_decision_evidence(
                 resolved_reviews,
@@ -236,7 +236,8 @@ class PostgreSQLOutcomesApi:
                    a.position_alignment,
                    v.parameter_digest,
                    v.terms -> 'decision_context',
-                   v.max_allowed_loss
+                   v.max_allowed_loss,
+                   v.terms ->> 'workflow_kind'
             FROM halpha.plan_activation a
             LEFT JOIN halpha.trade_plan_version v
               ON v.environment_id = a.environment_id
@@ -283,6 +284,11 @@ class PostgreSQLOutcomesApi:
                     str(row[14])
                     if len(row) > 14 and row[14] is not None
                     else None
+                ),
+                **(
+                    {"workflow_kind": str(row[15])}
+                    if len(row) > 15 and row[15] is not None
+                    else {}
                 ),
             }
             for row in rows
@@ -518,6 +524,7 @@ def summarize_decision_evidence(
             source_cutoffs.append(cutoff)
 
         historical_intent = str(decision_context.get("intent", ""))
+        is_scalp_cycle = context.get("workflow_kind") == "SCALP_CYCLE"
         if historical_intent != PlanDecisionIntent.PROFIT_SEEKING.value:
             exclude(
                 "VALIDATION_INTENT"
@@ -525,7 +532,7 @@ def summarize_decision_evidence(
                 else "MISSING_DECISION_INTENT"
             )
             continue
-        if str(review.get("status", "")) != "COMPLETE":
+        if not is_scalp_cycle and str(review.get("status", "")) != "COMPLETE":
             exclude("PENDING_REVIEW")
             continue
         evaluations = review.get("evaluations")
@@ -537,9 +544,29 @@ def summarize_decision_evidence(
         classification = (
             str(owner.get("result", "")) if isinstance(owner, Mapping) else ""
         )
-        if classification not in _DECISION_PERFORMANCE_CLASSIFICATIONS:
+        if (
+            not is_scalp_cycle
+            and classification not in _DECISION_PERFORMANCE_CLASSIFICATIONS
+        ):
             exclude(classification or "MISSING_CLASSIFICATION")
             continue
+        if is_scalp_cycle:
+            account_result = review.get("account_result")
+            responsibilities = review.get("open_responsibilities")
+            if (
+                not isinstance(account_result, Mapping)
+                or account_result.get("classification") not in {
+                    "NO_EXTERNAL_CHANGE",
+                    "ATTRIBUTED_FACTS_AVAILABLE",
+                    "ACCOUNT_FACTS_WITH_EXTERNAL_CLOSURE",
+                }
+                or account_result.get("missing_refs") != []
+                or not isinstance(responsibilities, Mapping)
+                or responsibilities.get("execution_action_refs") != []
+                or responsibilities.get("unknown_action_refs") != []
+            ):
+                exclude("UNRELIABLE_RESULT")
+                continue
         result = review.get("resolved_trade_result")
         if not isinstance(result, Mapping):
             exclude("UNRELIABLE_RESULT")

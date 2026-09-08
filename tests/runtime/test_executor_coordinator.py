@@ -809,6 +809,54 @@ def test_live_submission_guard_fails_closed_without_leaking_internal_error() -> 
         coordinator._require_current_live_write_gate("activation-live-001")
 
 
+def test_live_coordinator_extends_scope_only_after_the_current_gate_accepts() -> None:
+    observed: list[str] = []
+    coordinator = object.__new__(HalphaCoordinator)
+    coordinator._environment_kind = "LIVE"
+    coordinator._runtime_real_write_gate = "OPEN"
+    coordinator._live_write_risk_control_only = False
+    coordinator._live_write_activation_ids = frozenset({"activation-live-001"})
+    coordinator._live_write_submission_guard = observed.append
+
+    coordinator.authorize_live_write_activation("activation-live-002")
+
+    assert observed == ["activation-live-002"]
+    assert coordinator._live_write_activation_ids == frozenset(
+        {"activation-live-001", "activation-live-002"}
+    )
+
+
+def test_live_coordinator_accepts_the_first_activation_after_idle_startup() -> None:
+    observed: list[str] = []
+    coordinator = object.__new__(HalphaCoordinator)
+    coordinator._environment_kind = "LIVE"
+    coordinator._runtime_real_write_gate = "OPEN"
+    coordinator._live_write_risk_control_only = False
+    coordinator._live_write_activation_ids = frozenset()
+    coordinator._live_write_submission_guard = observed.append
+
+    coordinator.authorize_live_write_activation("activation-live-first")
+
+    assert observed == ["activation-live-first"]
+    assert coordinator._live_write_activation_ids == frozenset(
+        {"activation-live-first"}
+    )
+
+
+def test_live_coordinator_does_not_extend_scope_in_risk_control_mode() -> None:
+    coordinator = object.__new__(HalphaCoordinator)
+    coordinator._environment_kind = "LIVE"
+    coordinator._runtime_real_write_gate = "CLOSED"
+    coordinator._live_write_risk_control_only = True
+    coordinator._live_write_activation_ids = frozenset({"activation-live-001"})
+    coordinator._live_write_submission_guard = lambda _activation_id: pytest.fail(
+        "risk-control mode must not authorize a new activation"
+    )
+
+    with pytest.raises(RuntimeError, match="RUNTIME_REAL_WRITE_GATE_CLOSED"):
+        coordinator.authorize_live_write_activation("activation-live-002")
+
+
 def test_unknown_nautilus_result_records_specific_reason_without_terminal_fact() -> (
     None
 ):

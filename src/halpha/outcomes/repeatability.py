@@ -95,13 +95,12 @@ def assess_playbook_repeatability(
         early_count = trade_count - recent_count
         early_net_r = sum(valid_r_values[:early_count], Decimal(0))
         recent_net_r = sum(valid_r_values[early_count:], Decimal(0))
-        lower_confidence_bound, block_length = (
-            _moving_block_bootstrap_lower_mean(
+        if len(valid_r_values) >= 2:
+            lower_confidence_bound, block_length = _moving_block_bootstrap_lower_mean(
                 valid_r_values,
                 confidence_level=policy.confidence_level,
                 resamples=policy.bootstrap_resamples,
             )
-        )
 
     reason_codes: list[str] = []
     if intent == "VALIDATION":

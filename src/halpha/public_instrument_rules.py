@@ -6,7 +6,7 @@ import asyncio
 from datetime import UTC, datetime
 import re
 from time import monotonic
-from typing import Protocol
+from typing import Any, Mapping, Protocol
 
 from nautilus_trader.adapters.binance import get_cached_binance_http_client
 from nautilus_trader.adapters.binance.common.enums import (
@@ -19,6 +19,10 @@ from nautilus_trader.adapters.binance.futures.http.market import (
 from nautilus_trader.common.component import LiveClock
 
 from halpha.planning.order_schedule import InstrumentOrderRules
+from halpha.scalping.models import (
+    BinanceContract,
+    BinanceContractCatalog,
+)
 from halpha.venue_integration.binance_rules import (
     BinanceInstrumentRulesError,
     binance_exchange_symbol_rules,
@@ -45,6 +49,8 @@ class BinanceExchangeInfoApi(Protocol):
 
 class InstrumentRulesProvider(Protocol):
     async def fetch(self, instrument_ref: str) -> InstrumentOrderRules: ...
+
+    async def list_contracts(self) -> BinanceContractCatalog: ...
 
 
 def binance_public_instrument_rules_identity(
@@ -95,6 +101,7 @@ class BinancePublicInstrumentRules:
         self._query_attempts = max(1, query_attempts)
         self._retry_delay_seconds = max(0.0, retry_delay_seconds)
         self._cache: dict[str, tuple[float, InstrumentOrderRules]] = {}
+        self._catalog_cache: tuple[float, BinanceContractCatalog] | None = None
         self._failure_retry_after: dict[str, float] = {}
         self._failure_reason: dict[str, str] = {}
         self._lock = asyncio.Lock()
@@ -137,6 +144,19 @@ class BinancePublicInstrumentRules:
             except InstrumentRulesUnavailable as exc:
                 self._remember_failure(symbol, exc)
                 raise
+
+    async def list_contracts(self) -> BinanceContractCatalog:
+        cached = self._catalog_cache
+        now = monotonic()
+        if cached is not None and cached[0] > now:
+            return cached[1]
+        async with self._lock:
+            cached = self._catalog_cache
+            now = monotonic()
+            if cached is not None and cached[0] > now:
+                return cached[1]
+            exchange_info = await self._query_exchange_info()
+            return self._remember_catalog(exchange_info)
 
     def _preview_cached_result(
         self,
@@ -191,27 +211,11 @@ class BinancePublicInstrumentRules:
             self._cache.pop(symbol, None)
 
     async def _query_and_cache(self, symbol: str) -> InstrumentOrderRules:
-        exchange_info: object | None = None
-        for attempt in range(self._query_attempts):
-            try:
-                exchange_info = await asyncio.wait_for(
-                    self._market_api.query_futures_exchange_info(),
-                    timeout=INSTRUMENT_RULES_TIMEOUT_SECONDS,
-                )
-                break
-            except Exception as exc:
-                is_timeout = "TIMEOUT" in type(exc).__name__.upper()
-                if not is_timeout or attempt + 1 >= self._query_attempts:
-                    raise InstrumentRulesUnavailable(
-                        f"INSTRUMENT_RULES_QUERY_FAILED_{type(exc).__name__.upper()}"
-                    ) from None
-                if self._retry_delay_seconds > 0:
-                    await asyncio.sleep(self._retry_delay_seconds)
-        if exchange_info is None:
-            raise InstrumentRulesUnavailable("INSTRUMENT_RULES_QUERY_FAILED_UNKNOWN")
+        exchange_info = await self._query_exchange_info()
+        self._remember_catalog(exchange_info)
         try:
             rules = binance_exchange_symbol_rules(exchange_info, symbol)
-            source_time_ms = getattr(exchange_info, "serverTime", None)
+            source_time_ms = _value(exchange_info, "serverTime")
             if not isinstance(source_time_ms, int) or source_time_ms <= 0:
                 raise BinanceInstrumentRulesError("INSTRUMENT_RULES_CUTOFF_UNKNOWN")
             result = InstrumentOrderRules(
@@ -236,8 +240,89 @@ class BinancePublicInstrumentRules:
         self._failure_reason.pop(symbol, None)
         return result
 
+    async def _query_exchange_info(self) -> object:
+        exchange_info: object | None = None
+        for attempt in range(self._query_attempts):
+            try:
+                exchange_info = await asyncio.wait_for(
+                    self._market_api.query_futures_exchange_info(),
+                    timeout=INSTRUMENT_RULES_TIMEOUT_SECONDS,
+                )
+                break
+            except Exception as exc:
+                is_timeout = "TIMEOUT" in type(exc).__name__.upper()
+                if not is_timeout or attempt + 1 >= self._query_attempts:
+                    raise InstrumentRulesUnavailable(
+                        f"INSTRUMENT_RULES_QUERY_FAILED_{type(exc).__name__.upper()}"
+                    ) from None
+                if self._retry_delay_seconds > 0:
+                    await asyncio.sleep(self._retry_delay_seconds)
+        if exchange_info is None:
+            raise InstrumentRulesUnavailable("INSTRUMENT_RULES_QUERY_FAILED_UNKNOWN")
+        return exchange_info
+
+    def _remember_catalog(self, exchange_info: object) -> BinanceContractCatalog:
+        source_time_ms = _value(exchange_info, "serverTime")
+        symbols = _value(exchange_info, "symbols")
+        if (
+            not isinstance(source_time_ms, int)
+            or source_time_ms <= 0
+            or not isinstance(symbols, list)
+        ):
+            raise InstrumentRulesUnavailable("INSTRUMENT_CATALOG_INVALID")
+        contracts: list[BinanceContract] = []
+        for item in symbols:
+            symbol = str(_value(item, "symbol") or "")
+            status = str(_enum_text(_value(item, "status")) or "")
+            contract_type = str(_enum_text(_value(item, "contractType")) or "")
+            quote_asset = str(_value(item, "quoteAsset") or "")
+            base_asset = str(_value(item, "baseAsset") or "")
+            if (
+                status != "TRADING"
+                or contract_type != "PERPETUAL"
+                or quote_asset != "USDT"
+                or not base_asset
+                or _PERPETUAL_INSTRUMENT.fullmatch(f"{symbol}-PERP") is None
+            ):
+                continue
+            contracts.append(
+                BinanceContract(
+                    instrument_ref=f"{symbol}-PERP",
+                    symbol=symbol,
+                    base_asset=base_asset,
+                )
+            )
+        contracts.sort(key=lambda item: item.symbol)
+        catalog = BinanceContractCatalog(
+            source=self._source,
+            source_cutoff=datetime.fromtimestamp(source_time_ms / 1000, tz=UTC),
+            contracts=tuple(contracts),
+        )
+        self._catalog_cache = (monotonic() + self._ttl_seconds, catalog)
+        return catalog
+
 
 def _symbol_for_instrument(instrument_ref: str) -> str:
     if not _PERPETUAL_INSTRUMENT.fullmatch(instrument_ref):
         raise InstrumentRulesUnavailable("INSTRUMENT_RULES_INSTRUMENT_UNSUPPORTED")
     return instrument_ref.removesuffix("-PERP")
+
+
+def symbol_for_perpetual_instrument(instrument_ref: str) -> str:
+    return _symbol_for_instrument(instrument_ref)
+
+
+def perpetual_instrument_for_symbol(symbol: str) -> str:
+    instrument_ref = f"{symbol}-PERP"
+    _symbol_for_instrument(instrument_ref)
+    return instrument_ref
+
+
+def _value(source: object, name: str) -> Any:
+    if isinstance(source, Mapping):
+        return source.get(name)
+    return getattr(source, name, None)
+
+
+def _enum_text(value: object) -> object:
+    return getattr(value, "value", value)

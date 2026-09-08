@@ -1,8 +1,8 @@
 # Feedback, Async State, and Risk Controls
 
-## Every Action Has a Visible Lifecycle
+## Feedback for the Changed Action
 
-Specify feedback at four distinct layers:
+Use the following layers when they apply to a changed stateful action. A local selection need not acquire request identity, persistent progress or a new lifecycle.
 
 1. **Local response:** within perceptual immediacy, show pressed state, focus, field validation, or button-local activity and prevent accidental duplicate submission.
 2. **Request acknowledgement:** show that the request reached the responsible boundary; include a stable identity only when it is needed for retry, refresh or external-effect tracking.
@@ -52,9 +52,9 @@ For work that may outlive the current view and cannot be represented by the owni
 
 Avoid indefinite unlabeled spinners. If progress stalls, transition to a visible waiting, delayed, failed, or unknown state rather than silently continuing animation.
 
-## Risk-Action Inventory
+## Review Actions by Consequence
 
-Inventory proposed or existing actions by consequence, not by button color. Treat the following as review triggers, not as proof that Halpha owns or exposes the action:
+Review changed actions by consequence, not button color. The following are review triggers, not a required inventory or proof that Halpha owns the action:
 
 - deletion or irreversible evidence loss;
 - configuration changes that affect runtime, data, permissions, notifications, or recovery;
@@ -65,7 +65,7 @@ Inventory proposed or existing actions by consequence, not by button color. Trea
 - stopping a strategy, executor, application, or protective process;
 - exiting, taking over, releasing capital, or changing recovery authority.
 
-Review only the actions changed by the task, plus any directly coupled action with comparable irreversibility, uncertainty, privilege or exposure. Record the current owner, action, consequence preview and visual carrier. If the action has no current owner or result, report a design gap rather than inventing a generic command.
+Include directly coupled actions when their irreversibility, uncertainty, privilege or exposure can change. Locate the current owner and required consequence preview; do not create a separate record when the design and diff already make them clear. A new business action needs an owning contract through `write-halpha-docs`, not a generic UI command invented in its place.
 
 ## Consequence Preview and Explicit Action
 

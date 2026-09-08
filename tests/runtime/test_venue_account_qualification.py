@@ -14,6 +14,7 @@ from halpha.venue_account_qualification import (
     VenueAccountQualificationError,
     _HttpResponse,
     qualify_live_venue_account,
+    require_live_venue_symbols,
 )
 
 
@@ -105,6 +106,30 @@ def test_copy_lead_account_requires_status_and_symbol_whitelist() -> None:
     assert facts.server_time_ms == SERVER_TIME_MS
     assert len(requests) == 2
     assert all(item[1:] == (3.0, "http://127.0.0.1:7890") for item in requests)
+
+    assert require_live_venue_symbols(facts, ("ETHUSDT",)) is facts
+    with pytest.raises(
+        VenueAccountQualificationError,
+        match="VENUE_ACCOUNT_COPY_LEAD_SYMBOL_NOT_ALLOWED",
+    ):
+        require_live_venue_symbols(facts, ("SOLUSDT",))
+
+
+def test_copy_lead_startup_can_cache_whitelist_before_any_activation_exists() -> None:
+    facts = qualify_live_venue_account(
+        VenueAccountType.USDM_COPY_LEAD,
+        api_key=API_KEY,
+        api_secret=API_SECRET,
+        required_symbols=(),
+        clock_ms=lambda: SERVER_TIME_MS,
+        transport=_transport(
+            is_lead_trader=True,
+            symbols=("ETHUSDT", "SOLUSDT"),
+        ),
+    )
+
+    assert facts.lead_symbols == ("ETHUSDT", "SOLUSDT")
+    assert require_live_venue_symbols(facts, ("SOLUSDT",)) is facts
 
 
 def test_personal_account_requires_non_lead_status_without_whitelist_request() -> None:

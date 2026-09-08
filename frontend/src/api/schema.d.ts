@@ -90,6 +90,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/activations/{activation_id}/exit-by-idempotency": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Exit By Idempotency */
+        get: operations["exit_by_idempotency_api_v1_activations__activation_id__exit_by_idempotency_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/activations/{activation_id}/release-system-stop": {
         parameters: {
             query?: never;
@@ -565,6 +582,91 @@ export interface paths {
         };
         /** Review Price Path Evidence */
         get: operations["review_price_path_evidence_api_v1_reviews__review_id__price_path_evidence_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/scalping/contracts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Scalping Contracts */
+        get: operations["scalping_contracts_api_v1_scalping_contracts_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/scalping/cycles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create Scalping Cycle */
+        post: operations["create_scalping_cycle_api_v1_scalping_cycles_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/scalping/cycles/by-idempotency": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Scalping Cycle By Idempotency */
+        get: operations["scalping_cycle_by_idempotency_api_v1_scalping_cycles_by_idempotency_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/scalping/recommendation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Scalping Recommendation */
+        post: operations["scalping_recommendation_api_v1_scalping_recommendation_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/scalping/results": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Scalping Results */
+        get: operations["scalping_results_api_v1_scalping_results_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1238,6 +1340,39 @@ export interface components {
          * @enum {string}
          */
         AuthorityClass: "DEMO_VALIDATION" | "LIVE_REAL_CAPITAL" | "NO_TRADING_AUTHORITY";
+        /** BinanceContract */
+        BinanceContract: {
+            /** Base Asset */
+            base_asset: string;
+            /**
+             * Contract Type
+             * @default PERPETUAL
+             * @constant
+             */
+            contract_type: "PERPETUAL";
+            /** Instrument Ref */
+            instrument_ref: string;
+            /**
+             * Quote Asset
+             * @default USDT
+             * @constant
+             */
+            quote_asset: "USDT";
+            /** Symbol */
+            symbol: string;
+        };
+        /** BinanceContractCatalog */
+        BinanceContractCatalog: {
+            /** Contracts */
+            contracts: components["schemas"]["BinanceContract"][];
+            /** Source */
+            source: string;
+            /**
+             * Source Cutoff
+             * Format: date-time
+             */
+            source_cutoff: string;
+        };
         /**
          * BinancePriceMatch
          * @enum {string}
@@ -4066,6 +4201,278 @@ export interface components {
          * @enum {string}
          */
         RunState: "ACTIVE" | "PAUSED";
+        /** ScalpAggregate */
+        ScalpAggregate: {
+            /** Commission */
+            commission: string | null;
+            /**
+             * Currency
+             * @default USDT
+             */
+            currency: string;
+            /** Cycle Count */
+            cycle_count: number;
+            /** Flat Count */
+            flat_count: number;
+            /** Funding */
+            funding: string | null;
+            /** Gross Pnl */
+            gross_pnl: string | null;
+            /** Loss Count */
+            loss_count: number;
+            /** Net Pnl */
+            net_pnl: string | null;
+            /** No Trade Cycle Count */
+            no_trade_cycle_count: number;
+            /** Open Cycle Count */
+            open_cycle_count: number;
+            /** Reliable Trade Count */
+            reliable_trade_count: number;
+            /** Unknown Result Count */
+            unknown_result_count: number;
+            /** Win Count */
+            win_count: number;
+            /** Win Rate */
+            win_rate: string | null;
+        };
+        /** ScalpCycleCreateResponse */
+        ScalpCycleCreateResponse: {
+            /** Activation */
+            activation: {
+                [key: string]: unknown;
+            };
+            cycle: components["schemas"]["ScalpCycleRecord"];
+            /** Runtime Real Write Gate */
+            runtime_real_write_gate: string;
+            /**
+             * Venue Write Created
+             * @default false
+             * @constant
+             */
+            venue_write_created: false;
+        };
+        /** ScalpCycleRecord */
+        ScalpCycleRecord: {
+            /** Account Ref */
+            account_ref: string;
+            /** Activation Id */
+            activation_id: string;
+            /** Cycle Id */
+            cycle_id: string;
+            direction: components["schemas"]["Direction"];
+            /** Environment Id */
+            environment_id: string;
+            /** Idempotency Key */
+            idempotency_key: string;
+            /** Instrument Ref */
+            instrument_ref: string;
+            /** Plan Id */
+            plan_id: string;
+            /** Plan Version Id */
+            plan_version_id: string;
+            /** Request Digest */
+            request_digest: string;
+            template: components["schemas"]["ScalpTemplate-Output"];
+            /** Template Digest */
+            template_digest: string;
+            /**
+             * Triggered At
+             * Format: date-time
+             */
+            triggered_at: string;
+        };
+        /** ScalpCycleResult */
+        ScalpCycleResult: {
+            /** Activation Id */
+            activation_id: string;
+            /** Activation State Version */
+            activation_state_version: number;
+            /** Commission */
+            commission: string | null;
+            /** Currency */
+            currency: string | null;
+            /** Cycle Id */
+            cycle_id: string;
+            direction: components["schemas"]["Direction"];
+            /** Entry Notional */
+            entry_notional: string | null;
+            /** Funding */
+            funding: string | null;
+            /** Gross Pnl */
+            gross_pnl: string | null;
+            /** Holding Duration Seconds */
+            holding_duration_seconds: string | null;
+            /** Instrument Ref */
+            instrument_ref: string;
+            /** Lifecycle */
+            lifecycle: string;
+            /** Net Pnl */
+            net_pnl: string | null;
+            /**
+             * Result Status
+             * @enum {string}
+             */
+            result_status: "OPEN" | "RELIABLE" | "NO_TRADE" | "UNKNOWN";
+            /**
+             * Triggered At
+             * Format: date-time
+             */
+            triggered_at: string;
+        };
+        /** ScalpRecommendationPayload */
+        ScalpRecommendationPayload: {
+            /** Instrument Ref */
+            instrument_ref: string;
+            template: components["schemas"]["ScalpTemplate-Input"];
+        };
+        /** ScalpRecommendationResponse */
+        ScalpRecommendationResponse: {
+            /** Basis */
+            basis: string[];
+            /** Instrument Ref */
+            instrument_ref: string;
+            recommended_template: components["schemas"]["ScalpTemplate-Output"];
+            /** Source */
+            source: string;
+            /**
+             * Source Cutoff
+             * Format: date-time
+             */
+            source_cutoff: string;
+        };
+        /** ScalpResultsResponse */
+        ScalpResultsResponse: {
+            /** Account Ref */
+            account_ref: string;
+            aggregate: components["schemas"]["ScalpAggregate"];
+            /** Environment Id */
+            environment_id: string;
+            /**
+             * Fact Cutoff
+             * Format: date-time
+             */
+            fact_cutoff: string;
+            latest_cycle: components["schemas"]["ScalpCycleResult"] | null;
+            /**
+             * Range End
+             * Format: date-time
+             */
+            range_end: string;
+            /** Range Start */
+            range_start: string | null;
+            /**
+             * Scope
+             * @enum {string}
+             */
+            scope: "ALL" | "TODAY" | "ANCHOR";
+        };
+        /** ScalpTemplate */
+        "ScalpTemplate-Input": {
+            /**
+             * Entry Fee Bps
+             * @default 6
+             */
+            entry_fee_bps: string;
+            /**
+             * Entry Mode
+             * @default MARKET
+             * @enum {string}
+             */
+            entry_mode: "MARKET" | "MAKER_ONLY_SAME_SIDE";
+            /**
+             * Exit Fee Bps
+             * @default 6
+             */
+            exit_fee_bps: string;
+            /**
+             * Initial Stop Bps
+             * @default 35
+             */
+            initial_stop_bps: string;
+            /**
+             * Max Holding Seconds
+             * @default 300
+             */
+            max_holding_seconds: number;
+            /**
+             * Max Spread Bps
+             * @default 5
+             */
+            max_spread_bps: string;
+            /**
+             * Notional
+             * @default 100
+             */
+            notional: string;
+            /**
+             * Schema Version
+             * @default HALPHA_SCALP_TEMPLATE_V1
+             * @constant
+             */
+            schema_version: "HALPHA_SCALP_TEMPLATE_V1";
+            /**
+             * Take Profit R
+             * @default 1.5
+             */
+            take_profit_r: string;
+        };
+        /** ScalpTemplate */
+        "ScalpTemplate-Output": {
+            /**
+             * Entry Fee Bps
+             * @default 6
+             */
+            entry_fee_bps: string;
+            /**
+             * Entry Mode
+             * @default MARKET
+             * @enum {string}
+             */
+            entry_mode: "MARKET" | "MAKER_ONLY_SAME_SIDE";
+            /**
+             * Exit Fee Bps
+             * @default 6
+             */
+            exit_fee_bps: string;
+            /**
+             * Initial Stop Bps
+             * @default 35
+             */
+            initial_stop_bps: string;
+            /**
+             * Max Holding Seconds
+             * @default 300
+             */
+            max_holding_seconds: number;
+            /**
+             * Max Spread Bps
+             * @default 5
+             */
+            max_spread_bps: string;
+            /**
+             * Notional
+             * @default 100
+             */
+            notional: string;
+            /**
+             * Schema Version
+             * @default HALPHA_SCALP_TEMPLATE_V1
+             * @constant
+             */
+            schema_version: "HALPHA_SCALP_TEMPLATE_V1";
+            /**
+             * Take Profit R
+             * @default 1.5
+             */
+            take_profit_r: string;
+        };
+        /** ScalpTriggerPayload */
+        ScalpTriggerPayload: {
+            direction: components["schemas"]["Direction"];
+            /** Instrument Ref */
+            instrument_ref: string;
+            template: components["schemas"]["ScalpTemplate-Input"];
+        };
         /** ScheduleIssue */
         ScheduleIssue: {
             /** Code */
@@ -4809,6 +5216,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ReceiptResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    exit_by_idempotency_api_v1_activations__activation_id__exit_by_idempotency_get: {
+        parameters: {
+            query: {
+                idempotency_key: string;
+            };
+            header?: never;
+            path: {
+                activation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReceiptResponse"] | null;
                 };
             };
             /** @description Validation Error */
@@ -5868,6 +6308,157 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ReviewPricePathEvidenceResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    scalping_contracts_api_v1_scalping_contracts_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BinanceContractCatalog"];
+                };
+            };
+        };
+    };
+    create_scalping_cycle_api_v1_scalping_cycles_post: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScalpTriggerPayload"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScalpCycleCreateResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    scalping_cycle_by_idempotency_api_v1_scalping_cycles_by_idempotency_get: {
+        parameters: {
+            query: {
+                idempotency_key: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScalpCycleCreateResponse"] | null;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    scalping_recommendation_api_v1_scalping_recommendation_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScalpRecommendationPayload"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScalpRecommendationResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    scalping_results_api_v1_scalping_results_get: {
+        parameters: {
+            query?: {
+                scope?: "ALL" | "TODAY" | "ANCHOR";
+                anchor_at?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScalpResultsResponse"];
                 };
             };
             /** @description Validation Error */

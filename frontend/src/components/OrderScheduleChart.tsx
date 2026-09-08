@@ -44,6 +44,7 @@ import {
   ApiFailure,
   getMarketWindow,
   type MarketInterval,
+  type MarketWindow,
   type OrderScheduleDirection,
   type OrderScheduleFullFillProtectionEstimate,
   type OrderSchedulePreviewLeg,
@@ -98,6 +99,7 @@ const PRICE_TAG_EDGE_PADDING = 11;
 const PRICE_AXIS_WIDTH_NARROW = 128;
 const PRICE_AXIS_WIDTH_DESKTOP = 136;
 const PRICE_AXIS_POSITION = "right" as const;
+const MARKET_WINDOW_CACHE_CAPACITY = 12;
 const ANALYSIS_TIME_FORMATTER = new Intl.DateTimeFormat("zh-CN", {
   timeZone: "Asia/Shanghai",
   month: "2-digit",
@@ -288,6 +290,8 @@ export type OrderScheduleChartProps = {
   workspaceMode?: boolean;
   displayMode?: "DRAFT" | "RUNTIME";
   chartPurpose?: "ORDER_PLAN" | "STRATEGY_INPUT";
+  readOnlyDraft?: boolean;
+  draftProjectionLabel?: string;
   runtimePhase?: "RUNNING" | "REVIEW";
   showPlanEntryAnnotations?: boolean;
   additionalPriceAnnotations?: OrderChartPriceAnnotation[];
@@ -458,6 +462,10 @@ function annotationTagAbbreviation(annotation: OrderChartPriceAnnotation): strin
 }
 
 function annotationTagName(annotation: OrderChartPriceAnnotation): string {
+  if (
+    annotation.authority === "SERVER_FACT"
+    && ["RUNTIME_ENTRY", "PROTECTION", "TAKE_PROFIT"].includes(annotation.role)
+  ) return annotation.label;
   if (annotation.id === "halpha-entry-opportunity-missed-price") return "错失";
   if (
     annotation.authority === "SERVER_PREVIEW"
@@ -694,6 +702,8 @@ export default function OrderScheduleChart({
   workspaceMode = false,
   displayMode = "DRAFT",
   chartPurpose = "ORDER_PLAN",
+  readOnlyDraft = false,
+  draftProjectionLabel = "草稿投影",
   runtimePhase = "RUNNING",
   showPlanEntryAnnotations = true,
   additionalPriceAnnotations = [],
@@ -746,6 +756,9 @@ export default function OrderScheduleChart({
   const liveBarSpaceRef = useRef<number | null>(null);
   const appliedIntervalRef = useRef<MarketInterval | null>(null);
   const loaderRequestRef = useRef(0);
+  const marketWindowCacheRef = useRef(new Map<string, MarketWindow>());
+  const marketWindowRequestsRef = useRef(new Map<string, Promise<MarketWindow>>());
+  const marketWindowRevisionRef = useRef(0);
   const liveSubscriptionRef = useRef<{
     interval: MarketInterval;
     callback: (data: KLineData) => void;
@@ -848,7 +861,14 @@ export default function OrderScheduleChart({
         if (annotation.role === "REFERENCE") return true;
         return showPlanEntryAnnotations;
       })
-      .map((annotation) => displayMode === "RUNTIME"
+      .filter((annotation) => !(
+        annotation.authority === "SERVER_PREVIEW"
+        && additionalPriceAnnotations.some((runtimeAnnotation) => (
+          runtimeAnnotation.authority === "SERVER_FACT"
+          && runtimeAnnotation.role === annotation.role
+        ))
+      ))
+      .map((annotation) => displayMode === "RUNTIME" || readOnlyDraft
         ? { ...annotation, draggable: false }
         : annotation);
     const additionalIds = new Set(
@@ -879,6 +899,7 @@ export default function OrderScheduleChart({
       showPlanEntryAnnotations,
       spec,
       priceTickSize,
+      readOnlyDraft,
       hiddenLocalPriceAnnotationIds,
       visibleAdditionalPriceAnnotationIds,
     ]);
@@ -1114,19 +1135,52 @@ export default function OrderScheduleChart({
           return;
         }
         const requestId = ++loaderRequestRef.current;
-        setMarketWindowLoading(true);
-        setMarketWindowError(null);
-        setBars([]);
-        setMarketWindowSource(null);
-        setMarketWindowSourceCutoff(null);
+        const revision = marketWindowRevisionRef.current;
+        const cacheKey = [
+          revision,
+          environmentScope,
+          instrumentRefRef.current,
+          requestedInterval,
+          bounds.startAt,
+          bounds.endAt,
+        ].join("|");
         try {
-          const window = await getMarketWindow(
-            instrumentRefRef.current,
-            bounds.startAt,
-            bounds.endAt,
-            requestedInterval,
-            "EXECUTION_REVIEW",
-          );
+          let window = marketWindowCacheRef.current.get(cacheKey);
+          if (window === undefined) {
+            setMarketWindowLoading(true);
+            setMarketWindowError(null);
+            setBars([]);
+            setMarketWindowSource(null);
+            setMarketWindowSourceCutoff(null);
+            let request = marketWindowRequestsRef.current.get(cacheKey);
+            if (request === undefined) {
+              request = (async () => {
+                try {
+                  const fetched = await getMarketWindow(
+                    instrumentRefRef.current,
+                    bounds.startAt,
+                    bounds.endAt,
+                    requestedInterval,
+                    "EXECUTION_REVIEW",
+                  );
+                  if (marketWindowRevisionRef.current === revision) {
+                    const cache = marketWindowCacheRef.current;
+                    cache.delete(cacheKey);
+                    cache.set(cacheKey, fetched);
+                    if (cache.size > MARKET_WINDOW_CACHE_CAPACITY) {
+                      const oldestKey = cache.keys().next().value;
+                      if (oldestKey !== undefined) cache.delete(oldestKey);
+                    }
+                  }
+                  return fetched;
+                } finally {
+                  marketWindowRequestsRef.current.delete(cacheKey);
+                }
+              })();
+              marketWindowRequestsRef.current.set(cacheKey, request);
+            }
+            window = await request;
+          }
           if (
             requestId !== loaderRequestRef.current
             || requestedInterval !== intervalRef.current
@@ -1362,9 +1416,14 @@ export default function OrderScheduleChart({
     ) {
       return;
     }
+    const initialStreamReady = lastStreamGenerationRef.current === 0;
     lastStreamGenerationRef.current = streamGeneration;
+    if (initialStreamReady) return;
     const chart = chartRef.current;
     if (!chart || chartGeneration === 0) return;
+    marketWindowRevisionRef.current += 1;
+    marketWindowCacheRef.current.clear();
+    marketWindowRequestsRef.current.clear();
     chart.resetData();
   }, [chartGeneration, streamGeneration]);
 
@@ -1989,7 +2048,7 @@ export default function OrderScheduleChart({
                     : runtimePhase === "REVIEW"
                       ? "结束后行情"
                       : "计划运行"
-                  : "草稿投影"}
+                  : draftProjectionLabel}
               </Typography>
               <Tooltip
                 arrow
@@ -1997,7 +2056,9 @@ export default function OrderScheduleChart({
                   ? "图中只读显示当前行情、策略通道和追价边界；策略是否触发仍以闭合 K 线、确认根数与执行前检查为准。"
                   : displayMode === "RUNTIME"
                   ? "计划线、动作线与交易所事实分层展示；图中线条不会修改运行中计划，当前行情也不替代服务端执行事实。"
-                  : "图中价格线与右侧字段使用同一份计划输入；分析线不会写入执行条件。"}
+                  : readOnlyDraft
+                    ? "图中价格线只读投影当前模板；只有已保存模板会用于一键交易。"
+                    : "图中价格线与右侧字段使用同一份计划输入；分析线不会写入执行条件。"}
               >
                 <IconButton size="small" aria-label={strategyInput ? "了解策略输入图表" : displayMode === "RUNTIME" ? "了解运行图表的事实边界" : "了解图表草稿和订单事实的区别"}>
                   <InfoOutlined sx={{ fontSize: 16 }} />
@@ -2031,6 +2092,9 @@ export default function OrderScheduleChart({
                 <Tooltip
                   arrow
                   title={`${chartMarketSourceDescription(marketWindowSource)} 来源截止 ${chartSourceCutoff ?? "未知"}。`}
+                  slotProps={{
+                    popper: { container: () => chartContainerRef.current?.closest("main") ?? null },
+                  }}
                 >
                   <Chip
                     size="small"
@@ -2060,7 +2124,9 @@ export default function OrderScheduleChart({
                     : " · 只读展示计划、持仓与动作价格"
                 : strategyInput
                   ? " · 只读展示当前策略输入与关键价格"
-                  : " · 输入线可拖动 · Esc 撤销最近一次图上修改"}
+                  : readOnlyDraft
+                    ? " · 只读投影当前模板"
+                    : " · 输入线可拖动 · Esc 撤销最近一次图上修改"}
             </Typography>
             <Stack
               direction="row"
@@ -2158,7 +2224,7 @@ export default function OrderScheduleChart({
               ) : null}
             </Stack>
           </Box>
-          {displayMode === "DRAFT" && !strategyInput && <Stack
+          {displayMode === "DRAFT" && !strategyInput && !readOnlyDraft && <Stack
             data-testid="order-schedule-chart-tools"
             direction="row"
             spacing={0.75}
@@ -2202,7 +2268,7 @@ export default function OrderScheduleChart({
             </Button>
           </Stack>}
         </Stack>
-        {displayMode === "DRAFT" && !strategyInput && narrow ? (
+        {displayMode === "DRAFT" && !strategyInput && !readOnlyDraft && narrow ? (
           <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1 }}>
             窄屏保留查看与精确数值输入；绘图和多档拖动仅在桌面开放。
           </Typography>
@@ -2217,7 +2283,9 @@ export default function OrderScheduleChart({
           ? `策略输入 ${interval} K 线主图；只读展示当前价、通道与追价边界`
           : displayMode === "RUNTIME"
           ? `订单计划 ${interval} K 线运行主图；只读展示计划、持仓、保护与执行动作价格`
-          : `订单计划 ${interval} K 线主图；可在桌面编辑单笔限价、区间、支撑阻力和趋势线`}
+          : readOnlyDraft
+            ? `订单计划 ${interval} K 线主图；只读投影当前模板、保护与止盈价格`
+            : `订单计划 ${interval} K 线主图；可在桌面编辑单笔限价、区间、支撑阻力和趋势线`}
         sx={{
           position: "relative",
           height: workspaceMode ? { xs: 340, md: "auto" } : { xs: 330, sm: 430 },
@@ -2373,6 +2441,7 @@ export default function OrderScheduleChart({
         ) : null}
         {!chartSurfaceBlocked
           && !strategyInput
+          && !readOnlyDraft
           && displayMode === "DRAFT"
           && !marketDataReady ? (
           <Box
@@ -2429,6 +2498,7 @@ export default function OrderScheduleChart({
         ) : null}
         {displayMode === "DRAFT"
           && !strategyInput
+          && !readOnlyDraft
           && marketDataReady
           && rangeMode ? (
           <Box
@@ -2466,20 +2536,21 @@ export default function OrderScheduleChart({
         ) : null}
       </Box>
 
-      <Box
-        data-testid="order-schedule-chart-detail-scroll"
-        sx={{
-          px: { xs: 1.25, sm: 1.5 },
-          py: 1,
-          borderTop: 1,
-          borderColor: "divider",
-          flex: { xs: "0 0 auto", md: "0 1 auto" },
-          minHeight: 0,
-          maxHeight: workspaceMode ? { md: "42%" } : undefined,
-          overflowY: workspaceMode ? { xs: "visible", md: "auto" } : "visible",
-          overscrollBehavior: "contain",
-        }}
-      >
+      {!readOnlyDraft ? (
+        <Box
+          data-testid="order-schedule-chart-detail-scroll"
+          sx={{
+            px: { xs: 1.25, sm: 1.5 },
+            py: 1,
+            borderTop: 1,
+            borderColor: "divider",
+            flex: { xs: "0 0 auto", md: "0 1 auto" },
+            minHeight: 0,
+            maxHeight: workspaceMode ? { md: "42%" } : undefined,
+            overflowY: workspaceMode ? { xs: "visible", md: "auto" } : "visible",
+            overscrollBehavior: "contain",
+          }}
+        >
         {displayMode === "RUNTIME" && !strategyInput ? (
           <Box
             aria-label="计划图摘要"
@@ -2752,7 +2823,8 @@ export default function OrderScheduleChart({
           </Alert>
         ) : null}
         </Box>
-      </Box>
+        </Box>
+      ) : null}
     </Box>
   );
 }

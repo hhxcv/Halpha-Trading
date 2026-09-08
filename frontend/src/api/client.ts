@@ -11,6 +11,13 @@ export type MarketWindow = components["schemas"]["MarketWindow"];
 export type MarketFundingRateHistory = components["schemas"]["MarketFundingRateHistory"];
 export type MarketInterval = MarketWindow["interval"];
 export type MarketWindowPurpose = "EXECUTION_REVIEW";
+export type BinanceContractCatalog = components["schemas"]["BinanceContractCatalog"];
+export type ScalpTemplate = components["schemas"]["ScalpTemplate-Input"];
+export type ScalpTriggerPayload = components["schemas"]["ScalpTriggerPayload"];
+export type ScalpCycleCreateResult = components["schemas"]["ScalpCycleCreateResponse"];
+export type ScalpRecommendation = components["schemas"]["ScalpRecommendationResponse"];
+export type ScalpResults = components["schemas"]["ScalpResultsResponse"];
+export type ScalpResultScope = ScalpResults["scope"];
 export type PlanCreatePayload = components["schemas"]["PlanCreatePayload"];
 export type PlanDraftPayload = components["schemas"]["PlanDraftPayload"];
 export type DraftDecisionBasis = components["schemas"]["DraftDecisionBasis"];
@@ -271,6 +278,102 @@ export async function getMarketWindow(
     },
   });
   if (!data) throw new ApiFailure(response.status, errorCode(error, "MARKET_WINDOW_FAILED"));
+  return data;
+}
+
+export async function getScalpingContracts(): Promise<BinanceContractCatalog> {
+  const { data, error, response } = await api.GET("/api/v1/scalping/contracts");
+  if (!data) {
+    throw new ApiFailure(
+      response.status,
+      errorCode(error, "SCALP_CONTRACTS_FAILED"),
+    );
+  }
+  return data;
+}
+
+export async function getScalpRecommendation(
+  instrumentRef: string,
+  template: ScalpTemplate,
+): Promise<ScalpRecommendation> {
+  const { data, error, response } = await api.POST(
+    "/api/v1/scalping/recommendation",
+    {
+      body: { instrument_ref: instrumentRef, template },
+      headers: csrfHeader(),
+    },
+  );
+  if (!data) {
+    throw new ApiFailure(
+      response.status,
+      errorCode(error, "SCALP_RECOMMENDATION_FAILED"),
+      error,
+    );
+  }
+  return data;
+}
+
+export async function createScalpCycle(
+  payload: ScalpTriggerPayload,
+  idempotencyKey: string,
+): Promise<ScalpCycleCreateResult> {
+  const { data, error, response } = await api.POST(
+    "/api/v1/scalping/cycles",
+    {
+      body: payload,
+      params: { header: { "Idempotency-Key": idempotencyKey } },
+      headers: csrfHeader(),
+    },
+  );
+  if (!data) {
+    throw new ApiFailure(
+      response.status,
+      errorCode(error, "SCALP_CYCLE_CREATE_FAILED"),
+      error,
+    );
+  }
+  return data;
+}
+
+export async function getScalpCycleByIdempotency(
+  idempotencyKey: string,
+): Promise<ScalpCycleCreateResult | null> {
+  const { data, error, response } = await api.GET("/api/v1/scalping/cycles/by-idempotency", {
+    params: { query: { idempotency_key: idempotencyKey } },
+  });
+  if (!response.ok) throw new ApiFailure(response.status, errorCode(error, "SCALP_REQUEST_QUERY_FAILED"));
+  return data ?? null;
+}
+
+export async function getScalpExitByIdempotency(
+  activationId: string,
+  idempotencyKey: string,
+): Promise<Receipt | null> {
+  const { data, error, response } = await api.GET("/api/v1/activations/{activation_id}/exit-by-idempotency", {
+    params: { path: { activation_id: activationId }, query: { idempotency_key: idempotencyKey } },
+  });
+  if (!response.ok) throw new ApiFailure(response.status, errorCode(error, "SCALP_EXIT_QUERY_FAILED"));
+  return data ?? null;
+}
+
+export async function getScalpResults(
+  scope: ScalpResultScope,
+  anchorAt: string | null,
+): Promise<ScalpResults> {
+  const { data, error, response } = await api.GET("/api/v1/scalping/results", {
+    params: {
+      query: {
+        scope,
+        ...(anchorAt ? { anchor_at: anchorAt } : {}),
+      },
+    },
+  });
+  if (!data) {
+    throw new ApiFailure(
+      response.status,
+      errorCode(error, "SCALP_RESULTS_FAILED"),
+    );
+  }
   return data;
 }
 

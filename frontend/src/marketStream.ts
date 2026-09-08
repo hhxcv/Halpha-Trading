@@ -14,10 +14,21 @@ export const MARKET_INTERVALS = [
 ] as const satisfies ReadonlyArray<MarketInterval>;
 
 export const MARKET_STREAM_QUOTE_THROTTLE_MS = 250;
+/** DOM and tape are informational surfaces, committed in bounded batches. */
+export const MARKET_STREAM_FLOW_THROTTLE_MS = 100;
+export const MARKET_STREAM_MAX_TRADE_TAPE_EVENTS = 80;
 export const MARKET_STREAM_STALE_AFTER_MS = 5_000;
 export const MARKET_STREAM_MAX_FUTURE_SKEW_MS = 5_000;
 export const MARKET_STREAM_RECONNECT_BASE_MS = 500;
 export const MARKET_STREAM_RECONNECT_MAX_MS = 8_000;
+
+/** A hidden workbench has no current market-observation consumer. */
+export function shouldObservePublicMarketStream(
+  enabled: boolean,
+  visibilityState: DocumentVisibilityState | undefined,
+): boolean {
+  return enabled && (visibilityState === undefined || visibilityState === "visible");
+}
 
 export function marketEnvironmentScopeKey(
   environmentKind: string,
@@ -94,11 +105,43 @@ export type MarketStreamFunding = Readonly<{
   next_funding_at: string;
 }>;
 
+export type MarketStreamDepthLevel = Readonly<{
+  price: string;
+  quantity: string;
+}>;
+
+/** Latest bounded top-of-book snapshot from the selected venue environment. */
+export type MarketStreamDepth = Readonly<{
+  type: "depth";
+  instrument_ref: string;
+  source: string;
+  source_cutoff: string;
+  received_at: string;
+  update_id: number;
+  bids: ReadonlyArray<MarketStreamDepthLevel>;
+  asks: ReadonlyArray<MarketStreamDepthLevel>;
+}>;
+
+/** One public aggregate print; the hook keeps only a bounded recent tape. */
+export type MarketStreamTrade = Readonly<{
+  type: "trade";
+  instrument_ref: string;
+  source: string;
+  source_cutoff: string;
+  received_at: string;
+  trade_id: string;
+  price: string;
+  quantity: string;
+  aggressor_side: "BUYER" | "SELLER";
+}>;
+
 export type MarketStreamEvent =
   | MarketStreamServerStatus
   | MarketStreamQuote
   | MarketStreamBar
-  | MarketStreamFunding;
+  | MarketStreamFunding
+  | MarketStreamDepth
+  | MarketStreamTrade;
 
 export type MarketStreamClientStatus =
   | "DISABLED"
@@ -117,6 +160,10 @@ export type PublicMarketStreamSnapshot = Readonly<{
   quote: MarketStreamQuote | null;
   liveBar: MarketStreamBar | null;
   funding: MarketStreamFunding | null;
+  /** Current top-ten snapshot; null means unavailable rather than an empty book. */
+  depth: MarketStreamDepth | null;
+  /** Bounded current-session aggregate prints. They are never trade-execution facts. */
+  trades: ReadonlyArray<MarketStreamTrade>;
   /**
    * UI-only top-of-book midpoint estimates for configured short windows.
    * Executor conditions continue to use their frozen venue facts; consumers
@@ -368,6 +415,106 @@ function parseBar(value: Record<string, unknown>): MarketStreamBar | null {
   };
 }
 
+function parseDepthLevels(
+  value: unknown,
+): ReadonlyArray<MarketStreamDepthLevel> | null {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 10) {
+    return null;
+  }
+  const levels: MarketStreamDepthLevel[] = [];
+  for (const item of value) {
+    if (!isRecord(item)) return null;
+    const price = decimalNumber(item.price);
+    const quantity = decimalNumber(item.quantity);
+    if (
+      !isNonEmptyString(item.price)
+      || !isNonEmptyString(item.quantity)
+      || price === null
+      || quantity === null
+      || price <= 0
+      || quantity <= 0
+    ) {
+      return null;
+    }
+    levels.push({ price: item.price, quantity: item.quantity });
+  }
+  return levels;
+}
+
+function isStrictlyOrdered(
+  levels: ReadonlyArray<MarketStreamDepthLevel>,
+  direction: "DESC" | "ASC",
+): boolean {
+  return levels.slice(1).every((level, index) => {
+    const prior = Number(levels[index]?.price);
+    const current = Number(level.price);
+    return direction === "DESC" ? prior > current : prior < current;
+  });
+}
+
+function parseDepth(value: Record<string, unknown>): MarketStreamDepth | null {
+  const bids = parseDepthLevels(value.bids);
+  const asks = parseDepthLevels(value.asks);
+  if (
+    !isNonEmptyString(value.instrument_ref)
+    || !isNonEmptyString(value.source)
+    || !isTimestamp(value.source_cutoff)
+    || !isTimestamp(value.received_at)
+    || typeof value.update_id !== "number"
+    || !Number.isSafeInteger(value.update_id)
+    || value.update_id <= 0
+    || bids === null
+    || asks === null
+    || !isStrictlyOrdered(bids, "DESC")
+    || !isStrictlyOrdered(asks, "ASC")
+    || Number(bids[0]?.price) >= Number(asks[0]?.price)
+  ) {
+    return null;
+  }
+  return {
+    type: "depth",
+    instrument_ref: value.instrument_ref,
+    source: value.source,
+    source_cutoff: value.source_cutoff,
+    received_at: value.received_at,
+    update_id: value.update_id,
+    bids,
+    asks,
+  };
+}
+
+function parseTrade(value: Record<string, unknown>): MarketStreamTrade | null {
+  const price = decimalNumber(value.price);
+  const quantity = decimalNumber(value.quantity);
+  if (
+    !isNonEmptyString(value.instrument_ref)
+    || !isNonEmptyString(value.source)
+    || !isTimestamp(value.source_cutoff)
+    || !isTimestamp(value.received_at)
+    || !isNonEmptyString(value.trade_id)
+    || !isNonEmptyString(value.price)
+    || !isNonEmptyString(value.quantity)
+    || (value.aggressor_side !== "BUYER" && value.aggressor_side !== "SELLER")
+    || price === null
+    || quantity === null
+    || price <= 0
+    || quantity <= 0
+  ) {
+    return null;
+  }
+  return {
+    type: "trade",
+    instrument_ref: value.instrument_ref,
+    source: value.source,
+    source_cutoff: value.source_cutoff,
+    received_at: value.received_at,
+    trade_id: value.trade_id,
+    price: value.price,
+    quantity: value.quantity,
+    aggressor_side: value.aggressor_side,
+  };
+}
+
 /**
  * Parses the local relay boundary defensively. Unknown or malformed messages
  * are ignored instead of being allowed to corrupt the visible market state.
@@ -395,6 +542,12 @@ export function parseMarketStreamEvent(raw: unknown): MarketStreamEvent | null {
   }
   if (value.type === "bar") {
     return parseBar(value);
+  }
+  if (value.type === "depth") {
+    return parseDepth(value);
+  }
+  if (value.type === "trade") {
+    return parseTrade(value);
   }
   return null;
 }
@@ -484,6 +637,28 @@ export function isUsableMarketStreamFunding(
     && isCurrentStreamTimestamp(funding.received_at, now);
 }
 
+export function isUsableMarketStreamDepth(
+  depth: MarketStreamDepth | null,
+  expectedSource: string | null,
+  now: number,
+): depth is MarketStreamDepth {
+  if (depth === null) return false;
+  if (expectedSource === null || depth.source !== expectedSource) return false;
+  return isCurrentStreamTimestamp(depth.source_cutoff, now)
+    && isCurrentStreamTimestamp(depth.received_at, now);
+}
+
+export function isUsableMarketStreamTrade(
+  trade: MarketStreamTrade | null,
+  expectedSource: string | null,
+  now: number,
+): trade is MarketStreamTrade {
+  if (trade === null) return false;
+  if (expectedSource === null || trade.source !== expectedSource) return false;
+  return isCurrentStreamTimestamp(trade.source_cutoff, now)
+    && isCurrentStreamTimestamp(trade.received_at, now);
+}
+
 function isCurrentStreamTimestamp(value: string, now: number): boolean {
   const timestamp = Date.parse(value);
   return Number.isFinite(timestamp)
@@ -517,6 +692,8 @@ function initialSnapshot(
     quote: null,
     liveBar: null,
     funding: null,
+    depth: null,
+    trades: [],
     priceMoveBpsByWindow: {},
     generation: 0,
   };
@@ -547,8 +724,27 @@ export function usePublicMarketStream(
   const [snapshot, setSnapshot] = useState<PublicMarketStreamSnapshot>(
     () => initialSnapshot(enabled, environmentScope),
   );
+  const [documentVisible, setDocumentVisible] = useState(() => (
+    shouldObservePublicMarketStream(
+      true,
+      typeof document === "undefined" ? undefined : document.visibilityState,
+    )
+  ));
   const selectedIntervalRef = useRef(selectedInterval);
+  const generationRef = useRef(0);
   selectedIntervalRef.current = selectedInterval;
+
+  useEffect(() => {
+    if (typeof document === "undefined") return undefined;
+    const syncVisibility = (): void => {
+      setDocumentVisible(document.visibilityState === "visible");
+    };
+    syncVisibility();
+    document.addEventListener("visibilitychange", syncVisibility);
+    return () => document.removeEventListener("visibilitychange", syncVisibility);
+  }, []);
+
+  const streamEnabled = enabled && documentVisible;
 
   useEffect(() => {
     setSnapshot((current) => (
@@ -559,7 +755,7 @@ export function usePublicMarketStream(
   }, [selectedInterval]);
 
   useEffect(() => {
-    if (!enabled) {
+    if (!streamEnabled) {
       setSnapshot(initialSnapshot(false, environmentScope));
       return undefined;
     }
@@ -585,8 +781,11 @@ export function usePublicMarketStream(
     let reconnectAttempt = 0;
     let reconnectTimer: number | null = null;
     let quoteTimer: number | null = null;
+    let flowTimer: number | null = null;
     let staleTimer: number | null = null;
     let pendingQuote: MarketStreamQuote | null = null;
+    let pendingDepth: MarketStreamDepth | null = null;
+    let pendingTrades: MarketStreamTrade[] = [];
     let recentQuotes: MarketStreamQuote[] = [];
     let lastQuoteCommitAt = 0;
     let lastQuoteReceivedAt: number | null = null;
@@ -604,6 +803,51 @@ export function usePublicMarketStream(
       clearTimer(quoteTimer);
       quoteTimer = null;
       pendingQuote = null;
+    };
+
+    const clearPendingFlow = (): void => {
+      clearTimer(flowTimer);
+      flowTimer = null;
+      pendingDepth = null;
+      pendingTrades = [];
+    };
+
+    const commitPendingFlow = (): void => {
+      flowTimer = null;
+      if (disposed || (pendingDepth === null && pendingTrades.length === 0)) {
+        return;
+      }
+      const depth = pendingDepth;
+      const trades = pendingTrades;
+      pendingDepth = null;
+      pendingTrades = [];
+      const now = Date.now();
+      setSnapshot((current) => {
+        const usableCurrentTrades = current.trades.filter((trade) => (
+          isUsableMarketStreamTrade(trade, expectedSource, now)
+        ));
+        const byTradeId = new Map(
+          [...usableCurrentTrades, ...trades].map((trade) => [trade.trade_id, trade]),
+        );
+        const boundedTrades = [...byTradeId.values()]
+          .sort((left, right) => (
+            Date.parse(left.source_cutoff) - Date.parse(right.source_cutoff)
+          ))
+          .slice(-MARKET_STREAM_MAX_TRADE_TAPE_EVENTS);
+        return {
+          ...current,
+          depth: depth ?? current.depth,
+          trades: boundedTrades,
+        };
+      });
+    };
+
+    const scheduleFlowCommit = (): void => {
+      if (flowTimer !== null) return;
+      flowTimer = window.setTimeout(
+        commitPendingFlow,
+        MARKET_STREAM_FLOW_THROTTLE_MS,
+      );
     };
 
     const clearQuoteHistory = (): void => {
@@ -626,6 +870,7 @@ export function usePublicMarketStream(
           return;
         }
         awaitingFreshQuote = true;
+        clearPendingFlow();
         setSnapshot((current) => ({
           ...current,
           status: "STALE",
@@ -634,6 +879,8 @@ export function usePublicMarketStream(
           quote: null,
           liveBar: null,
           funding: null,
+          depth: null,
+          trades: [],
           priceMoveBpsByWindow: {},
         }));
       }, MARKET_STREAM_STALE_AFTER_MS);
@@ -660,6 +907,8 @@ export function usePublicMarketStream(
       const configuredWindows = priceMoveWindowKey
         ? priceMoveWindowKey.split(",").map(Number)
         : [];
+      generationRef.current = nextMarketStreamGeneration(generationRef.current, recovered);
+      const generation = generationRef.current;
       setSnapshot((current) => ({
         ...current,
         status: "LIVE",
@@ -672,7 +921,7 @@ export function usePublicMarketStream(
           configuredWindows,
           Date.now(),
         ),
-        generation: nextMarketStreamGeneration(current.generation, recovered),
+        generation,
       }));
     };
 
@@ -682,6 +931,7 @@ export function usePublicMarketStream(
         lastQuoteReceivedAt = null;
         awaitingFreshQuote = true;
         clearPendingQuote();
+        clearPendingFlow();
         clearQuoteHistory();
         clearTimer(staleTimer);
         staleTimer = null;
@@ -693,6 +943,8 @@ export function usePublicMarketStream(
           quote: null,
           liveBar: null,
           funding: null,
+          depth: null,
+          trades: [],
           priceMoveBpsByWindow: {},
         }));
         return;
@@ -716,6 +968,7 @@ export function usePublicMarketStream(
       if (event.source !== expectedSource) {
         awaitingFreshQuote = true;
         clearPendingQuote();
+        clearPendingFlow();
         clearQuoteHistory();
         clearTimer(staleTimer);
         staleTimer = null;
@@ -732,6 +985,7 @@ export function usePublicMarketStream(
         const missing = lastQuoteReceivedAt === null;
         const stale = missing
           || isMarketStreamQuoteStale(lastQuoteReceivedAt, Date.now());
+        if (stale) clearPendingFlow();
         setSnapshot((current) => ({
           ...current,
           status: stale ? "STALE" : "LIVE",
@@ -744,6 +998,7 @@ export function usePublicMarketStream(
           statusObservedAt: event.observed_at,
           ...(stale ? { quote: null, liveBar: null } : {}),
           ...(stale ? { funding: null } : {}),
+          ...(stale ? { depth: null, trades: [] } : {}),
           ...(stale ? { priceMoveBpsByWindow: {} } : {}),
         }));
         armStaleTimer();
@@ -751,6 +1006,7 @@ export function usePublicMarketStream(
       }
       awaitingFreshQuote = true;
       clearPendingQuote();
+      clearPendingFlow();
       clearQuoteHistory();
       clearTimer(staleTimer);
       staleTimer = null;
@@ -763,6 +1019,8 @@ export function usePublicMarketStream(
         quote: null,
         liveBar: null,
         funding: null,
+        depth: null,
+        trades: [],
         priceMoveBpsByWindow: {},
       }));
     };
@@ -773,6 +1031,7 @@ export function usePublicMarketStream(
       }
       awaitingFreshQuote = true;
       clearPendingQuote();
+      clearPendingFlow();
       clearQuoteHistory();
       clearTimer(staleTimer);
       staleTimer = null;
@@ -786,6 +1045,8 @@ export function usePublicMarketStream(
         quote: null,
         liveBar: null,
         funding: null,
+        depth: null,
+        trades: [],
         priceMoveBpsByWindow: {},
       }));
       reconnectTimer = window.setTimeout(() => {
@@ -820,12 +1081,17 @@ export function usePublicMarketStream(
         if (event.type === "status") {
           applyServerStatus(event);
         } else if (
-          (event.type === "quote" || event.type === "bar" || event.type === "funding")
+          (event.type === "quote"
+            || event.type === "bar"
+            || event.type === "funding"
+            || event.type === "depth"
+            || event.type === "trade")
           && event.instrument_ref === instrumentRef
           && event.source !== expectedSource
         ) {
           awaitingFreshQuote = true;
           clearPendingQuote();
+          clearPendingFlow();
           clearQuoteHistory();
           clearTimer(staleTimer);
           staleTimer = null;
@@ -857,6 +1123,30 @@ export function usePublicMarketStream(
             ) ? event : null,
           }));
         } else if (
+          event.type === "depth"
+          && event.instrument_ref === instrumentRef
+          && event.source === expectedSource
+        ) {
+          if (!isUsableMarketStreamDepth(event, expectedSource, Date.now())) {
+            pendingDepth = null;
+            setSnapshot((current) => ({ ...current, depth: null }));
+            return;
+          }
+          pendingDepth = event;
+          scheduleFlowCommit();
+        } else if (
+          event.type === "trade"
+          && event.instrument_ref === instrumentRef
+          && event.source === expectedSource
+        ) {
+          if (!isUsableMarketStreamTrade(event, expectedSource, Date.now())) {
+            return;
+          }
+          pendingTrades = [...pendingTrades, event].slice(
+            -MARKET_STREAM_MAX_TRADE_TAPE_EVENTS,
+          );
+          scheduleFlowCommit();
+        } else if (
           event.type === "bar"
           && shouldUseMarketStreamBar(
             event,
@@ -869,6 +1159,7 @@ export function usePublicMarketStream(
             lastQuoteReceivedAt = null;
             awaitingFreshQuote = true;
             clearPendingQuote();
+            clearPendingFlow();
             clearQuoteHistory();
             clearTimer(staleTimer);
             staleTimer = null;
@@ -880,6 +1171,8 @@ export function usePublicMarketStream(
               quote: null,
               liveBar: null,
               funding: null,
+              depth: null,
+              trades: [],
               priceMoveBpsByWindow: {},
             }));
             return;
@@ -895,6 +1188,7 @@ export function usePublicMarketStream(
         socket = null;
         awaitingFreshQuote = true;
         clearPendingQuote();
+        clearPendingFlow();
         clearQuoteHistory();
         clearTimer(staleTimer);
         staleTimer = null;
@@ -907,6 +1201,8 @@ export function usePublicMarketStream(
             quote: null,
             liveBar: null,
             funding: null,
+            depth: null,
+            trades: [],
           }));
           return;
         }
@@ -932,11 +1228,15 @@ export function usePublicMarketStream(
       disposed = true;
       clearTimer(reconnectTimer);
       clearTimer(quoteTimer);
+      clearTimer(flowTimer);
       clearTimer(staleTimer);
       reconnectTimer = null;
       quoteTimer = null;
+      flowTimer = null;
       staleTimer = null;
       pendingQuote = null;
+      pendingDepth = null;
+      pendingTrades = [];
       if (socket !== null) {
         const closingSocket = socket;
         socket = null;
@@ -952,9 +1252,9 @@ export function usePublicMarketStream(
         }
       }
     };
-  }, [enabled, environmentScope, expectedSource, instrumentRef, priceMoveWindowKey]);
+  }, [environmentScope, expectedSource, instrumentRef, priceMoveWindowKey, streamEnabled]);
 
   return snapshot.environmentScope === environmentScope
     ? snapshot
-    : initialSnapshot(enabled, environmentScope);
+    : initialSnapshot(streamEnabled, environmentScope);
 }

@@ -1,5 +1,6 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Page, type TestInfo } from "@playwright/test";
+import type { ReviewSequenceEvidence } from "../src/api/client";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -21,7 +22,14 @@ function tradeResult({
   lastFillTime: string;
 }) {
   return {
+    fill_count: 2,
     calculation_complete: true,
+    commission_complete: true,
+    execution_cost_complete: true,
+    funding_complete: true,
+    funding_included: true,
+    funding: "0",
+    strategy_attribution_complete: true,
     closed: true,
     gross_pnl: grossPnl,
     commission,
@@ -69,16 +77,18 @@ const professionalThreeTradeResult = tradeResult({
   firstFillTime: "2026-07-21T00:20:00Z",
   lastFillTime: "2026-07-21T00:25:30Z",
 });
-const externalClosureTradeResult = tradeResult({
-  entry: "101",
-  exit: "100",
-  netPnl: "-0.9",
-  grossPnl: "-0.8",
-  commission: "0.1",
-  firstFillTime: "2026-07-21T00:10:00Z",
-  lastFillTime: "2026-07-21T00:15:30Z",
-});
-externalClosureTradeResult.result_scope = "ACCOUNT_FACTS_WITH_EXTERNAL_CLOSURE";
+const externalClosureTradeResult = {
+  ...tradeResult({
+    entry: "101",
+    exit: "100",
+    netPnl: "-0.9",
+    grossPnl: "-0.8",
+    commission: "0.1",
+    firstFillTime: "2026-07-21T00:10:00Z",
+    lastFillTime: "2026-07-21T00:15:30Z",
+  }),
+  result_scope: "ACCOUNT_FACTS_WITH_EXTERNAL_CLOSURE",
+};
 externalClosureTradeResult.strategy_attribution_complete = false;
 externalClosureTradeResult.fills[1].action_kind = "EXTERNAL_ACCOUNT_CLOSURE";
 const legacyProfessionalThreeTradeResult = {
@@ -141,7 +151,77 @@ const reviews: JsonRecord[] = [
   },
 ];
 
+function professionalSequenceEvidence(scope: ReviewSequenceEvidence["scope"]): ReviewSequenceEvidence {
+  // These legacy reviews have no recorded pre-trade intent. Their reliable
+  // account results remain visible without inventing profit-seeking eligibility.
+  const accountScope = scope === "ACCOUNT_RESULTS";
+  const cumulativePnl = ["1.8", "0.9", "3.3"];
+  const trades: ReviewSequenceEvidence["trades"] = accountScope
+    ? [...reviews].reverse().map((review, index) => {
+      const result = review.resolved_trade_result as JsonRecord;
+      const context = review.trade_context as JsonRecord;
+      const owner = (review.evaluations as { owner_conclusion: JsonRecord }).owner_conclusion;
+      return {
+        review_id: String(review.review_id), review_version: Number(review.review_version),
+        closed_at: String(result.last_fill_time), instrument_ref: String(context.instrument_ref),
+        direction: context.direction as "LONG" | "SHORT", classification: String(owner.result),
+        intent: null, result_kind: index === 1 ? "LOSS" : "WIN",
+        net_pnl: String(result.net_pnl), commission: String(result.commission),
+        entry_notional: String(Number(result.entry_notional)), notional_return_percent: String(result.net_pnl),
+        cumulative_net_pnl: cumulativePnl[index], drawdown_from_peak: index === 1 ? "0.9" : "0",
+        segment_index: index, price_path: null,
+      };
+    })
+    : [];
+  return {
+    scope, range_start: null, range_end: null, source: "CURRENT_LATEST_REVIEWS",
+    source_cutoff: "2026-07-21T00:28:00Z", source_review_count: 3,
+    eligible_trade_count: trades.length, excluded_review_count: accountScope ? 0 : 3,
+    exclusions: accountScope ? {} : { MISSING_DECISION_INTENT: 3 },
+    metrics: {
+      trade_count: trades.length, wins: accountScope ? 2 : 0, losses: accountScope ? 1 : 0, flat: 0,
+      net_pnl: accountScope ? "3.3" : "0", commission: accountScope ? "0.3" : "0",
+      gross_profit: accountScope ? "4.2" : "0", gross_loss: accountScope ? "0.9" : "0",
+      profit_factor: accountScope ? "4.666666666666666666666666667" : null,
+      total_entry_notional: accountScope ? "300" : null,
+      notional_return_percent: accountScope ? "1.1" : null,
+      maximum_drawdown: accountScope ? "0.9" : "0",
+      maximum_drawdown_peak_review_id: accountScope ? "review-professional-1" : null,
+      maximum_drawdown_peak_at: accountScope ? "2026-07-21T00:05:30Z" : null,
+      maximum_drawdown_trough_review_id: accountScope ? "review-professional-2" : null,
+      maximum_drawdown_trough_at: accountScope ? "2026-07-21T00:15:30Z" : null,
+      current_segment_index: accountScope ? 2 : null,
+      longest_win_segment_index: accountScope ? 2 : null,
+      longest_loss_segment_index: accountScope ? 1 : null,
+      best_win_segment_index: accountScope ? 2 : null,
+      worst_loss_segment_index: accountScope ? 1 : null,
+      worst_trade_review_id: accountScope ? "review-professional-2" : null,
+      worst_trade_net_pnl: accountScope ? "-0.9" : null,
+      net_pnl_without_worst_trade: accountScope ? "4.2" : null,
+      largest_loss_share_percent: accountScope ? "100" : null,
+      top_loss_count: accountScope ? 1 : 0, top_loss_total: accountScope ? "0.9" : null,
+      net_pnl_without_top_losses: accountScope ? "4.2" : null,
+      top_loss_share_percent: accountScope ? "100" : null,
+    },
+    segments: trades.map((trade) => ({
+      segment_index: trade.segment_index, result_kind: trade.result_kind,
+      start_at: trade.closed_at, end_at: trade.closed_at, trade_count: 1,
+      net_pnl: trade.net_pnl, commission: trade.commission, total_entry_notional: trade.entry_notional,
+      notional_return_percent: trade.notional_return_percent,
+      review_refs: [{ review_id: trade.review_id, review_version: trade.review_version }], price_path: null,
+    })),
+    trades, price_path: null, capital_scaling_authority: false,
+    limitations: ["确定性复盘界面样本；不形成实盘或资金授权。"],
+  };
+}
+
 async function mockProfessionalReviews(page: Page) {
+  await page.route("**/api/v1/review-sequence-evidence?**", async (route) => {
+    const scope = new URL(route.request().url()).searchParams.get("scope");
+    await route.fulfill({ json: professionalSequenceEvidence(
+      scope === "PROFIT_SEEKING" ? "PROFIT_SEEKING" : "ACCOUNT_RESULTS",
+    ) });
+  });
   await page.route("**/api/v1/market-window**", async (route) => {
     const requestUrl = new URL(route.request().url());
     const interval = requestUrl.searchParams.get("interval") === "15m" ? "15m" : "1m";
@@ -522,7 +602,7 @@ test("review workbench exposes full-history performance and one visual trade nar
   await page.goto("/reviews");
 
   await expect(page.getByRole("group", { name: "全部已闭合交易累计净盈亏趋势" })).toBeVisible();
-  await expect(page.getByText("+3.30 USDT", { exact: true })).toBeVisible();
+  await expect(page.getByText("账户累计净盈亏", { exact: true }).locator("..")).toContainText("+3.30 USDT");
   await expect(page.getByRole("table", { name: "交易与复盘记录" })).toContainText("-0.90 USDT");
   await expect(page.getByRole("table", { name: "交易与复盘记录" })).toContainText("按计划止盈");
   await expect(page.getByRole("table", { name: "交易与复盘记录" })).toContainText("AI BTC 突破复核");
@@ -561,6 +641,8 @@ test("review workbench exposes full-history performance and one visual trade nar
   await expect(page.getByRole("heading", { name: "复盘判断" })).toBeVisible();
   const layout = await page.evaluate(() => ({ clientWidth: document.documentElement.clientWidth, scrollWidth: document.documentElement.scrollWidth }));
   expect(layout.scrollWidth).toBe(layout.clientWidth);
+  await page.getByTestId("order-schedule-chart-market-source").hover();
+  await expect(page.getByRole("main").getByRole("tooltip", { name: /图表历史、实时 K 线和当前价/ })).toBeVisible();
   await assertAccessible(page, testInfo, `review-detail-${testInfo.project.name}`);
   const detailScreenshot = testInfo.outputPath(`review-detail-${testInfo.project.name}.png`);
   await page.screenshot({ path: detailScreenshot, fullPage: true });

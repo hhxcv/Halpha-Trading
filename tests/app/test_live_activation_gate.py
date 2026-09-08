@@ -53,6 +53,7 @@ from halpha.planning.registry import (
     build_fixed_plan_basis,
 )
 from halpha.planning.transitions import ControlIntent
+from halpha.scalping.models import ScalpTemplate, ScalpTriggerPayload
 
 
 NOW = datetime(2026, 7, 18, 12, tzinfo=UTC)
@@ -178,6 +179,77 @@ def test_live_activation_rejects_before_database_mutation(
     )
     with pytest.raises(ValueError, match=reason):
         api.activate(_payload(), idempotency_key="live-001", observed_at=NOW)
+
+
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    (
+        (
+            _status(consistent=False),
+            "LIVE_WRITE_PRODUCT_BUILD_MISMATCH",
+        ),
+        (
+            _status(),
+            "LIVE_WRITE_GATE_MUST_BE_OPEN_FOR_SCALP",
+        ),
+        (
+            _status(violations=("LIVE_WRITE_GATE_BINDING_EXPIRED",)),
+            "LIVE_WRITE_GATE_BINDING_INVALID_FOR_ACTIVATION",
+        ),
+    ),
+)
+def test_live_scalp_rejects_without_an_effective_open_gate(
+    status: LiveWriteGateStatus,
+    reason: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = _api(status)
+    monkeypatch.setattr(
+        api,
+        "_connect",
+        lambda: pytest.fail("database must not be reached"),
+    )
+    payload = ScalpTriggerPayload(
+        instrument_ref="BTCUSDT-PERP",
+        direction="LONG",
+        template=ScalpTemplate(),
+    )
+    invalid_preview = SimpleNamespace(full_fill_protection_estimate=None)
+
+    with pytest.raises(ValueError, match=reason):
+        api.trigger_scalp_cycle(
+            payload,
+            idempotency_key="live-scalp-001",
+            observed_at=NOW,
+            order_schedule_snapshot=invalid_preview,
+        )
+
+
+def test_live_scalp_accepts_an_effective_open_gate_before_preview_validation() -> None:
+    status = LiveWriteGateStatus(
+        configured_runtime_real_write_gate="OPEN",
+        runtime_real_write_gate="OPEN",
+        product_build_id="a" * 64,
+        product_build_consistent=True,
+        authorized_activation_ids=("activation-live-existing",),
+    )
+    api = _api(status)
+    payload = ScalpTriggerPayload(
+        instrument_ref="BTCUSDT-PERP",
+        direction="LONG",
+        template=ScalpTemplate(),
+    )
+
+    with pytest.raises(ValueError, match="SCALP_PREVIEW_MISMATCH"):
+        api.trigger_scalp_cycle(
+            payload,
+            idempotency_key="live-scalp-open",
+            observed_at=NOW,
+            order_schedule_snapshot=SimpleNamespace(
+                full_fill_protection_estimate=None,
+                valid=False,
+            ),
+        )
 
 
 def test_activation_payload_rejects_legacy_capital_authorization_fields() -> None:

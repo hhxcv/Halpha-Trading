@@ -535,22 +535,22 @@ def test_live_recovery_requires_at_least_one_current_activation(
     )
 
 
-def test_open_gate_binds_all_current_plan_activations(
+def test_open_gate_can_idle_without_activations_and_binds_new_current_ones(
     tmp_path: Path,
     current_product_build: None,
 ) -> None:
     settings = _settings(tmp_path)
     _write_binding(settings, _binding(settings, gate="OPEN"))
 
-    missing = evaluate_live_write_gate(
+    idle = require_live_write_gate_open(
         ROOT,
         settings,
         connection=_Connection(activation_ids=()),
         now=NOW,
     )
-    assert missing.runtime_real_write_gate == "CLOSED"
-    assert missing.authorized_activation_ids == ()
-    assert "LIVE_WRITE_CURRENT_ACTIVATION_MISSING" in missing.violations
+    assert idle.runtime_real_write_gate == "OPEN"
+    assert idle.authorized_activation_ids == ()
+    assert idle.violations == ()
 
     effective = require_live_write_gate_open(
         ROOT,

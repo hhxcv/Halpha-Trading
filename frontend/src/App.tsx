@@ -47,6 +47,7 @@ import ArrowBackOutlined from "@mui/icons-material/ArrowBackOutlined";
 import ChevronLeftOutlined from "@mui/icons-material/ChevronLeftOutlined";
 import ChevronRightOutlined from "@mui/icons-material/ChevronRightOutlined";
 import DashboardOutlined from "@mui/icons-material/DashboardOutlined";
+import BoltOutlined from "@mui/icons-material/BoltOutlined";
 import InfoOutlined from "@mui/icons-material/InfoOutlined";
 import MenuOutlined from "@mui/icons-material/MenuOutlined";
 import OpenInNewOutlined from "@mui/icons-material/OpenInNewOutlined";
@@ -253,6 +254,7 @@ const STATUS_QUERY_KEY = ["settings-status"] as const;
 const DIRECT_EXECUTION_KIND = "DIRECT_EXECUTION";
 const DIRECT_EXECUTION_LABEL = "直接执行订单计划";
 const NewPlanPage = lazy(() => import("./pages/NewPlanPage"));
+const ScalpingPage = lazy(() => import("./pages/ScalpingPage"));
 
 const OrderScheduleChart = lazy(() => import("./components/OrderScheduleChart"));
 const ReviewPriceChart = lazy(() => import("./components/ReviewCharts").then((module) => ({ default: module.ReviewPriceChart })));
@@ -1913,6 +1915,7 @@ type FrameContext = {
 
 const navItems = [
   { label: "总览", path: "/overview", icon: <DashboardOutlined /> },
+  { label: "剥头皮", path: "/scalping", icon: <BoltOutlined /> },
   { label: "策略计划", path: "/plans", icon: <AssignmentOutlined /> },
   { label: "复盘", path: "/reviews", icon: <ReviewsOutlined /> },
   { label: "设置", path: "/settings", icon: <SettingsOutlined /> },
@@ -2039,6 +2042,8 @@ function WorkbenchFrame({ status }: { status: SettingsStatus }) {
   );
   const currentPrimaryPath = location.pathname.startsWith("/plans")
     ? "/plans"
+    : location.pathname.startsWith("/scalping")
+      ? "/scalping"
     : location.pathname.startsWith("/reviews")
       ? "/reviews"
       : location.pathname.startsWith("/settings")
@@ -7306,6 +7311,14 @@ function WorkbenchRoutes({ status }: { status: SettingsStatus }) {
     <Routes>
       <Route element={<WorkbenchFrame status={status} />}>
         <Route path="/overview" element={<OverviewPage />} />
+        <Route
+          path="/scalping"
+          element={(
+            <Suspense fallback={<AppLoading />}>
+              <ScalpingPage key={`${status.environment_id}:${status.account_id}`} />
+            </Suspense>
+          )}
+        />
         <Route path="/plans" element={<PlansPage />} />
         <Route
           path="/plans/new"
@@ -7340,6 +7353,9 @@ export default function App() {
     queryKey: STATUS_QUERY_KEY,
     queryFn: getSettingsStatus,
     refetchInterval: 30_000,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: true,
+    refetchOnReconnect: true,
   });
   const environmentScope = query.data
     ? marketEnvironmentScopeKey(

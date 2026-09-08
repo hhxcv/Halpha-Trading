@@ -16,6 +16,10 @@ from halpha.app.outcomes_api import (
     summarize_execution_fee_evidence,
 )
 from halpha.domain_values import content_digest
+from halpha.planning.live_profit_qualification import (
+    build_playbook_qualification_artifact,
+)
+from halpha.planning.registry import DecisionBasisKind
 
 
 class _Rows:
@@ -574,12 +578,22 @@ def _decision_review(
     reliable: bool = True,
     max_allowed_loss: str | None = "10",
     fact_cutoff: str = "2026-07-20T01:00:00+00:00",
+    workflow_kind: str | None = None,
 ) -> dict[str, object]:
     return {
         "review_id": review_id,
         "review_version": 1,
         "content_digest": content_digest({"review_id": review_id}),
         "status": status,
+        "primary_result": "COMPLETED",
+        "account_result": {
+            "classification": "ATTRIBUTED_FACTS_AVAILABLE",
+            "missing_refs": [],
+        },
+        "open_responsibilities": {
+            "execution_action_refs": [],
+            "unknown_action_refs": [],
+        },
         "fact_cutoff": fact_cutoff,
         "evaluations": {
             "owner_conclusion": {
@@ -599,6 +613,7 @@ def _decision_review(
                 "playbook_ref": playbook_ref,
             },
             "max_allowed_loss": max_allowed_loss,
+            "workflow_kind": workflow_kind,
         },
         "resolved_trade_result": {
             "calculation_complete": reliable,
@@ -774,6 +789,130 @@ def test_direct_decision_evidence_excludes_history_without_playbook_identity() -
     assert result["matched_review_count"] == 0
     assert result["comparable_trade_count"] == 0
     assert result["playbook_ref"] == "BTC_BREAKOUT_V1"
+
+
+def test_scalp_evidence_uses_reliable_cycles_without_manual_review_completion() -> None:
+    result = summarize_decision_evidence(
+        [
+            _decision_review(
+                review_id="scalp-cycle-1",
+                net_pnl="12",
+                status="DRAFT",
+                classification="",
+                setup_family="OTHER",
+                playbook_ref="SCALP_TEMPLATE:abc",
+                workflow_kind="SCALP_CYCLE",
+            )
+        ],
+        instrument_ref="BTCUSDT-PERP",
+        direction="LONG",
+        decision_basis_ref="DIRECT_EXECUTION@1",
+        parameter_digest="parameter-digest",
+        intent="PROFIT_SEEKING",
+        setup_family="OTHER",
+        playbook_ref="SCALP_TEMPLATE:abc",
+    )
+
+    assert result["matched_review_count"] == 1
+    assert result["comparable_trade_count"] == 1
+    assert result["exclusions"] == {}
+    assert result["metrics"]["net_pnl"] == "12"
+
+
+@pytest.mark.parametrize(
+    ("section", "patch"),
+    [
+        ("account_result", None),
+        ("account_result", {"classification": "UNKNOWN"}),
+        ("account_result", {"classification": "EXTERNAL_POSITION_DISPOSITION"}),
+        ("account_result", {"missing_refs": ["plan_version"]}),
+        ("account_result", {"missing_refs": None}),
+        ("open_responsibilities", None),
+        ("open_responsibilities", {"execution_action_refs": ["pending-exit"]}),
+        ("open_responsibilities", {"unknown_action_refs": ["unknown-entry"]}),
+        ("open_responsibilities", {"unknown_action_refs": None}),
+        ("resolved_trade_result", {"calculation_complete": False}),
+        ("resolved_trade_result", {"execution_cost_complete": False}),
+        ("resolved_trade_result", {"strategy_attribution_complete": False}),
+        ("resolved_trade_result", {"closed": False}),
+    ],
+)
+def test_scalp_evidence_excludes_unresolved_machine_facts(
+    section: str,
+    patch: dict[str, object] | None,
+) -> None:
+    review = _decision_review(
+        review_id="unresolved-scalp", net_pnl="12", status="DRAFT",
+        classification="", setup_family="OTHER", playbook_ref="SCALP_TEMPLATE:abc",
+        workflow_kind="SCALP_CYCLE",
+    )
+    review[section] = (
+        {**review[section], **patch} if patch is not None else None
+    )
+
+    result = summarize_decision_evidence(
+        [review], instrument_ref="BTCUSDT-PERP", direction="LONG",
+        decision_basis_ref="DIRECT_EXECUTION@1", parameter_digest="parameter-digest",
+        intent="PROFIT_SEEKING", setup_family="OTHER", playbook_ref="SCALP_TEMPLATE:abc",
+    )
+
+    assert result["comparable_trade_count"] == 0
+    assert result["metrics"]["net_pnl"] == "0"
+    assert result["exclusions"] == {"UNRELIABLE_RESULT": 1}
+    assert result["sample_review_refs"] == []
+
+
+@pytest.mark.parametrize("unreliable_kind", ["UNKNOWN_ACTION", "MISSING_FEES", "INCOMPLETE_ATTRIBUTION"])
+def test_unreliable_scalp_cannot_complete_a_live_qualification_cohort(
+    unreliable_kind: str,
+) -> None:
+    reviews = [
+        _decision_review(
+            review_id=f"scalp-{index:02d}", net_pnl="12", status="DRAFT",
+            classification="", setup_family="OTHER", playbook_ref="SCALP_TEMPLATE:abc",
+            workflow_kind="SCALP_CYCLE", fact_cutoff=f"2026-07-20T01:{index:02d}:00+00:00",
+        )
+        for index in range(30)
+    ]
+    parameter_digest = content_digest({})
+    for review in reviews:
+        review["trade_context"]["parameter_digest"] = parameter_digest
+
+    def evidence():
+        return summarize_decision_evidence(
+            reviews, instrument_ref="BTCUSDT-PERP", direction="LONG",
+            decision_basis_ref="DIRECT_EXECUTION@1", parameter_digest=parameter_digest,
+            intent="PROFIT_SEEKING", setup_family="OTHER", playbook_ref="SCALP_TEMPLATE:abc",
+        )
+
+    def export(value):
+        return build_playbook_qualification_artifact(
+            value, source_environment_id="binance-demo-primary",
+            source_product_build_id="a" * 64, target_venue_account_type="USDM_PERSONAL",
+            decision_basis_kind=DecisionBasisKind.DIRECT_EXECUTION,
+            issued_at=datetime(2026, 7, 20, 2, tzinfo=UTC),
+        )[0]
+
+    artifact = export(evidence())
+    assert artifact.comparable_trade_count == 30
+    assert artifact.live_activation_authority is False
+
+    latest = reviews[-1]
+    if unreliable_kind == "UNKNOWN_ACTION":
+        latest["primary_result"] = "RESULT_UNKNOWN"
+        latest["account_result"]["classification"] = "UNKNOWN"
+        latest["open_responsibilities"]["unknown_action_refs"] = ["unknown-entry"]
+    elif unreliable_kind == "MISSING_FEES":
+        latest["resolved_trade_result"]["execution_cost_complete"] = False
+    else:
+        latest["resolved_trade_result"]["strategy_attribution_complete"] = False
+
+    screened = evidence()
+    assert screened["comparable_trade_count"] == 29
+    assert screened["exclusions"] == {"UNRELIABLE_RESULT": 1}
+    assert all(ref["review_id"] != "scalp-29" for ref in screened["sample_review_refs"])
+    with pytest.raises(ValueError, match="PLAYBOOK_QUALIFICATION_EVIDENCE_NOT_CANDIDATE"):
+        export(screened)
 
 
 def test_direct_decision_evidence_preview_requires_a_playbook_identity() -> None:

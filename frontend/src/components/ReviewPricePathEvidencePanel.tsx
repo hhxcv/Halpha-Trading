@@ -105,7 +105,7 @@ export default function ReviewPricePathEvidencePanel({
       aria-labelledby="review-price-path-title"
       sx={{ ...surfaceFrameSx, p: { xs: 1.5, sm: 2 }, mt: 1.5 }}
     >
-      <Typography id="review-price-path-title" variant="h3">
+      <Typography id="review-price-path-title" component="h2" variant="h3">
         入场后价路证据
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mt: .5 }}>

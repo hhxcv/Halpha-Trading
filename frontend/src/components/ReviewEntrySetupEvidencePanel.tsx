@@ -175,7 +175,7 @@ export default function ReviewEntrySetupEvidencePanel({
       aria-labelledby="review-entry-setup-title"
       sx={{ ...surfaceFrameSx, p: { xs: 1.5, sm: 2 }, mt: 1.5 }}
     >
-      <Typography id="review-entry-setup-title" variant="h3">
+      <Typography id="review-entry-setup-title" component="h2" variant="h3">
         突破入场还原
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mt: .5 }}>
